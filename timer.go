@@ -1,6 +1,7 @@
 package byterate
 
 import (
+	"math/bits"
 	"sync"
 	"time"
 )
@@ -13,6 +14,18 @@ const (
 	coalesceWaitNs   = int64(200 * time.Microsecond)
 	shortWaitNs      = int64(2 * time.Millisecond)
 )
+
+// epoch is the shared monotonic origin for Rate and Meter timestamps, so zero
+// values and clones need no per-instance clock base and wall-clock steps do
+// not affect sampling. It is set one second in the past so nowNs is never 0,
+// which Meter reserves for "no window started": on coarse clocks (Windows
+// InterruptTime) time.Since(time.Now()) stays 0 until the next tick.
+var epoch = time.Now().Add(-time.Second) // Add keeps the monotonic reading
+
+// nowNs returns monotonic nanoseconds since epoch.
+func nowNs() int64 {
+	return int64(time.Since(epoch))
+}
 
 var timerPool = sync.Pool{
 	New: func() any {
@@ -49,65 +62,62 @@ func putTimer(t *time.Timer) {
 	timerPool.Put(t)
 }
 
-func sleepNs(waitNs int64, stopCh <-chan struct{}) {
+// sleepNs waits waitNs, returning early when stopCh or done is closed.
+// It reports false only when done was closed before the wait elapsed.
+func sleepNs(waitNs int64, stopCh, done <-chan struct{}) bool {
 	if waitNs <= 0 {
-		return
+		return true
 	}
-	if waitNs <= shortWaitNs || stopCh == nil {
+	if waitNs <= shortWaitNs || (stopCh == nil && done == nil) {
 		time.Sleep(time.Duration(waitNs))
-		return
+		return true
 	}
 
 	t := getTimer(time.Duration(waitNs))
+	defer putTimer(t)
 	select {
 	case <-t.C:
+		return true
 	case <-stopCh:
+		return true
+	case <-done:
+		return false
 	}
-	putTimer(t)
 }
 
+// bytesToNsCeil returns ceil(bytes*1e9/rate), saturated to maxI64.
 func bytesToNsCeil(bytes, rate int64) int64 {
 	if bytes <= 0 || rate <= 0 {
 		return 0
 	}
-	if bytes > maxI64/1e9 {
+	hi, lo := bits.Mul64(uint64(bytes), uint64(time.Second))
+	if hi >= uint64(rate) { // quotient does not fit in 64 bits
 		return maxI64
 	}
-	num := bytes * 1e9
-	return (num + rate - 1) / rate
+	q, r := bits.Div64(hi, lo, uint64(rate))
+	if q >= uint64(maxI64) {
+		return maxI64
+	}
+	if r != 0 {
+		q++
+	}
+	return int64(q)
 }
 
+// bytesPerSec returns floor(bytes*1e9/dtNs), saturated to maxI64.
 func bytesPerSec(bytes, dtNs int64) int64 {
 	if bytes <= 0 || dtNs <= 0 {
 		return 0
 	}
-	q := bytes / dtNs
-	rem := bytes % dtNs
-
-	if q > maxI64/1e9 {
+	hi, lo := bits.Mul64(uint64(bytes), uint64(time.Second))
+	if hi >= uint64(dtNs) { // quotient does not fit in 64 bits
 		return maxI64
 	}
-	res := q * 1e9
-
-	if rem > 0 {
-		if rem > maxI64/1e9 {
-			add := maxI64 / dtNs
-			if add > maxI64-res {
-				return maxI64
-			}
-			res += add
-		} else {
-			add := (rem * 1e9) / dtNs
-			if add > maxI64-res {
-				return maxI64
-			}
-			res += add
-		}
-	}
-	if res < 0 {
+	q, _ := bits.Div64(hi, lo, uint64(dtNs))
+	if q > uint64(maxI64) {
 		return maxI64
 	}
-	return res
+	return int64(q)
 }
 
 func clampAdd(a, b int64) int64 {

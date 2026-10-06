@@ -1,94 +1,90 @@
 package byterate
 
 import (
+	"context"
 	"encoding/json"
 	"sync"
 	"sync/atomic"
 	"time"
 )
 
+// burstWindowNs is the burst allowance: after an idle period a Rate lets up
+// to two seconds' worth of bytes through without waiting.
 const burstWindowNs = int64(2 * time.Second)
 
 type stopSignal struct {
 	ch chan struct{}
 }
 
+// Rate is a bytes-per-second limiter (GCRA, a token-bucket variant) with a
+// built-in throughput meter. A limit <= 0 means unlimited, and after an idle
+// period up to two seconds' worth of bytes pass without waiting.
+//
+// All methods are safe for concurrent use and on a nil *Rate, which never
+// limits. The zero value is an unlimited Rate that is not started; call
+// ResetLimit, or SetLimit and Start, before use. A Rate must not be copied
+// after first use; use Clone.
 type Rate struct {
-	rate    int64
-	burstNs int64
-	tat     int64
+	rate atomic.Int64 // bytes/s, <=0 => unlimited
+	tat  atomic.Int64 // theoretical arrival time (ns since epoch), can be negative
 
-	enabled int32
-	t0      time.Time
+	enabled atomic.Bool
 
 	mu      sync.Mutex
 	stopped bool
 	stop    atomic.Pointer[stopSignal]
 
-	bytesAcc     int64
-	lastSampleNs int64
-	nowBps       int64
+	// approx realtime rate (bytes/s)
+	bytesAcc     atomic.Int64
+	lastSampleNs atomic.Int64
+	nowBps       atomic.Int64
 }
 
 type rateJSON struct {
-	NowRate int64 `json:"NowRate"`
-	Limit   int64 `json:"Limit"`
+	NowRate int64 `json:"NowRate"` // bytes/s
+	Limit   int64 `json:"Limit"`   // bytes/s, 0 => unlimited
 }
 
+// NewRate returns a started Rate limited to limitBps bytes per second with a
+// full burst available. A limitBps <= 0 means unlimited.
 func NewRate(limitBps int64) *Rate {
 	if limitBps <= 0 {
 		limitBps = 0
 	}
-	r := &Rate{
-		enabled: 1,
-		t0:      time.Now(),
-		burstNs: burstWindowNs,
-	}
-	atomic.StoreInt64(&r.rate, limitBps)
+	r := &Rate{}
+	r.enabled.Store(true)
+	r.rate.Store(limitBps)
 	r.stop.Store(&stopSignal{ch: make(chan struct{})})
 
+	now := nowNs()
 	if limitBps > 0 {
-		atomic.StoreInt64(&r.tat, -r.burstNs)
+		r.tat.Store(now - burstWindowNs) // full burst initially
 	} else {
-		atomic.StoreInt64(&r.tat, 0)
+		r.tat.Store(0)
 	}
 
-	now := r.nowNs()
-	atomic.StoreInt64(&r.lastSampleNs, now)
-	atomic.StoreInt64(&r.nowBps, 0)
+	r.lastSampleNs.Store(now)
+	r.nowBps.Store(0)
 	return r
 }
 
+// Clone returns an independent copy of r's limit, debt, started or stopped
+// state and meter. Callers blocked on r are not affected by the copy.
 func (r *Rate) Clone() *Rate {
 	if r == nil {
 		return nil
 	}
-	enabled := atomic.LoadInt32(&r.enabled)
-	if r.t0.IsZero() {
-		cloned := NewRate(atomic.LoadInt64(&r.rate))
-		if enabled == 0 {
-			cloned.Stop()
-		}
-		return cloned
-	}
-
 	r.mu.Lock()
 	stopped := r.stopped
-	burstNs := r.burstNs
-	t0 := r.t0
 	r.mu.Unlock()
 
-	cloned := &Rate{
-		burstNs: burstNs,
-		t0:      t0,
-		stopped: stopped,
-	}
-	atomic.StoreInt64(&cloned.rate, atomic.LoadInt64(&r.rate))
-	atomic.StoreInt64(&cloned.tat, atomic.LoadInt64(&r.tat))
-	atomic.StoreInt32(&cloned.enabled, enabled)
-	atomic.StoreInt64(&cloned.bytesAcc, atomic.LoadInt64(&r.bytesAcc))
-	atomic.StoreInt64(&cloned.lastSampleNs, atomic.LoadInt64(&r.lastSampleNs))
-	atomic.StoreInt64(&cloned.nowBps, atomic.LoadInt64(&r.nowBps))
+	cloned := &Rate{stopped: stopped}
+	cloned.rate.Store(r.rate.Load())
+	cloned.tat.Store(r.tat.Load())
+	cloned.enabled.Store(r.enabled.Load())
+	cloned.bytesAcc.Store(r.bytesAcc.Load())
+	cloned.lastSampleNs.Store(r.lastSampleNs.Load())
+	cloned.nowBps.Store(r.nowBps.Load())
 
 	signal := &stopSignal{ch: make(chan struct{})}
 	if stopped {
@@ -98,6 +94,10 @@ func (r *Rate) Clone() *Rate {
 	return cloned
 }
 
+// SetLimit sets the limit in bytes per second; limitBps <= 0 means unlimited.
+// It applies to later reservations only: debt accrued at the previous limit is
+// kept and callers blocked in Get are not woken, so a raised limit takes full
+// effect once that debt is repaid. Use ResetLimit to apply a limit at once.
 func (r *Rate) SetLimit(limitBps int64) {
 	if r == nil {
 		return
@@ -105,9 +105,11 @@ func (r *Rate) SetLimit(limitBps int64) {
 	if limitBps <= 0 {
 		limitBps = 0
 	}
-	atomic.StoreInt64(&r.rate, limitBps)
+	r.rate.Store(limitBps)
 }
 
+// ResetLimit is Stop, SetLimit and Start: it wakes blocked callers, clears the
+// debt and the meter, and restarts with a full burst at the new limit.
 func (r *Rate) ResetLimit(limitBps int64) {
 	if r == nil {
 		return
@@ -117,21 +119,27 @@ func (r *Rate) ResetLimit(limitBps int64) {
 	r.Start()
 }
 
+// Limit returns the limit in bytes per second, or 0 if unlimited.
 func (r *Rate) Limit() int64 {
 	if r == nil {
 		return 0
 	}
-	return atomic.LoadInt64(&r.rate)
+	return r.rate.Load()
 }
 
+// Now returns the measured throughput in bytes per second over the last
+// sampling window of at least one second, closing the current window if it is
+// due. It reports 0 while r is stopped.
 func (r *Rate) Now() int64 {
 	if r == nil {
 		return 0
 	}
-	r.updateRateWithNow(r.nowNs())
-	return atomic.LoadInt64(&r.nowBps)
+	r.updateRateWithNow(nowNs())
+	return r.nowBps.Load()
 }
 
+// Start enables r. A stopped or never-started Rate also gets a full burst and
+// a cleared meter; Start is a no-op on a running Rate.
 func (r *Rate) Start() {
 	if r == nil {
 		return
@@ -139,7 +147,7 @@ func (r *Rate) Start() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	prevEnabled := atomic.LoadInt32(&r.enabled) != 0
+	prevEnabled := r.enabled.Load()
 	needReset := r.stopped || !prevEnabled || r.stop.Load() == nil
 
 	if r.stopped || r.stop.Load() == nil {
@@ -148,22 +156,24 @@ func (r *Rate) Start() {
 	}
 
 	if needReset {
-		rate := atomic.LoadInt64(&r.rate)
+		rate := r.rate.Load()
 		if rate > 0 {
-			now := r.nowNs()
-			atomic.StoreInt64(&r.tat, now-r.burstNs)
+			now := nowNs()
+			r.tat.Store(now - burstWindowNs) // full burst on (re)enable
 		} else {
-			atomic.StoreInt64(&r.tat, 0)
+			r.tat.Store(0)
 		}
-		atomic.StoreInt64(&r.bytesAcc, 0)
-		now := r.nowNs()
-		atomic.StoreInt64(&r.lastSampleNs, now)
-		atomic.StoreInt64(&r.nowBps, 0)
+		r.bytesAcc.Store(0)
+		now := nowNs()
+		r.lastSampleNs.Store(now)
+		r.nowBps.Store(0)
 	}
 
-	atomic.StoreInt32(&r.enabled, 1)
+	r.enabled.Store(true)
 }
 
+// Stop disables limiting and metering until Start: Get returns immediately
+// and callers blocked in Get are woken.
 func (r *Rate) Stop() {
 	if r == nil {
 		return
@@ -171,56 +181,78 @@ func (r *Rate) Stop() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	atomic.StoreInt32(&r.enabled, 0)
+	r.enabled.Store(false)
 	if !r.stopped {
 		if s := r.stop.Load(); s != nil && s.ch != nil {
-			close(s.ch)
+			close(s.ch) // wake sleepers immediately
 		}
 		r.stopped = true
 	}
-	atomic.StoreInt64(&r.bytesAcc, 0)
-	atomic.StoreInt64(&r.nowBps, 0)
+	r.bytesAcc.Store(0)
+	r.nowBps.Store(0)
 }
 
+// ReturnBucket refunds size bytes previously charged by Get, for example the
+// unwritten part of a short write. A refund never raises the available burst
+// above two seconds' worth of bytes.
 func (r *Rate) ReturnBucket(size int64) {
-	if r == nil || size <= 0 || atomic.LoadInt32(&r.enabled) == 0 {
+	if r == nil || size <= 0 || !r.enabled.Load() {
 		return
 	}
 
-	atomic.AddInt64(&r.bytesAcc, -size)
+	r.bytesAcc.Add(-size)
 
-	rate := atomic.LoadInt64(&r.rate)
+	rate := r.rate.Load()
 	if rate <= 0 {
 		return
 	}
 
 	refund := bytesToNsCeil(size, rate)
-	now := r.nowNs()
-	minTat := now - r.burstNs
+	now := nowNs()
+	minTat := now - burstWindowNs
 
 	for {
-		prev := atomic.LoadInt64(&r.tat)
+		prev := r.tat.Load()
 		next := clampSub(prev, refund)
 		if next < minTat {
 			next = minTat
 		}
-		if atomic.CompareAndSwapInt64(&r.tat, prev, next) {
+		if r.tat.CompareAndSwap(prev, next) {
 			return
 		}
-		if atomic.LoadInt32(&r.enabled) == 0 {
+		if !r.enabled.Load() {
 			return
 		}
 	}
 }
 
+// Get charges size bytes and blocks until the limit allows them. It returns
+// immediately if r is nil, stopped or unlimited; Stop and ResetLimit wake a
+// blocked Get early. Use GetContext to abandon a wait.
 func (r *Rate) Get(size int64) {
 	wait := r.reserve(size)
 	if wait <= coalesceWaitNs {
 		return
 	}
-	sleepNs(wait, r.stopCh())
+	sleepNs(wait, r.stopCh(), nil)
 }
 
+// GetContext is like Get but returns ctx.Err() if ctx is done before the wait
+// ends. The charge is kept either way; refund unused bytes with ReturnBucket.
+func (r *Rate) GetContext(ctx context.Context, size int64) error {
+	wait := r.reserve(size)
+	if wait <= coalesceWaitNs {
+		return nil
+	}
+	if !sleepNs(wait, r.stopCh(), ctx.Done()) {
+		return ctx.Err()
+	}
+	return nil
+}
+
+// MarshalJSON encodes r as {"NowRate":bps,"Limit":bps}, where NowRate is Now
+// and Limit is Limit. Like Now, it closes the current sampling window if it is
+// due, so an idle Rate reports 0.
 func (r *Rate) MarshalJSON() ([]byte, error) {
 	if r == nil {
 		return []byte("null"), nil
@@ -232,16 +264,16 @@ func (r *Rate) MarshalJSON() ([]byte, error) {
 }
 
 func (r *Rate) reserve(size int64) int64 {
-	if r == nil || size <= 0 || atomic.LoadInt32(&r.enabled) == 0 {
+	if r == nil || size <= 0 || !r.enabled.Load() {
 		return 0
 	}
 
-	atomic.AddInt64(&r.bytesAcc, size)
+	r.bytesAcc.Add(size)
 
-	now := r.nowNs()
+	now := nowNs()
 	r.updateRateWithNow(now)
 
-	currentRate := atomic.LoadInt64(&r.rate)
+	currentRate := r.rate.Load()
 	if currentRate <= 0 {
 		return 0
 	}
@@ -249,16 +281,16 @@ func (r *Rate) reserve(size int64) int64 {
 	cost := bytesToNsCeil(size, currentRate)
 
 	for {
-		minTat := now - r.burstNs
+		minTat := now - burstWindowNs
 
-		prev := atomic.LoadInt64(&r.tat)
+		prev := r.tat.Load()
 		base := prev
 		if base < minTat {
 			base = minTat
 		}
 		next := clampAdd(base, cost)
 
-		if atomic.CompareAndSwapInt64(&r.tat, prev, next) {
+		if r.tat.CompareAndSwap(prev, next) {
 			wait := next - now
 			if wait < 0 {
 				return 0
@@ -266,10 +298,10 @@ func (r *Rate) reserve(size int64) int64 {
 			return wait
 		}
 
-		if atomic.LoadInt32(&r.enabled) == 0 {
+		if !r.enabled.Load() {
 			return 0
 		}
-		now = r.nowNs()
+		now = nowNs()
 	}
 }
 
@@ -284,15 +316,15 @@ func (r *Rate) stopCh() <-chan struct{} {
 }
 
 func (r *Rate) updateRateWithNow(now int64) {
-	last := atomic.LoadInt64(&r.lastSampleNs)
+	last := r.lastSampleNs.Load()
 	if now-last < sampleIntervalNs {
 		return
 	}
-	if !atomic.CompareAndSwapInt64(&r.lastSampleNs, last, now) {
+	if !r.lastSampleNs.CompareAndSwap(last, now) {
 		return
 	}
 
-	bytes := atomic.SwapInt64(&r.bytesAcc, 0)
+	bytes := r.bytesAcc.Swap(0)
 	if bytes < 0 {
 		bytes = 0
 	}
@@ -300,9 +332,5 @@ func (r *Rate) updateRateWithNow(now int64) {
 	if dt <= 0 {
 		return
 	}
-	atomic.StoreInt64(&r.nowBps, bytesPerSec(bytes, dt))
-}
-
-func (r *Rate) nowNs() int64 {
-	return int64(time.Since(r.t0))
+	r.nowBps.Store(bytesPerSec(bytes, dt))
 }

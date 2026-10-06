@@ -3,8 +3,9 @@ package byterate
 import (
 	"errors"
 	"io"
-	"sync/atomic"
+	"net"
 	"testing"
+	"time"
 )
 
 type scriptedConn struct {
@@ -46,7 +47,7 @@ func TestRateConnReadChargesActualBytes(t *testing.T) {
 	if string(buf[:n]) != "ok" {
 		t.Fatalf("Read() data = %q, want %q", string(buf[:n]), "ok")
 	}
-	if got := atomic.LoadInt64(&r.bytesAcc); got != 2 {
+	if got := r.bytesAcc.Load(); got != 2 {
 		t.Fatalf("bytesAcc after Read() = %d, want 2", got)
 	}
 }
@@ -63,7 +64,7 @@ func TestRateConnWriteRefundsShortWrite(t *testing.T) {
 	if n != 2 {
 		t.Fatalf("Write() n = %d, want 2", n)
 	}
-	if got := atomic.LoadInt64(&r.bytesAcc); got != 2 {
+	if got := r.bytesAcc.Load(); got != 2 {
 		t.Fatalf("bytesAcc after Write() = %d, want 2", got)
 	}
 }
@@ -78,5 +79,115 @@ func TestRateConnNilConnectionReturnsError(t *testing.T) {
 	}
 	if err := conn.Close(); !errors.Is(err, ErrNilConn) {
 		t.Fatalf("Close() error = %v, want %v", err, ErrNilConn)
+	}
+}
+
+type plainLimiter struct {
+	got, returned int64
+}
+
+func (l *plainLimiter) Get(size int64)          { l.got += size }
+func (l *plainLimiter) ReturnBucket(size int64) { l.returned += size }
+
+type ioResult struct {
+	n   int
+	err error
+}
+
+// closeWhileBlocked starts op, closes conn once op is blocked in the limiter
+// and returns op's result. stop releases op if Close fails to wake it.
+func closeWhileBlocked(t *testing.T, conn io.Closer, op func() (int, error), stop func()) ioResult {
+	t.Helper()
+	done := make(chan ioResult, 1)
+	go func() {
+		n, err := op()
+		done <- ioResult{n, err}
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+	select {
+	case res := <-done:
+		t.Fatalf("operation returned before Close: n=%d err=%v", res.n, res.err)
+	default:
+	}
+	if err := conn.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	select {
+	case res := <-done:
+		return res
+	case <-time.After(500 * time.Millisecond):
+		stop()
+		t.Fatal("Close() did not wake the operation blocked in the limiter")
+		return ioResult{}
+	}
+}
+
+func TestRateConnCloseWakesBlockedWrite(t *testing.T) {
+	r := NewRate(1024)
+	conn := NewRateConn(&scriptedConn{writeN: 64 << 10}, r)
+
+	res := closeWhileBlocked(t, conn, func() (int, error) {
+		return conn.Write(make([]byte, 64<<10))
+	}, r.Stop)
+	if res.n != 0 || !errors.Is(res.err, net.ErrClosed) {
+		t.Fatalf("Write() = %d, %v; want 0, %v", res.n, res.err, net.ErrClosed)
+	}
+	if got := r.bytesAcc.Load(); got != 0 {
+		t.Fatalf("bytesAcc after canceled Write() = %d, want 0", got)
+	}
+	// The unsent write was refunded, so other users of r get the full burst.
+	if wait := r.reserve(2048); wait != 0 {
+		t.Fatalf("reserve(2048) after canceled Write() wait=%s, want 0", time.Duration(wait))
+	}
+}
+
+func TestRateConnCloseWakesBlockedRead(t *testing.T) {
+	r := NewRate(1024)
+	conn := NewRateConn(&scriptedConn{readBuf: make([]byte, 64<<10)}, r)
+
+	res := closeWhileBlocked(t, conn, func() (int, error) {
+		return conn.Read(make([]byte, 64<<10))
+	}, r.Stop)
+	if res.n != 64<<10 || !errors.Is(res.err, net.ErrClosed) {
+		t.Fatalf("Read() = %d, %v; want %d, %v", res.n, res.err, 64<<10, net.ErrClosed)
+	}
+	// The bytes were received, so they stay charged.
+	if got := r.bytesAcc.Load(); got != 64<<10 {
+		t.Fatalf("bytesAcc after canceled Read() = %d, want %d", got, 64<<10)
+	}
+}
+
+func TestRateConnCloseWakesHierarchicalWrite(t *testing.T) {
+	first := NewRate(1024)
+	second := NewRate(1 << 20)
+	conn := NewRateConn(&scriptedConn{writeN: 64 << 10}, NewHierarchicalLimiter2(first, second))
+
+	res := closeWhileBlocked(t, conn, func() (int, error) {
+		return conn.Write(make([]byte, 64<<10))
+	}, first.Stop)
+	if res.n != 0 || !errors.Is(res.err, net.ErrClosed) {
+		t.Fatalf("Write() = %d, %v; want 0, %v", res.n, res.err, net.ErrClosed)
+	}
+	if got := first.bytesAcc.Load(); got != 0 {
+		t.Fatalf("first bytesAcc after canceled Write() = %d, want 0", got)
+	}
+	if got := second.bytesAcc.Load(); got != 0 {
+		t.Fatalf("second bytesAcc after canceled Write() = %d, want 0", got)
+	}
+}
+
+func TestRateConnPlainLimiter(t *testing.T) {
+	l := &plainLimiter{}
+	conn := NewRateConn(&scriptedConn{writeN: 5}, l)
+	if n, err := conn.Write([]byte("hello")); n != 5 || err != nil {
+		t.Fatalf("Write() = %d, %v; want 5, nil", n, err)
+	}
+	if err := conn.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	if l.got != 5 || l.returned != 0 {
+		t.Fatalf("limiter got/returned = %d/%d, want 5/0", l.got, l.returned)
 	}
 }

@@ -1,24 +1,51 @@
 package byterate
 
+import "context"
+
+// Limiter charges and refunds byte budgets. *Rate and *HierarchicalLimiter
+// implement it.
 type Limiter interface {
-	Get(int64)
-	ReturnBucket(int64)
+	// Get charges size bytes, blocking until the limit allows them.
+	Get(size int64)
+	// ReturnBucket refunds size bytes previously charged by Get.
+	ReturnBucket(size int64)
 }
 
+// ContextLimiter is a Limiter whose wait can be abandoned. NewRateConn uses it
+// so that Close ends a Read or Write blocked in the limiter.
+type ContextLimiter interface {
+	Limiter
+	// GetContext is like Get but returns ctx.Err() if ctx is done before the
+	// wait ends. The charge is kept; refund unused bytes with ReturnBucket.
+	GetContext(ctx context.Context, size int64) error
+}
+
+var (
+	_ ContextLimiter = (*Rate)(nil)
+	_ ContextLimiter = (*HierarchicalLimiter)(nil)
+)
+
+// HierarchicalLimiter charges every one of its Rates and waits for the longest
+// resulting delay, so the strictest Rate sets the pace.
 type HierarchicalLimiter struct {
 	first  *Rate
 	second *Rate
 	third  *Rate
 	extra  []*Rate
-	count  int
 }
 
+// NewHierarchicalLimiter combines limiters into one Limiter. Nil rates and
+// rates whose Limit is <= 0 at call time are left out. It returns nil if no
+// rate remains and that *Rate itself if only one remains.
 func NewHierarchicalLimiter(limiters ...*Rate) Limiter {
 	switch len(limiters) {
 	case 0:
 		return nil
 	case 1:
-		return enabledLimiter(limiters[0])
+		if current := enabledLimiter(limiters[0]); current != nil {
+			return current
+		}
+		return nil
 	case 2:
 		return NewHierarchicalLimiter2(limiters[0], limiters[1])
 	case 3:
@@ -31,6 +58,7 @@ func NewHierarchicalLimiter(limiters ...*Rate) Limiter {
 	return builder.build()
 }
 
+// NewHierarchicalLimiter2 is NewHierarchicalLimiter for exactly two rates.
 func NewHierarchicalLimiter2(first, second *Rate) Limiter {
 	builder := hierarchicalLimiterBuilder{}
 	builder.add(first)
@@ -38,6 +66,7 @@ func NewHierarchicalLimiter2(first, second *Rate) Limiter {
 	return builder.build()
 }
 
+// NewHierarchicalLimiter3 is NewHierarchicalLimiter for exactly three rates.
 func NewHierarchicalLimiter3(first, second, third *Rate) Limiter {
 	builder := hierarchicalLimiterBuilder{}
 	builder.add(first)
@@ -46,9 +75,30 @@ func NewHierarchicalLimiter3(first, second, third *Rate) Limiter {
 	return builder.build()
 }
 
+// Get charges size bytes to every Rate and blocks for the longest wait. Stop
+// on the Rate imposing that wait ends it early.
 func (l *HierarchicalLimiter) Get(size int64) {
+	if wait, stopCh := l.reserve(size); wait > coalesceWaitNs {
+		sleepNs(wait, stopCh, nil)
+	}
+}
+
+// GetContext is like Get but returns ctx.Err() if ctx is done before the wait
+// ends. The charge is kept either way; refund unused bytes with ReturnBucket.
+func (l *HierarchicalLimiter) GetContext(ctx context.Context, size int64) error {
+	if wait, stopCh := l.reserve(size); wait > coalesceWaitNs {
+		if !sleepNs(wait, stopCh, ctx.Done()) {
+			return ctx.Err()
+		}
+	}
+	return nil
+}
+
+// reserve charges size to every Rate and returns the longest wait together
+// with the stop channel of the Rate that imposed it.
+func (l *HierarchicalLimiter) reserve(size int64) (int64, <-chan struct{}) {
 	if l == nil || size <= 0 {
-		return
+		return 0, nil
 	}
 	var maxWait int64
 	var maxStopCh <-chan struct{}
@@ -76,11 +126,10 @@ func (l *HierarchicalLimiter) Get(size int64) {
 			maxStopCh = current.stopCh()
 		}
 	}
-	if maxWait > coalesceWaitNs {
-		sleepNs(maxWait, maxStopCh)
-	}
+	return maxWait, maxStopCh
 }
 
+// ReturnBucket refunds size bytes to every Rate.
 func (l *HierarchicalLimiter) ReturnBucket(size int64) {
 	if l == nil || size <= 0 {
 		return
@@ -137,7 +186,6 @@ func (b *hierarchicalLimiterBuilder) build() Limiter {
 			second: b.second,
 			third:  b.third,
 			extra:  b.extra,
-			count:  b.count,
 		}
 	}
 }

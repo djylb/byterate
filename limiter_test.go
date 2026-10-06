@@ -1,8 +1,8 @@
 package byterate
 
 import (
+	"context"
 	"errors"
-	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -16,6 +16,28 @@ func TestNewHierarchicalLimiterCollapsesSingleEnabledRate(t *testing.T) {
 	limiter := NewHierarchicalLimiter(nil, disabled, enabled)
 	if limiter != enabled {
 		t.Fatalf("NewHierarchicalLimiter() = %#v, want enabled rate pointer", limiter)
+	}
+}
+
+func TestNewHierarchicalLimiterReturnsUntypedNilWhenNoRateEnabled(t *testing.T) {
+	disabled := NewRate(0)
+	cases := map[string]Limiter{
+		"none":     NewHierarchicalLimiter(),
+		"nil":      NewHierarchicalLimiter(nil),
+		"disabled": NewHierarchicalLimiter(disabled),
+		"two":      NewHierarchicalLimiter2(nil, disabled),
+		"three":    NewHierarchicalLimiter3(nil, disabled, nil),
+		"four":     NewHierarchicalLimiter(nil, disabled, nil, disabled),
+	}
+	for name, l := range cases {
+		if l != nil {
+			t.Fatalf("%s: got %T(%v), want untyped nil", name, l, l)
+		}
+	}
+
+	enabled := NewRate(1024)
+	if l := NewHierarchicalLimiter(enabled); l != Limiter(enabled) {
+		t.Fatalf("single enabled: got %#v, want the rate itself", l)
 	}
 }
 
@@ -39,10 +61,10 @@ func TestHierarchicalLimiterRefundsAllChildrenOnShortWrite(t *testing.T) {
 	if n != 2 {
 		t.Fatalf("Write() n = %d, want 2", n)
 	}
-	if got := atomic.LoadInt64(&first.bytesAcc); got != 2 {
+	if got := first.bytesAcc.Load(); got != 2 {
 		t.Fatalf("first bytesAcc after Write() = %d, want 2", got)
 	}
-	if got := atomic.LoadInt64(&second.bytesAcc); got != 2 {
+	if got := second.bytesAcc.Load(); got != 2 {
 		t.Fatalf("second bytesAcc after Write() = %d, want 2", got)
 	}
 }
@@ -125,5 +147,31 @@ func TestHierarchicalLimiterWakeOnMaxWaitLimiterStop(t *testing.T) {
 		}
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("HierarchicalLimiter.Get() did not wake after max-wait limiter stop")
+	}
+}
+
+func TestHierarchicalLimiterGetContextCancel(t *testing.T) {
+	first := NewRate(1024)
+	second := NewRate(2048)
+	limiter := NewHierarchicalLimiter2(first, second).(*HierarchicalLimiter)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- limiter.GetContext(ctx, 64<<10)
+	}()
+
+	time.Sleep(20 * time.Millisecond)
+	cancel()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("GetContext() error = %v, want %v", err, context.Canceled)
+		}
+	case <-time.After(500 * time.Millisecond):
+		first.Stop()
+		second.Stop()
+		t.Fatal("HierarchicalLimiter.GetContext() did not return promptly after cancel")
 	}
 }

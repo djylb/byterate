@@ -1,8 +1,9 @@
 package byterate
 
 import (
+	"context"
 	"encoding/json"
-	"sync/atomic"
+	"errors"
 	"testing"
 	"time"
 )
@@ -25,6 +26,21 @@ func TestBytesToNsCeil(t *testing.T) {
 	if got := bytesToNsCeil(maxI64, 1); got != maxI64 {
 		t.Fatalf("bytesToNsCeil(maxI64,1)=%d, want maxI64", got)
 	}
+
+	// Inputs whose intermediate product exceeds int64 must stay exact.
+	for _, tc := range []struct{ bytes, rate, want int64 }{
+		{10_000_000_000, 10_000_000_000, 1_000_000_000},
+		{10 << 30, 10 << 30, 1_000_000_000},
+		{9_000_000_000, 1 << 62, 2},
+		{32768, maxI64, 1},
+		{maxI64, maxI64, 1_000_000_000},
+		{maxI64, 1_000_000_000, maxI64},
+		{maxI64, 1_000_000_001, 9_223_372_027_631_403_780},
+	} {
+		if got := bytesToNsCeil(tc.bytes, tc.rate); got != tc.want {
+			t.Fatalf("bytesToNsCeil(%d,%d)=%d, want %d", tc.bytes, tc.rate, got, tc.want)
+		}
+	}
 }
 
 func TestBytesPerSec(t *testing.T) {
@@ -44,6 +60,20 @@ func TestBytesPerSec(t *testing.T) {
 	}
 	if got := bytesPerSec(maxI64, 1); got != maxI64 {
 		t.Fatalf("bytesPerSec(maxI64,1)=%d, want maxI64", got)
+	}
+
+	// Inputs whose intermediate product exceeds int64 must stay exact.
+	for _, tc := range []struct{ bytes, dtNs, want int64 }{
+		{9_500_000_000, 10_000_000_000, 950_000_000},
+		{99_000_000_000, 100_000_000_000, 990_000_000},
+		{10_000_000_000, 20_000_000_000, 500_000_000},
+		{10 << 30, int64(1100 * time.Millisecond), 9_761_289_309},
+		{maxI64, int64(time.Second), maxI64},
+		{maxI64, maxI64, 1_000_000_000},
+	} {
+		if got := bytesPerSec(tc.bytes, tc.dtNs); got != tc.want {
+			t.Fatalf("bytesPerSec(%d,%d)=%d, want %d", tc.bytes, tc.dtNs, got, tc.want)
+		}
 	}
 }
 
@@ -172,20 +202,141 @@ func TestMeterCloneDetachesMutableState(t *testing.T) {
 	if cloned == original {
 		t.Fatal("Clone() returned original pointer, want detached copy")
 	}
-	if atomic.LoadInt64(&cloned.inAcc) != atomic.LoadInt64(&original.inAcc) || atomic.LoadInt64(&cloned.outAcc) != atomic.LoadInt64(&original.outAcc) {
+	if cloned.inAcc.Load() != original.inAcc.Load() || cloned.outAcc.Load() != original.outAcc.Load() {
 		t.Fatalf("Clone() accumulators = %d/%d, want %d/%d",
-			atomic.LoadInt64(&cloned.inAcc),
-			atomic.LoadInt64(&cloned.outAcc),
-			atomic.LoadInt64(&original.inAcc),
-			atomic.LoadInt64(&original.outAcc),
+			cloned.inAcc.Load(),
+			cloned.outAcc.Load(),
+			original.inAcc.Load(),
+			original.outAcc.Load(),
 		)
 	}
 
 	cloned.Add(5, 6)
-	if got := atomic.LoadInt64(&original.inAcc); got != 3 {
+	if got := original.inAcc.Load(); got != 3 {
 		t.Fatalf("original inAcc after clone mutation = %d, want 3", got)
 	}
-	if got := atomic.LoadInt64(&original.outAcc); got != 4 {
+	if got := original.outAcc.Load(); got != 4 {
 		t.Fatalf("original outAcc after clone mutation = %d, want 4", got)
+	}
+}
+
+func TestRateLargeGetDoesNotPoisonLimiter(t *testing.T) {
+	r := NewRate(10 << 30)
+	if wait := r.reserve(10 << 30); wait != 0 {
+		t.Fatalf("reserve(10GiB) at 10GiB/s with full burst wait=%s, want 0", time.Duration(wait))
+	}
+	if wait := r.reserve(20 << 30); wait < int64(900*time.Millisecond) || wait > int64(time.Second) {
+		t.Fatalf("reserve(20GiB) after burst wait=%s, want about 1s", time.Duration(wait))
+	}
+	if wait := r.reserve(1); wait > int64(2*time.Second) {
+		t.Fatalf("reserve(1) after large reservations wait=%s, want about 1s", time.Duration(wait))
+	}
+}
+
+func TestNewRateStartsWithFullBurst(t *testing.T) {
+	r := NewRate(1000)
+	if wait := r.reserve(2000); wait != 0 {
+		t.Fatalf("reserve(2000) within burst wait=%s, want 0", time.Duration(wait))
+	}
+	if wait := r.reserve(1000); wait < int64(900*time.Millisecond) || wait > int64(time.Second) {
+		t.Fatalf("reserve(1000) after burst wait=%s, want about 1s", time.Duration(wait))
+	}
+}
+
+func TestZeroValueRateLimitsAfterStart(t *testing.T) {
+	var r Rate
+	if wait := r.reserve(1 << 20); wait != 0 {
+		t.Fatalf("zero Rate before Start wait=%s, want 0", time.Duration(wait))
+	}
+	r.SetLimit(1000)
+	r.Start()
+	if wait := r.reserve(2000); wait != 0 {
+		t.Fatalf("reserve(2000) within burst wait=%s, want 0", time.Duration(wait))
+	}
+	if wait := r.reserve(1000); wait < int64(900*time.Millisecond) || wait > int64(time.Second) {
+		t.Fatalf("reserve(1000) after burst wait=%s, want about 1s", time.Duration(wait))
+	}
+	last := r.lastSampleNs.Load()
+	r.updateRateWithNow(last + int64(2*time.Second))
+	if got := r.nowBps.Load(); got != 1500 {
+		t.Fatalf("nowBps after 3000 bytes over 2s = %d, want 1500", got)
+	}
+
+	cloned := (&Rate{}).Clone()
+	cloned.ResetLimit(1000)
+	cloned.reserve(2000)
+	if wait := cloned.reserve(1000); wait < int64(900*time.Millisecond) || wait > int64(time.Second) {
+		t.Fatalf("clone of zero Rate reserve(1000) after burst wait=%s, want about 1s", time.Duration(wait))
+	}
+}
+
+func TestRateSetLimitKeepsDebtResetLimitClearsIt(t *testing.T) {
+	r := NewRate(1)
+	r.reserve(100)
+	r.SetLimit(1 << 30)
+	if wait := r.reserve(1); wait < int64(90*time.Second) {
+		t.Fatalf("reserve(1) after SetLimit wait=%s, want the old debt kept", time.Duration(wait))
+	}
+	r.ResetLimit(1 << 30)
+	if wait := r.reserve(1); wait != 0 {
+		t.Fatalf("reserve(1) after ResetLimit wait=%s, want 0", time.Duration(wait))
+	}
+}
+
+func TestRateMarshalJSONReportsZeroWhenIdle(t *testing.T) {
+	r := NewRate(0)
+	r.reserve(500)
+	r.lastSampleNs.Store(nowNs() - int64(2*time.Second))
+
+	nowRate := func() int64 {
+		b, err := r.MarshalJSON()
+		if err != nil {
+			t.Fatalf("MarshalJSON error: %v", err)
+		}
+		var out map[string]int64
+		if err := json.Unmarshal(b, &out); err != nil {
+			t.Fatalf("json.Unmarshal error: %v", err)
+		}
+		return out["NowRate"]
+	}
+	if got := nowRate(); got < 200 || got > 250 {
+		t.Fatalf("MarshalJSON NowRate=%d, want about 250", got)
+	}
+
+	// An idle window must read 0, not the earlier bytes spread over more time.
+	r.lastSampleNs.Store(nowNs() - int64(time.Second))
+	if got := nowRate(); got != 0 {
+		t.Fatalf("idle MarshalJSON NowRate=%d, want 0", got)
+	}
+}
+
+func TestRateGetContextCancel(t *testing.T) {
+	r := NewRate(1024)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- r.GetContext(ctx, 64<<10)
+	}()
+
+	time.Sleep(20 * time.Millisecond)
+	cancel()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("GetContext() error = %v, want %v", err, context.Canceled)
+		}
+	case <-time.After(500 * time.Millisecond):
+		r.Stop()
+		t.Fatal("GetContext() did not return promptly after cancel")
+	}
+	if got := r.bytesAcc.Load(); got != 64<<10 {
+		t.Fatalf("bytesAcc after canceled GetContext = %d, want charge kept", got)
+	}
+
+	// No wait needed: a done context does not turn an allowed charge into an error.
+	r.ResetLimit(1024)
+	if err := r.GetContext(ctx, 1); err != nil {
+		t.Fatalf("GetContext() within burst error = %v, want nil", err)
 	}
 }
