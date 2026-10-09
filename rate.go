@@ -2,7 +2,7 @@ package byterate
 
 import (
 	"context"
-	"encoding/json"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -38,11 +38,6 @@ type Rate struct {
 	bytesAcc     atomic.Int64
 	lastSampleNs atomic.Int64
 	nowBps       atomic.Int64
-}
-
-type rateJSON struct {
-	NowRate int64 `json:"NowRate"` // bytes/s
-	Limit   int64 `json:"Limit"`   // bytes/s, 0 => unlimited
 }
 
 // NewRate returns a started Rate limited to limitBps bytes per second with a
@@ -254,10 +249,13 @@ func (r *Rate) MarshalJSON() ([]byte, error) {
 	if r == nil {
 		return []byte("null"), nil
 	}
-	return json.Marshal(rateJSON{
-		NowRate: r.Now(),
-		Limit:   r.Limit(),
-	})
+	// Encoded by hand so that importing the package does not link
+	// encoding/json, which adds about 150 KB to a binary.
+	b := append(make([]byte, 0, 48), `{"NowRate":`...)
+	b = strconv.AppendInt(b, r.Now(), 10)
+	b = append(b, `,"Limit":`...)
+	b = strconv.AppendInt(b, r.Limit(), 10)
+	return append(b, '}'), nil
 }
 
 func (r *Rate) reserve(size int64) int64 {
