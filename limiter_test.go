@@ -53,7 +53,7 @@ func TestHierarchicalLimiterRefundsAllChildrenOnShortWrite(t *testing.T) {
 	}
 
 	wantErr := errors.New("short write")
-	conn := NewRateConn(&scriptedConn{writeN: 2, writeErr: wantErr}, limiter)
+	conn := NewRateReadWriteCloser(&scriptedConn{writeN: 2, writeErr: wantErr}, limiter)
 	n, err := conn.Write([]byte("hello"))
 	if !errors.Is(err, wantErr) {
 		t.Fatalf("Write() error = %v, want %v", err, wantErr)

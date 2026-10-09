@@ -213,10 +213,7 @@ func (r *Rate) ReturnBucket(size int64) {
 
 	for {
 		prev := r.tat.Load()
-		next := clampSub(prev, refund)
-		if next < minTat {
-			next = minTat
-		}
+		next := max(clampSub(prev, refund), minTat)
 		if r.tat.CompareAndSwap(prev, next) {
 			return
 		}
@@ -284,11 +281,7 @@ func (r *Rate) reserve(size int64) int64 {
 		minTat := now - burstWindowNs
 
 		prev := r.tat.Load()
-		base := prev
-		if base < minTat {
-			base = minTat
-		}
-		next := clampAdd(base, cost)
+		next := clampAdd(max(prev, minTat), cost)
 
 		if r.tat.CompareAndSwap(prev, next) {
 			wait := next - now
@@ -324,10 +317,7 @@ func (r *Rate) updateRateWithNow(now int64) {
 		return
 	}
 
-	bytes := r.bytesAcc.Swap(0)
-	if bytes < 0 {
-		bytes = 0
-	}
+	bytes := max(r.bytesAcc.Swap(0), 0)
 	dt := now - last
 	if dt <= 0 {
 		return

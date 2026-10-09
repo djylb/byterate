@@ -4,6 +4,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"os"
 	"testing"
 	"time"
 )
@@ -34,7 +35,7 @@ func (c *scriptedConn) Close() error { return nil }
 
 func TestRateConnReadChargesActualBytes(t *testing.T) {
 	r := NewRate(1 << 20)
-	conn := NewRateConn(&scriptedConn{readBuf: []byte("ok")}, r)
+	conn := NewRateReadWriteCloser(&scriptedConn{readBuf: []byte("ok")}, r)
 
 	buf := make([]byte, 4)
 	n, err := conn.Read(buf)
@@ -55,7 +56,7 @@ func TestRateConnReadChargesActualBytes(t *testing.T) {
 func TestRateConnWriteRefundsShortWrite(t *testing.T) {
 	r := NewRate(1 << 20)
 	wantErr := errors.New("short write")
-	conn := NewRateConn(&scriptedConn{writeN: 2, writeErr: wantErr}, r)
+	conn := NewRateReadWriteCloser(&scriptedConn{writeN: 2, writeErr: wantErr}, r)
 
 	n, err := conn.Write([]byte("hello"))
 	if !errors.Is(err, wantErr) {
@@ -70,7 +71,7 @@ func TestRateConnWriteRefundsShortWrite(t *testing.T) {
 }
 
 func TestRateConnNilConnectionReturnsError(t *testing.T) {
-	conn := NewRateConn(nil, NewRate(1024))
+	conn := NewRateReadWriteCloser(nil, NewRate(1024))
 	if _, err := conn.Read(make([]byte, 1)); !errors.Is(err, ErrNilConn) {
 		t.Fatalf("Read() error = %v, want %v", err, ErrNilConn)
 	}
@@ -126,7 +127,7 @@ func closeWhileBlocked(t *testing.T, conn io.Closer, op func() (int, error), sto
 
 func TestRateConnCloseWakesBlockedWrite(t *testing.T) {
 	r := NewRate(1024)
-	conn := NewRateConn(&scriptedConn{writeN: 64 << 10}, r)
+	conn := NewRateReadWriteCloser(&scriptedConn{writeN: 64 << 10}, r)
 
 	res := closeWhileBlocked(t, conn, func() (int, error) {
 		return conn.Write(make([]byte, 64<<10))
@@ -145,7 +146,7 @@ func TestRateConnCloseWakesBlockedWrite(t *testing.T) {
 
 func TestRateConnCloseWakesBlockedRead(t *testing.T) {
 	r := NewRate(1024)
-	conn := NewRateConn(&scriptedConn{readBuf: make([]byte, 64<<10)}, r)
+	conn := NewRateReadWriteCloser(&scriptedConn{readBuf: make([]byte, 64<<10)}, r)
 
 	res := closeWhileBlocked(t, conn, func() (int, error) {
 		return conn.Read(make([]byte, 64<<10))
@@ -162,7 +163,7 @@ func TestRateConnCloseWakesBlockedRead(t *testing.T) {
 func TestRateConnCloseWakesHierarchicalWrite(t *testing.T) {
 	first := NewRate(1024)
 	second := NewRate(1 << 20)
-	conn := NewRateConn(&scriptedConn{writeN: 64 << 10}, NewHierarchicalLimiter2(first, second))
+	conn := NewRateReadWriteCloser(&scriptedConn{writeN: 64 << 10}, NewHierarchicalLimiter2(first, second))
 
 	res := closeWhileBlocked(t, conn, func() (int, error) {
 		return conn.Write(make([]byte, 64<<10))
@@ -180,7 +181,7 @@ func TestRateConnCloseWakesHierarchicalWrite(t *testing.T) {
 
 func TestRateConnPlainLimiter(t *testing.T) {
 	l := &plainLimiter{}
-	conn := NewRateConn(&scriptedConn{writeN: 5}, l)
+	conn := NewRateReadWriteCloser(&scriptedConn{writeN: 5}, l)
 	if n, err := conn.Write([]byte("hello")); n != 5 || err != nil {
 		t.Fatalf("Write() = %d, %v; want 5, nil", n, err)
 	}
@@ -189,5 +190,70 @@ func TestRateConnPlainLimiter(t *testing.T) {
 	}
 	if l.got != 5 || l.returned != 0 {
 		t.Fatalf("limiter got/returned = %d/%d, want 5/0", l.got, l.returned)
+	}
+}
+
+func TestRateConnKeepsNetConnBehavior(t *testing.T) {
+	client, server := net.Pipe()
+	defer func() { _ = server.Close() }()
+	r := NewRate(1 << 20)
+	conn := NewRateConn(client, r)
+	if conn.LocalAddr() != client.LocalAddr() || conn.RemoteAddr() != client.RemoteAddr() {
+		t.Fatalf("addresses = %v/%v, want %v/%v", conn.LocalAddr(), conn.RemoteAddr(), client.LocalAddr(), client.RemoteAddr())
+	}
+	if raw := conn.(interface{ RawConn() net.Conn }).RawConn(); raw != client {
+		t.Fatalf("RawConn() = %v, want wrapped conn", raw)
+	}
+	if err := conn.SetReadDeadline(time.Now().Add(-time.Second)); err != nil {
+		t.Fatalf("SetReadDeadline() error = %v", err)
+	}
+	if _, err := conn.Read(make([]byte, 1)); !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("Read() after past deadline error = %v", err)
+	}
+	if err := conn.SetDeadline(time.Time{}); err != nil {
+		t.Fatalf("SetDeadline() error = %v", err)
+	}
+	if err := conn.SetWriteDeadline(time.Time{}); err != nil {
+		t.Fatalf("SetWriteDeadline() error = %v", err)
+	}
+	go func() { _, _ = conn.Write([]byte("abc")) }()
+	buf := make([]byte, 3)
+	if _, err := io.ReadFull(server, buf); err != nil || string(buf) != "abc" {
+		t.Fatalf("server read = %q, %v", buf, err)
+	}
+	if got := r.bytesAcc.Load(); got != 3 {
+		t.Fatalf("bytesAcc = %d, want 3", got)
+	}
+	if err := conn.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	if _, err := server.Read(buf); !errors.Is(err, io.EOF) {
+		t.Fatalf("server Read() after Close error = %v, want EOF", err)
+	}
+}
+
+func TestRateConnNilArguments(t *testing.T) {
+	client, server := net.Pipe()
+	defer func() { _ = client.Close() }()
+	defer func() { _ = server.Close() }()
+	if got := NewRateConn(client, nil); got != client {
+		t.Fatalf("NewRateConn(c, nil) = %v, want c", got)
+	}
+	if got := NewRateReadWriteCloser(client, nil); got != io.ReadWriteCloser(client) {
+		t.Fatalf("NewRateReadWriteCloser(c, nil) = %v, want c", got)
+	}
+	conn := NewRateConn(nil, NewRate(1024))
+	if conn.LocalAddr() != nil || conn.RemoteAddr() != nil {
+		t.Fatalf("nil conn addresses = %v/%v, want nil", conn.LocalAddr(), conn.RemoteAddr())
+	}
+	for name, err := range map[string]error{
+		"Close":            conn.Close(),
+		"SetDeadline":      conn.SetDeadline(time.Time{}),
+		"SetReadDeadline":  conn.SetReadDeadline(time.Time{}),
+		"SetWriteDeadline": conn.SetWriteDeadline(time.Time{}),
+	} {
+		if !errors.Is(err, ErrNilConn) {
+			t.Fatalf("%s() error = %v, want %v", name, err, ErrNilConn)
+		}
 	}
 }

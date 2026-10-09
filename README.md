@@ -14,7 +14,8 @@ go get github.com/djylb/byterate
 import "github.com/djylb/byterate"
 
 limiter := byterate.NewRate(64 * 1024)
-limitedConn := byterate.NewRateConn(conn, limiter)
+limitedConn := byterate.NewRateConn(conn, limiter)           // net.Conn
+limitedStream := byterate.NewRateReadWriteCloser(rwc, limiter) // io.ReadWriteCloser
 
 meter := byterate.NewMeter()
 meter.Add(readBytes, writtenBytes)
@@ -37,10 +38,13 @@ inBps, outBps, totalBps := meter.Snapshot()
 - `NewHierarchicalLimiter` charges every `Rate` and waits for the longest
   delay. Nil rates and rates with no limit are left out; it returns nil when
   none remain.
-- `NewRateConn` charges reads after the data arrives and writes before
-  sending, refunding short writes. When the limiter implements
-  `ContextLimiter` (`*Rate` and `*HierarchicalLimiter` do), `Close` wakes a
-  `Read` or `Write` blocked in the limiter, which then returns
-  `net.ErrClosed`.
+- `NewRateConn` and `NewRateReadWriteCloser` charge reads after the data
+  arrives and writes before sending, refunding short writes. When the limiter
+  implements `ContextLimiter` (`*Rate` and `*HierarchicalLimiter` do), `Close`
+  wakes a `Read` or `Write` blocked in the limiter, which then returns
+  `net.ErrClosed`. A nil limiter returns the connection unchanged.
+- `NewRateConn` keeps the `net.Conn` addresses and deadlines, and its
+  `RawConn` method returns the wrapped connection, so helpers such as
+  `netx.RawConnOf` can unwrap it.
 - `Rate.Now` and `Meter.Snapshot` report bytes per second over the last
   sampling window of at least one second.

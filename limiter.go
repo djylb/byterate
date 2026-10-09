@@ -11,7 +11,7 @@ type Limiter interface {
 	ReturnBucket(size int64)
 }
 
-// ContextLimiter is a Limiter whose wait can be abandoned. NewRateConn uses it
+// ContextLimiter is a Limiter whose wait can be abandoned. NewRateConn and NewRateReadWriteCloser use it
 // so that Close ends a Read or Write blocked in the limiter.
 type ContextLimiter interface {
 	Limiter
