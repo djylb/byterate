@@ -7,11 +7,16 @@ import "sync/atomic"
 // ready to use and starts its first sampling window on first use. A Meter must
 // not be copied after first use; use Clone.
 type Meter struct {
+	// Read by every Add and written once per sampling window.
 	lastSampleNs atomic.Int64 // ns since epoch, 0 => no window started yet
-	inAcc        atomic.Int64
-	outAcc       atomic.Int64
 	inBps        atomic.Int64
 	outBps       atomic.Int64
+
+	_ cacheLinePad
+	// Written by every Add, on a cache line of their own.
+	inAcc  atomic.Int64
+	outAcc atomic.Int64
+	_      cacheLinePad
 }
 
 // NewMeter returns a Meter whose first sampling window starts now.

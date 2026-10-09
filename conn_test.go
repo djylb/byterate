@@ -257,3 +257,75 @@ func TestRateConnNilArguments(t *testing.T) {
 		}
 	}
 }
+
+func TestRateConnCloseWrite(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = ln.Close() }()
+	client, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = client.Close() }()
+	server, err := ln.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = server.Close() }()
+
+	limited := NewRateConn(client, NewRate(1<<20))
+	cw, ok := limited.(interface{ CloseWrite() error })
+	if !ok {
+		t.Fatal("rate conn has no CloseWrite")
+	}
+	if err := cw.CloseWrite(); err != nil {
+		t.Fatalf("CloseWrite() error = %v", err)
+	}
+	_ = server.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := server.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
+		t.Fatalf("peer Read() error = %v, want EOF after CloseWrite", err)
+	}
+
+	plain := NewRateReadWriteCloser(&scriptedConn{}, NewRate(1<<20))
+	if err := plain.(interface{ CloseWrite() error }).CloseWrite(); !errors.Is(err, errors.ErrUnsupported) {
+		t.Fatalf("CloseWrite() without support error = %v, want %v", err, errors.ErrUnsupported)
+	}
+}
+
+func TestDuplexRateConnChargesEachDirection(t *testing.T) {
+	in, out := NewRate(1<<30), NewRate(1<<30)
+	conn := NewDuplexRateReadWriteCloser(&scriptedConn{readBuf: []byte("abc"), writeN: 64}, in, out)
+	if _, err := conn.Read(make([]byte, 8)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Write([]byte("hello")); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := in.bytesAcc.Load(), int64(3); got != want {
+		t.Fatalf("read limiter charged %d, want %d", got, want)
+	}
+	if got, want := out.bytesAcc.Load(), int64(5); got != want {
+		t.Fatalf("write limiter charged %d, want %d", got, want)
+	}
+
+	// One direction may be left unlimited.
+	conn = NewDuplexRateReadWriteCloser(&scriptedConn{readBuf: []byte("abc"), writeN: 64}, nil, out)
+	if _, err := conn.Read(make([]byte, 8)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Write([]byte("hi")); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := out.bytesAcc.Load(), int64(7); got != want {
+		t.Fatalf("write limiter charged %d in total, want %d", got, want)
+	}
+
+	raw, peer := net.Pipe()
+	defer func() { _ = raw.Close() }()
+	defer func() { _ = peer.Close() }()
+	if c := NewDuplexRateConn(raw, nil, nil); c != raw {
+		t.Fatalf("NewDuplexRateConn(nil, nil) = %T, want the connection itself", c)
+	}
+}

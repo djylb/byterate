@@ -7,27 +7,13 @@ import (
 	"time"
 )
 
-func TestNewHierarchicalLimiterCollapsesSingleEnabledRate(t *testing.T) {
-	enabled := NewRate(64 * 1024)
-	enabled.Start()
-	disabled := NewRate(0)
-	disabled.Start()
-
-	limiter := NewHierarchicalLimiter(nil, disabled, enabled)
-	if limiter != enabled {
-		t.Fatalf("NewHierarchicalLimiter() = %#v, want enabled rate pointer", limiter)
-	}
-}
-
-func TestNewHierarchicalLimiterReturnsUntypedNilWhenNoRateEnabled(t *testing.T) {
-	disabled := NewRate(0)
+func TestNewHierarchicalLimiterCollapses(t *testing.T) {
 	cases := map[string]Limiter{
-		"none":     NewHierarchicalLimiter(),
-		"nil":      NewHierarchicalLimiter(nil),
-		"disabled": NewHierarchicalLimiter(disabled),
-		"two":      NewHierarchicalLimiter2(nil, disabled),
-		"three":    NewHierarchicalLimiter3(nil, disabled, nil),
-		"four":     NewHierarchicalLimiter(nil, disabled, nil, disabled),
+		"none":  NewHierarchicalLimiter(),
+		"nil":   NewHierarchicalLimiter(nil),
+		"two":   NewHierarchicalLimiter2(nil, nil),
+		"three": NewHierarchicalLimiter3(nil, nil, nil),
+		"four":  NewHierarchicalLimiter(nil, nil, nil, nil),
 	}
 	for name, l := range cases {
 		if l != nil {
@@ -35,9 +21,49 @@ func TestNewHierarchicalLimiterReturnsUntypedNilWhenNoRateEnabled(t *testing.T) 
 		}
 	}
 
-	enabled := NewRate(1024)
-	if l := NewHierarchicalLimiter(enabled); l != Limiter(enabled) {
-		t.Fatalf("single enabled: got %#v, want the rate itself", l)
+	// A single Rate, limited or not, is returned itself.
+	for _, r := range []*Rate{NewRate(0), NewRate(1024)} {
+		if l := NewHierarchicalLimiter(nil, r, nil); l != Limiter(r) {
+			t.Fatalf("single rate: got %#v, want the rate itself", l)
+		}
+	}
+	unlimited, limited := NewRate(0), NewRate(1024)
+	for _, l := range []Limiter{
+		NewHierarchicalLimiter(nil, unlimited, limited),
+		NewHierarchicalLimiter2(unlimited, limited),
+		NewHierarchicalLimiter3(unlimited, nil, limited),
+		NewHierarchicalLimiter(unlimited, limited, NewRate(0), NewRate(0)),
+	} {
+		if _, ok := l.(*HierarchicalLimiter); !ok {
+			t.Fatalf("two or more rates: got %T, want *HierarchicalLimiter", l)
+		}
+	}
+}
+
+// TestHierarchicalLimiterMetersUnlimitedRates checks that an unlimited level,
+// such as a global one kept only for its throughput, is charged too.
+func TestHierarchicalLimiterMetersUnlimitedRates(t *testing.T) {
+	global := NewRate(0)
+	conn := NewRate(1 << 30)
+	l := NewHierarchicalLimiter(conn, global)
+	l.Get(64 << 10)
+	for _, r := range []*Rate{global, conn} {
+		r.lastSampleNs.Store(nowNs() - int64(time.Second))
+		if got := r.Now(); got < 32<<10 {
+			t.Fatalf("Now() = %d B/s, want the charged 64 KiB over about a second", got)
+		}
+	}
+}
+
+// TestHierarchicalLimiterAppliesLaterLimit checks that a limit set on a level
+// after the limiter was built applies to it.
+func TestHierarchicalLimiterAppliesLaterLimit(t *testing.T) {
+	later := NewRate(0)
+	l := NewHierarchicalLimiter(later, NewRate(0)).(*HierarchicalLimiter)
+	later.SetLimit(1000)
+	// Two seconds' burst is free; the third second of bytes must wait.
+	if wait, _ := l.reserve(3000); wait < int64(900*time.Millisecond) {
+		t.Fatalf("wait = %v, want about a second", time.Duration(wait))
 	}
 }
 

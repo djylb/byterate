@@ -27,6 +27,10 @@ func nowNs() int64 {
 	return int64(time.Since(epoch))
 }
 
+// cacheLinePad separates fields written by different cores. 128 bytes covers
+// the 128-byte lines of Apple silicon and the adjacent-line prefetch of x86.
+type cacheLinePad [128]byte
+
 var timerPool = sync.Pool{
 	New: func() any {
 		t := time.NewTimer(0)

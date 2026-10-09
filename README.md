@@ -22,6 +22,20 @@ meter.Add(readBytes, writtenBytes)
 inBps, outBps, totalBps := meter.Snapshot()
 ```
 
+Nested limits, such as a connection's within its user's within a global one,
+charge every level, and each level reports its own throughput:
+
+```go
+global := byterate.NewRate(0)      // unlimited, kept for its throughput
+user := byterate.NewRate(10 << 20) // 10 MiB/s for all of a user's connections
+conn := byterate.NewRateConn(c, byterate.NewHierarchicalLimiter(byterate.NewRate(2<<20), user, global))
+fmt.Println(global.Now(), user.Now()) // bytes/s of each level
+global.SetLimit(100 << 20)            // applies to open connections too
+
+// Separate download and upload limits for one connection.
+duplex := byterate.NewDuplexRateConn(c, byterate.NewRate(8<<20), byterate.NewRate(1<<20))
+```
+
 ## Semantics
 
 - Limits are in bytes per second; a limit `<= 0` means unlimited.
@@ -35,9 +49,13 @@ inBps, outBps, totalBps := meter.Snapshot()
 - `Stop` disables limiting and wakes callers blocked in `Get`.
   `GetContext` also returns early when its context is done; the charge is
   kept, so refund bytes that were not transferred with `ReturnBucket`.
-- `NewHierarchicalLimiter` charges every `Rate` and waits for the longest
-  delay. Nil rates and rates with no limit are left out; it returns nil when
-  none remain.
+- `NewHierarchicalLimiter` charges every started `Rate` and waits for the
+  longest delay. Nil rates are left out and it returns nil when none remain,
+  or the `Rate` itself when one does. Unlimited rates are kept, so they meter
+  the traffic and a limit set on them later applies to existing connections.
+  Pass nil for levels that should neither limit nor meter: wrapping a
+  connection costs a charge per call and hides `*net.TCPConn`'s zero-copy
+  `ReadFrom`/`WriteTo`.
 - `NewRateConn` and `NewRateReadWriteCloser` charge reads after the data
   arrives and writes before sending, refunding short writes. When the limiter
   implements `ContextLimiter` (`*Rate` and `*HierarchicalLimiter` do), `Close`
@@ -45,6 +63,31 @@ inBps, outBps, totalBps := meter.Snapshot()
   `net.ErrClosed`. A nil limiter returns the connection unchanged.
 - `NewRateConn` keeps the `net.Conn` addresses and deadlines, and its
   `RawConn` method returns the wrapped connection, so helpers such as
-  `netx.RawConnOf` can unwrap it.
+  `netx.RawConnOf` can unwrap it. `CloseWrite` is passed on when the wrapped
+  connection has one, so relays such as `netx.Relay` can half-close through
+  the wrapper.
 - `Rate.Now` and `Meter.Snapshot` report bytes per second over the last
-  sampling window of at least one second.
+  sampling window of at least one second, so they lag by up to about two
+  seconds. `NewRateConn` charges both directions of a connection to one
+  limiter; `NewDuplexRateConn` and `NewDuplexRateReadWriteCloser` take one per
+  direction, so uploads and downloads are limited and metered apart.
+
+## Performance
+
+`Get`, `ReturnBucket`, `Now` and `Meter.Add` are lock-free and
+allocation-free. Medians on an Apple M5 Pro, with 32 KiB charges that never
+wait (`go test -bench .`):
+
+| Operation                           | 1 goroutine | 8 goroutines         |
+|-------------------------------------|-------------|----------------------|
+| `Rate.Get`                          | 17 ns       | 75 ns on one `Rate`  |
+| `HierarchicalLimiter.Get`, 3 levels | 25 ns       | 81 ns                |
+| `Meter.Add`                         | 15 ns       | 23 ns on one `Meter` |
+| `Rate.Now`                          | 12 ns       | 12 ns                |
+
+The 8-goroutine figures are wall time per call across all goroutines. In the
+hierarchical case each goroutine has its own connection `Rate`, under one of
+four user `Rate`s and one global `Rate`. A hierarchical charge reads the clock
+once for all levels, and hot counters sit on cache lines of their own, so
+`Rate`s and `Meter`s used by different cores do not slow each other down; this
+padding makes a `Rate` about 330 bytes and a `Meter` about 300.

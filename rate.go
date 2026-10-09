@@ -25,19 +25,22 @@ type stopSignal struct {
 // ResetLimit, or SetLimit and Start, before use. A Rate must not be copied
 // after first use; use Clone.
 type Rate struct {
-	rate atomic.Int64 // bytes/s, <=0 => unlimited
-	tat  atomic.Int64 // theoretical arrival time (ns since epoch), can be negative
+	// Read by every charge and written rarely, so they stay cached on every
+	// core.
+	rate         atomic.Int64 // bytes/s, <=0 => unlimited
+	lastSampleNs atomic.Int64 // start of the sampling window
+	stop         atomic.Pointer[stopSignal]
+	enabled      atomic.Bool
 
-	enabled atomic.Bool
+	_ cacheLinePad
+	// Written by every charge, on a cache line of their own.
+	tat      atomic.Int64 // theoretical arrival time (ns since epoch), can be negative
+	bytesAcc atomic.Int64 // bytes charged in the current sampling window
+	_        cacheLinePad
 
+	nowBps  atomic.Int64 // throughput of the last sampling window, bytes/s
 	mu      sync.Mutex
 	stopped bool
-	stop    atomic.Pointer[stopSignal]
-
-	// approx realtime rate (bytes/s)
-	bytesAcc     atomic.Int64
-	lastSampleNs atomic.Int64
-	nowBps       atomic.Int64
 }
 
 // NewRate returns a started Rate limited to limitBps bytes per second with a
@@ -52,11 +55,7 @@ func NewRate(limitBps int64) *Rate {
 	r.stop.Store(&stopSignal{ch: make(chan struct{})})
 
 	now := nowNs()
-	if limitBps > 0 {
-		r.tat.Store(now - burstWindowNs) // full burst initially
-	} else {
-		r.tat.Store(0)
-	}
+	r.tat.Store(now - burstWindowNs) // full burst, also for a limit set later
 
 	r.lastSampleNs.Store(now)
 	r.nowBps.Store(0)
@@ -151,15 +150,9 @@ func (r *Rate) Start() {
 	}
 
 	if needReset {
-		rate := r.rate.Load()
-		if rate > 0 {
-			now := nowNs()
-			r.tat.Store(now - burstWindowNs) // full burst on (re)enable
-		} else {
-			r.tat.Store(0)
-		}
-		r.bytesAcc.Store(0)
 		now := nowNs()
+		r.tat.Store(now - burstWindowNs) // full burst on (re)enable
+		r.bytesAcc.Store(0)
 		r.lastSampleNs.Store(now)
 		r.nowBps.Store(0)
 	}
@@ -259,13 +252,18 @@ func (r *Rate) MarshalJSON() ([]byte, error) {
 }
 
 func (r *Rate) reserve(size int64) int64 {
+	return r.reserveAt(size, nowNs())
+}
+
+// reserveAt charges size at time now, as returned by nowNs, and returns how
+// long the caller must wait. A HierarchicalLimiter passes one now to all its
+// Rates, reading the clock once.
+func (r *Rate) reserveAt(size, now int64) int64 {
 	if r == nil || size <= 0 || !r.enabled.Load() {
 		return 0
 	}
 
 	r.bytesAcc.Add(size)
-
-	now := nowNs()
 	r.updateRateWithNow(now)
 
 	currentRate := r.rate.Load()
@@ -274,25 +272,18 @@ func (r *Rate) reserve(size int64) int64 {
 	}
 
 	cost := bytesToNsCeil(size, currentRate)
-
+	minTat := now - burstWindowNs
 	for {
-		minTat := now - burstWindowNs
-
 		prev := r.tat.Load()
 		next := clampAdd(max(prev, minTat), cost)
-
 		if r.tat.CompareAndSwap(prev, next) {
-			wait := next - now
-			if wait < 0 {
-				return 0
-			}
-			return wait
+			return max(next-now, 0)
 		}
-
+		// Retry at once with the same now: reading the clock again would
+		// widen the window in which other cores win the race.
 		if !r.enabled.Load() {
 			return 0
 		}
-		now = nowNs()
 	}
 }
 

@@ -340,3 +340,19 @@ func TestRateGetContextCancel(t *testing.T) {
 		t.Fatalf("GetContext() within burst error = %v, want nil", err)
 	}
 }
+
+// TestRateStartsWithFullBurstForLaterLimit checks that an unlimited Rate
+// given a limit later starts with the full burst, also early in the process,
+// when the monotonic clock is still below the burst window.
+func TestRateStartsWithFullBurstForLaterLimit(t *testing.T) {
+	for _, r := range []*Rate{NewRate(0), func() *Rate { var r Rate; r.Start(); return &r }()} {
+		want := nowNs() - burstWindowNs
+		if got := r.tat.Load(); got > want || got < want-int64(time.Second) {
+			t.Fatalf("tat = %d, want about %d (a full burst)", got, want)
+		}
+		r.SetLimit(1000)
+		if wait := r.reserve(2000); wait > int64(time.Millisecond) {
+			t.Fatalf("first 2s of bytes waited %v, want the burst", time.Duration(wait))
+		}
+	}
+}

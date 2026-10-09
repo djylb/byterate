@@ -26,7 +26,10 @@ var (
 )
 
 // HierarchicalLimiter charges every one of its Rates and waits for the longest
-// resulting delay, so the strictest Rate sets the pace.
+// resulting delay, so the strictest Rate sets the pace. Every started Rate also
+// meters the traffic, whether or not it has a limit, so each level reports its
+// own throughput through Now, and a limit set on any of them later applies to
+// the next charge. A stopped or never-started Rate is skipped until Start.
 type HierarchicalLimiter struct {
 	first  *Rate
 	second *Rate
@@ -34,45 +37,39 @@ type HierarchicalLimiter struct {
 	extra  []*Rate
 }
 
-// NewHierarchicalLimiter combines limiters into one Limiter. Nil rates and
-// rates whose Limit is <= 0 at call time are left out. It returns nil if no
+// NewHierarchicalLimiter combines rates, such as a connection's, its user's
+// and a global one, into one Limiter. Nil rates are left out; unlimited ones
+// are kept so that they meter and can be limited later. It returns nil if no
 // rate remains and that *Rate itself if only one remains.
-func NewHierarchicalLimiter(limiters ...*Rate) Limiter {
-	switch len(limiters) {
-	case 0:
-		return nil
-	case 1:
-		if current := enabledLimiter(limiters[0]); current != nil {
-			return current
-		}
-		return nil
-	case 2:
-		return NewHierarchicalLimiter2(limiters[0], limiters[1])
-	case 3:
-		return NewHierarchicalLimiter3(limiters[0], limiters[1], limiters[2])
+//
+// Pass nil for levels that should neither limit nor meter: a limiter of
+// unlimited Rates still charges every call, and wrapping a connection with
+// NewRateConn hides the zero-copy ReadFrom and WriteTo of *net.TCPConn.
+func NewHierarchicalLimiter(rates ...*Rate) Limiter {
+	b := hierarchicalLimiterBuilder{}
+	for _, r := range rates {
+		b.add(r)
 	}
-	builder := hierarchicalLimiterBuilder{}
-	for _, current := range limiters {
-		builder.add(current)
-	}
-	return builder.build()
+	return b.build()
 }
 
-// NewHierarchicalLimiter2 is NewHierarchicalLimiter for exactly two rates.
+// NewHierarchicalLimiter2 is NewHierarchicalLimiter for two rates, without
+// the variadic slice.
 func NewHierarchicalLimiter2(first, second *Rate) Limiter {
-	builder := hierarchicalLimiterBuilder{}
-	builder.add(first)
-	builder.add(second)
-	return builder.build()
+	b := hierarchicalLimiterBuilder{}
+	b.add(first)
+	b.add(second)
+	return b.build()
 }
 
-// NewHierarchicalLimiter3 is NewHierarchicalLimiter for exactly three rates.
+// NewHierarchicalLimiter3 is NewHierarchicalLimiter for three rates, without
+// the variadic slice.
 func NewHierarchicalLimiter3(first, second, third *Rate) Limiter {
-	builder := hierarchicalLimiterBuilder{}
-	builder.add(first)
-	builder.add(second)
-	builder.add(third)
-	return builder.build()
+	b := hierarchicalLimiterBuilder{}
+	b.add(first)
+	b.add(second)
+	b.add(third)
+	return b.build()
 }
 
 // Get charges size bytes to every Rate and blocks for the longest wait. Stop
@@ -94,37 +91,28 @@ func (l *HierarchicalLimiter) GetContext(ctx context.Context, size int64) error 
 	return nil
 }
 
-// reserve charges size to every Rate and returns the longest wait together
-// with the stop channel of the Rate that imposed it.
+// reserve charges size to every Rate at one point in time and returns the
+// longest wait together with the stop channel of the Rate that imposed it.
 func (l *HierarchicalLimiter) reserve(size int64) (int64, <-chan struct{}) {
 	if l == nil || size <= 0 {
 		return 0, nil
 	}
+	now := nowNs()
 	var maxWait int64
 	var maxStopCh <-chan struct{}
-	if l.first != nil {
-		if wait := l.first.reserve(size); wait > maxWait {
+	charge := func(r *Rate) {
+		if wait := r.reserveAt(size, now); wait > maxWait {
 			maxWait = wait
-			maxStopCh = l.first.stopCh()
+			maxStopCh = r.stopCh()
 		}
 	}
-	if l.second != nil {
-		if wait := l.second.reserve(size); wait > maxWait {
-			maxWait = wait
-			maxStopCh = l.second.stopCh()
-		}
-	}
+	charge(l.first)
+	charge(l.second)
 	if l.third != nil {
-		if wait := l.third.reserve(size); wait > maxWait {
-			maxWait = wait
-			maxStopCh = l.third.stopCh()
-		}
+		charge(l.third)
 	}
-	for _, current := range l.extra {
-		if wait := current.reserve(size); wait > maxWait {
-			maxWait = wait
-			maxStopCh = current.stopCh()
-		}
+	for _, r := range l.extra {
+		charge(r)
 	}
 	return maxWait, maxStopCh
 }
@@ -134,17 +122,11 @@ func (l *HierarchicalLimiter) ReturnBucket(size int64) {
 	if l == nil || size <= 0 {
 		return
 	}
-	if l.first != nil {
-		l.first.ReturnBucket(size)
-	}
-	if l.second != nil {
-		l.second.ReturnBucket(size)
-	}
-	if l.third != nil {
-		l.third.ReturnBucket(size)
-	}
-	for _, current := range l.extra {
-		current.ReturnBucket(size)
+	l.first.ReturnBucket(size)
+	l.second.ReturnBucket(size)
+	l.third.ReturnBucket(size)
+	for _, r := range l.extra {
+		r.ReturnBucket(size)
 	}
 }
 
@@ -156,20 +138,19 @@ type hierarchicalLimiterBuilder struct {
 	count  int
 }
 
-func (b *hierarchicalLimiterBuilder) add(current *Rate) {
-	current = enabledLimiter(current)
-	if current == nil {
+func (b *hierarchicalLimiterBuilder) add(r *Rate) {
+	if r == nil {
 		return
 	}
 	switch b.count {
 	case 0:
-		b.first = current
+		b.first = r
 	case 1:
-		b.second = current
+		b.second = r
 	case 2:
-		b.third = current
+		b.third = r
 	default:
-		b.extra = append(b.extra, current)
+		b.extra = append(b.extra, r)
 	}
 	b.count++
 }
@@ -188,11 +169,4 @@ func (b *hierarchicalLimiterBuilder) build() Limiter {
 			extra:  b.extra,
 		}
 	}
-}
-
-func enabledLimiter(current *Rate) *Rate {
-	if current == nil || current.Limit() <= 0 {
-		return nil
-	}
-	return current
 }
