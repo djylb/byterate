@@ -60,34 +60,32 @@ duplex := byterate.NewDuplexRateConn(c, byterate.NewRate(8<<20), byterate.NewRat
   arrives and writes before sending, refunding short writes. When the limiter
   implements `ContextLimiter` (`*Rate` and `*HierarchicalLimiter` do), `Close`
   wakes a `Read` or `Write` blocked in the limiter, which then returns
-  `net.ErrClosed`. A nil limiter returns the connection unchanged.
+  `net.ErrClosed`. A nil limiter, including a nil `*Rate` or
+  `*HierarchicalLimiter`, returns the connection unchanged.
 - `NewRateConn` keeps the `net.Conn` addresses and deadlines, and its
   `RawConn` method returns the wrapped connection, so helpers such as
-  `netx.RawConnOf` can unwrap it. `CloseWrite` is passed on when the wrapped
-  connection has one, so relays such as `netx.Relay` can half-close through
-  the wrapper.
+  `netx.RawConnOf` can unwrap it. `CloseRead` and `CloseWrite` are passed on
+  when the wrapped connection has them, so relays such as `netx.Relay` can
+  half-close through the wrapper.
+- With a `ContextLimiter`, the read and write deadlines of `NewRateConn` also
+  bound the wait in the limiter, and a deadline set in the past ends a wait in
+  progress, as `net/http` does to abort a read. A `Write` whose deadline
+  passes refunds its charge and returns 0 and `os.ErrDeadlineExceeded`, a
+  timeout `net.Error`. A `Read` has already received its bytes, so it keeps
+  the charge and returns them with `os.ErrDeadlineExceeded`. Moving a deadline
+  later does not end a wait.
 - `Rate.Now` and `Meter.Snapshot` report bytes per second over the last
   sampling window of at least one second, so they lag by up to about two
-  seconds. `NewRateConn` charges both directions of a connection to one
+  seconds. Refunds come off the throughput: one for bytes metered in an
+  earlier window, such as a write canceled by `Close`, is taken off the next
+  windows. `NewRateConn` charges both directions of a connection to one
   limiter; `NewDuplexRateConn` and `NewDuplexRateReadWriteCloser` take one per
   direction, so uploads and downloads are limited and metered apart.
 
-## Performance
+## Concurrency
 
 `Get`, `ReturnBucket`, `Now` and `Meter.Add` are lock-free and
-allocation-free. Medians on an Apple M5 Pro, with 32 KiB charges that never
-wait (`go test -bench .`):
-
-| Operation                           | 1 goroutine | 8 goroutines         |
-|-------------------------------------|-------------|----------------------|
-| `Rate.Get`                          | 17 ns       | 75 ns on one `Rate`  |
-| `HierarchicalLimiter.Get`, 3 levels | 25 ns       | 81 ns                |
-| `Meter.Add`                         | 15 ns       | 23 ns on one `Meter` |
-| `Rate.Now`                          | 12 ns       | 12 ns                |
-
-The 8-goroutine figures are wall time per call across all goroutines. In the
-hierarchical case each goroutine has its own connection `Rate`, under one of
-four user `Rate`s and one global `Rate`. A hierarchical charge reads the clock
-once for all levels, and hot counters sit on cache lines of their own, so
-`Rate`s and `Meter`s used by different cores do not slow each other down; this
-padding makes a `Rate` about 330 bytes and a `Meter` about 300.
+allocation-free. A hierarchical charge reads the clock once for all levels,
+and hot counters sit on cache lines of their own, so `Rate`s and `Meter`s used
+by different cores do not slow each other down; this padding makes a `Rate`
+about 330 bytes and a `Meter` about 300.

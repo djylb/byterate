@@ -356,3 +356,34 @@ func TestRateStartsWithFullBurstForLaterLimit(t *testing.T) {
 		}
 	}
 }
+
+// TestRateMeterCarriesRefunds checks that a refund of bytes metered in an
+// earlier window, such as a canceled write, is taken off later windows rather
+// than dropped.
+func TestRateMeterCarriesRefunds(t *testing.T) {
+	r := NewRate(0) // unlimited, still metered
+	last := nowNs() + int64(time.Hour)
+	r.lastSampleNs.Store(last) // only roll closes a window
+	roll := func() int64 {
+		last += sampleIntervalNs
+		r.updateRateWithNow(last)
+		return r.nowBps.Load()
+	}
+
+	r.Get(1000)
+	if got := roll(); got != 1000 {
+		t.Fatalf("window 1 = %d B/s, want 1000", got)
+	}
+	r.ReturnBucket(1000) // the 1000 bytes were never sent
+	r.Get(600)
+	if got := roll(); got != 0 {
+		t.Fatalf("window 2 = %d B/s, want 0", got)
+	}
+	r.Get(1000)
+	if got := roll(); got != 600 {
+		t.Fatalf("window 3 = %d B/s, want 600 after the remaining 400-byte refund", got)
+	}
+	if got := roll(); got != 0 {
+		t.Fatalf("idle window = %d B/s, want 0", got)
+	}
+}

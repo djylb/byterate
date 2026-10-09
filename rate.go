@@ -182,7 +182,9 @@ func (r *Rate) Stop() {
 
 // ReturnBucket refunds size bytes previously charged by Get, for example the
 // unwritten part of a short write. A refund never raises the available burst
-// above two seconds' worth of bytes.
+// above two seconds' worth of bytes. The bytes also come off the meter: a
+// refund of bytes metered in an earlier sampling window is taken off the
+// following windows.
 func (r *Rate) ReturnBucket(size int64) {
 	if r == nil || size <= 0 || !r.enabled.Load() {
 		return
@@ -215,21 +217,23 @@ func (r *Rate) ReturnBucket(size int64) {
 // immediately if r is nil, stopped or unlimited; Stop and ResetLimit wake a
 // blocked Get early. Use GetContext to abandon a wait.
 func (r *Rate) Get(size int64) {
+	stopCh := r.stopCh() // before reserving, so that a Stop after the charge ends the wait
 	wait := r.reserve(size)
 	if wait <= coalesceWaitNs {
 		return
 	}
-	sleepNs(wait, r.stopCh(), nil)
+	sleepNs(wait, stopCh, nil)
 }
 
 // GetContext is like Get but returns ctx.Err() if ctx is done before the wait
 // ends. The charge is kept either way; refund unused bytes with ReturnBucket.
 func (r *Rate) GetContext(ctx context.Context, size int64) error {
+	stopCh := r.stopCh() // before reserving, as in Get
 	wait := r.reserve(size)
 	if wait <= coalesceWaitNs {
 		return nil
 	}
-	if !sleepNs(wait, r.stopCh(), ctx.Done()) {
+	if !sleepNs(wait, stopCh, ctx.Done()) {
 		return ctx.Err()
 	}
 	return nil
@@ -277,7 +281,13 @@ func (r *Rate) reserveAt(size, now int64) int64 {
 		prev := r.tat.Load()
 		next := clampAdd(max(prev, minTat), cost)
 		if r.tat.CompareAndSwap(prev, next) {
-			return max(next-now, 0)
+			wait := max(next-now, 0)
+			if wait > 0 {
+				if hook := testHookReserved.Load(); hook != nil {
+					(*hook)(r)
+				}
+			}
+			return wait
 		}
 		// Retry at once with the same now: reading the clock again would
 		// widen the window in which other cores win the race.
@@ -287,6 +297,14 @@ func (r *Rate) reserveAt(size, now int64) int64 {
 	}
 }
 
+// testHookReserved, if set, is called with a Rate whose charge must wait,
+// between the charge and the wait, so that tests can stop the Rate there.
+var testHookReserved atomic.Pointer[func(*Rate)]
+
+// stopCh returns the channel that Stop closes. Callers load it before they
+// reserve: a Stop between the reservation and the wait closes the channel
+// they hold, whereas one loaded afterwards may already belong to the next
+// Start and miss that Stop.
 func (r *Rate) stopCh() <-chan struct{} {
 	if r == nil {
 		return nil
@@ -306,7 +324,13 @@ func (r *Rate) updateRateWithNow(now int64) {
 		return
 	}
 
-	bytes := max(r.bytesAcc.Swap(0), 0)
+	bytes := r.bytesAcc.Swap(0)
+	if bytes < 0 {
+		// Refunds of bytes metered in an earlier window, such as a canceled
+		// write, outweigh this window's charges: carry the rest forward.
+		r.bytesAcc.Add(bytes)
+		bytes = 0
+	}
 	dt := now - last
 	if dt <= 0 {
 		return

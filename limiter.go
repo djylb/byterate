@@ -11,8 +11,9 @@ type Limiter interface {
 	ReturnBucket(size int64)
 }
 
-// ContextLimiter is a Limiter whose wait can be abandoned. NewRateConn and NewRateReadWriteCloser use it
-// so that Close ends a Read or Write blocked in the limiter.
+// ContextLimiter is a Limiter whose wait can be abandoned. NewRateConn and
+// NewRateReadWriteCloser use it so that Close, and for NewRateConn a
+// deadline, ends a Read or Write blocked in the limiter.
 type ContextLimiter interface {
 	Limiter
 	// GetContext is like Get but returns ctx.Err() if ctx is done before the
@@ -101,9 +102,10 @@ func (l *HierarchicalLimiter) reserve(size int64) (int64, <-chan struct{}) {
 	var maxWait int64
 	var maxStopCh <-chan struct{}
 	charge := func(r *Rate) {
+		stopCh := r.stopCh() // before reserving, as in Rate.Get
 		if wait := r.reserveAt(size, now); wait > maxWait {
 			maxWait = wait
-			maxStopCh = r.stopCh()
+			maxStopCh = stopCh
 		}
 	}
 	charge(l.first)

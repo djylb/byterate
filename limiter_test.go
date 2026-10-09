@@ -3,6 +3,7 @@ package byterate
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 )
@@ -199,5 +200,60 @@ func TestHierarchicalLimiterGetContextCancel(t *testing.T) {
 		first.Stop()
 		second.Stop()
 		t.Fatal("HierarchicalLimiter.GetContext() did not return promptly after cancel")
+	}
+}
+
+// TestStopBetweenChargeAndWait stops the Rate imposing the wait right after
+// the charge, before the caller sleeps: Stop must still end the wait.
+func TestStopBetweenChargeAndWait(t *testing.T) {
+	cases := map[string]func(strict *Rate) func(){
+		"Rate.Get": func(strict *Rate) func() {
+			return func() { strict.Get(3000) }
+		},
+		"Rate.GetContext": func(strict *Rate) func() {
+			return func() { _ = strict.GetContext(context.Background(), 3000) }
+		},
+		"HierarchicalLimiter.Get": func(strict *Rate) func() {
+			l := NewHierarchicalLimiter3(NewRate(1<<30), strict, NewRate(0))
+			return func() { l.Get(3000) }
+		},
+		"HierarchicalLimiter.GetContext": func(strict *Rate) func() {
+			l := NewHierarchicalLimiter2(NewRate(1<<30), strict).(*HierarchicalLimiter)
+			return func() { _ = l.GetContext(context.Background(), 3000) }
+		},
+	}
+	for name, get := range cases {
+		t.Run(name, func(t *testing.T) {
+			strict := NewRate(1000)
+			strict.reserve(2000) // spend the burst: 3000 more bytes wait 3s
+			op := get(strict)
+
+			var once sync.Once
+			hook := func(r *Rate) {
+				if r == strict {
+					once.Do(func() { strict.ResetLimit(0) })
+				}
+			}
+			testHookReserved.Store(&hook)
+			defer testHookReserved.Store(nil)
+
+			done := make(chan struct{})
+			go func() {
+				op()
+				close(done)
+			}()
+			select {
+			case <-done:
+			case <-time.After(time.Second):
+				strict.Stop() // release the stale wait
+				<-done
+				t.Fatal("ResetLimit between the charge and the wait did not end the wait")
+			}
+			hookRan := true
+			once.Do(func() { hookRan = false })
+			if !hookRan {
+				t.Fatal("the test hook did not run")
+			}
+		})
 	}
 }

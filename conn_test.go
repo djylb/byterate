@@ -1,6 +1,7 @@
 package byterate
 
 import (
+	"context"
 	"errors"
 	"io"
 	"net"
@@ -327,5 +328,385 @@ func TestDuplexRateConnChargesEachDirection(t *testing.T) {
 	defer func() { _ = peer.Close() }()
 	if c := NewDuplexRateConn(raw, nil, nil); c != raw {
 		t.Fatalf("NewDuplexRateConn(nil, nil) = %T, want the connection itself", c)
+	}
+}
+
+// drain reads from c until it fails.
+func drain(c net.Conn) {
+	buf := make([]byte, 64<<10)
+	for {
+		if _, err := c.Read(buf); err != nil {
+			return
+		}
+	}
+}
+
+func isTimeout(err error) bool {
+	var ne net.Error
+	return errors.Is(err, os.ErrDeadlineExceeded) && errors.As(err, &ne) && ne.Timeout()
+}
+
+func TestRateConnWriteDeadlineEndsLimiterWait(t *testing.T) {
+	for name, wrap := range map[string]func(net.Conn, *Rate) net.Conn{
+		"Rate": func(c net.Conn, r *Rate) net.Conn { return NewRateConn(c, r) },
+		"HierarchicalLimiter": func(c net.Conn, r *Rate) net.Conn {
+			return NewDuplexRateConn(c, nil, NewHierarchicalLimiter2(NewRate(1<<30), r))
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			client, server := net.Pipe()
+			defer func() { _ = server.Close() }()
+			go drain(server)
+			r := NewRate(1024)
+			conn := wrap(client, r)
+			defer func() { _ = conn.Close() }()
+
+			if err := conn.SetWriteDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
+				t.Fatal(err)
+			}
+			done := make(chan ioResult, 1)
+			start := time.Now()
+			go func() {
+				n, err := conn.Write(make([]byte, 8<<10)) // waits 6s at 1 KiB/s
+				done <- ioResult{n, err}
+			}()
+			select {
+			case res := <-done:
+				if res.n != 0 || !isTimeout(res.err) {
+					t.Fatalf("Write() = %d, %v; want 0 and a timeout matching %v", res.n, res.err, os.ErrDeadlineExceeded)
+				}
+				if elapsed := time.Since(start); elapsed < 80*time.Millisecond {
+					t.Fatalf("Write() returned after %v, before its deadline", elapsed)
+				}
+			case <-time.After(time.Second):
+				r.Stop()
+				<-done
+				t.Fatal("Write() blocked in the limiter past its deadline")
+			}
+			// The unsent write was refunded.
+			if wait := r.reserve(2048); wait != 0 {
+				t.Fatalf("reserve(2048) after timed-out Write() wait=%s, want 0", time.Duration(wait))
+			}
+		})
+	}
+}
+
+func TestRateConnReadDeadlineEndsLimiterWait(t *testing.T) {
+	client, server := net.Pipe()
+	defer func() { _ = server.Close() }()
+	go func() { _, _ = server.Write(make([]byte, 8<<10)) }()
+	r := NewRate(1024)
+	conn := NewRateConn(client, r)
+	defer func() { _ = conn.Close() }()
+
+	done := make(chan ioResult, 1)
+	go func() {
+		n, err := conn.Read(make([]byte, 8<<10)) // waits 6s at 1 KiB/s
+		done <- ioResult{n, err}
+	}()
+	time.Sleep(50 * time.Millisecond)
+	// Moving the deadline later must not end the wait.
+	if err := conn.SetReadDeadline(time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	select {
+	case res := <-done:
+		t.Fatalf("Read() = %d, %v after a later deadline was set; want it still waiting", res.n, res.err)
+	default:
+	}
+	// A deadline in the past, as net/http sets to abort a read, ends it.
+	if err := conn.SetReadDeadline(time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case res := <-done:
+		if res.n != 8<<10 || !isTimeout(res.err) {
+			t.Fatalf("Read() = %d, %v; want %d and a timeout matching %v", res.n, res.err, 8<<10, os.ErrDeadlineExceeded)
+		}
+	case <-time.After(time.Second):
+		r.Stop()
+		<-done
+		t.Fatal("SetReadDeadline(now) did not end a Read blocked in the limiter")
+	}
+	// The bytes were received, so they stay charged.
+	if got := r.bytesAcc.Load(); got != 8<<10 {
+		t.Fatalf("bytesAcc after timed-out Read() = %d, want %d", got, 8<<10)
+	}
+
+	// Clearing the expired deadline lets later waits run to completion again.
+	if err := conn.SetDeadline(time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+	r.ResetLimit(1 << 20)
+	go func() { _, _ = server.Write([]byte("abc")) }()
+	if n, err := conn.Read(make([]byte, 8)); n != 3 || err != nil {
+		t.Fatalf("Read() after clearing the deadline = %d, %v; want 3, nil", n, err)
+	}
+}
+
+func TestRateConnDeadlineAfterClose(t *testing.T) {
+	client, server := net.Pipe()
+	defer func() { _ = server.Close() }()
+	r := NewRate(1024)
+	conn := NewRateConn(client, r)
+	if err := conn.SetDeadline(time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for _, d := range []*direction{&conn.(*rateNetConn).read, &conn.(*rateNetConn).write} {
+		if d.cancel.timer != nil {
+			t.Fatal("Close() left a deadline timer running")
+		}
+	}
+	_ = conn.Close()
+	_ = conn.SetDeadline(time.Time{}) // must not reopen the wait signal
+	_ = conn.SetWriteDeadline(time.Now().Add(-time.Second))
+	r.reserve(2048) // spend the burst
+	if n, err := conn.Write(make([]byte, 1024)); n != 0 || !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("Write() after Close = %d, %v; want 0, %v", n, err, net.ErrClosed)
+	}
+}
+
+func TestRateConnCloseAfterDeadline(t *testing.T) {
+	client, server := net.Pipe()
+	defer func() { _ = server.Close() }()
+	r := NewRate(1024)
+	conn := NewRateConn(client, r)
+	if err := conn.SetWriteDeadline(time.Now().Add(-time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+	r.reserve(2048) // spend the burst
+	if n, err := conn.Write(make([]byte, 1024)); n != 0 || !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("Write() after an expired deadline and Close = %d, %v; want 0, %v", n, err, net.ErrClosed)
+	}
+}
+
+// gateLimiter is a ContextLimiter that hands each wait's context to the test,
+// waits for it to be done and then for the test to let it return ctx.Err().
+type gateLimiter struct {
+	entered chan context.Context
+	proceed chan struct{}
+}
+
+func (l *gateLimiter) Get(int64)          {}
+func (l *gateLimiter) ReturnBucket(int64) {}
+func (l *gateLimiter) GetContext(ctx context.Context, _ int64) error {
+	l.entered <- ctx
+	<-ctx.Done()
+	<-l.proceed
+	return ctx.Err()
+}
+
+// checkEnded fails unless ctx, whose Done channel was done, still has that
+// channel and a non-nil Err, as context.Context requires.
+func checkEnded(t *testing.T, ctx context.Context, done <-chan struct{}, want error) {
+	t.Helper()
+	if ctx.Done() != done {
+		t.Fatal("Done() returned a different channel after the wait ended")
+	}
+	if err := ctx.Err(); !errors.Is(err, want) {
+		t.Fatalf("Err() of an ended wait = %v, want %v", err, want)
+	}
+}
+
+func TestRateConnWaitContextStaysEnded(t *testing.T) {
+	client, server := net.Pipe()
+	defer func() { _ = server.Close() }()
+	go drain(server)
+	l := &gateLimiter{entered: make(chan context.Context), proceed: make(chan struct{})}
+	conn := NewRateConn(client, l)
+	defer func() { _ = conn.Close() }()
+
+	write := func() <-chan ioResult {
+		res := make(chan ioResult, 1)
+		go func() {
+			n, err := conn.Write([]byte("x"))
+			res <- ioResult{n, err}
+		}()
+		return res
+	}
+
+	// Abort the wait with a deadline in the past, then clear the deadline
+	// before the limiter looks at the context again.
+	res := write()
+	ctx := <-l.entered
+	done := ctx.Done()
+	_ = conn.SetWriteDeadline(time.Now().Add(-time.Second))
+	_ = conn.SetWriteDeadline(time.Time{})
+	l.proceed <- struct{}{}
+	if r := <-res; r.n != 0 || !isTimeout(r.err) {
+		t.Fatalf("Write() aborted by a deadline = %d, %v; want 0 and a timeout matching %v", r.n, r.err, os.ErrDeadlineExceeded)
+	}
+	checkEnded(t, ctx, done, context.DeadlineExceeded)
+
+	// The cleared deadline gives the next wait an open context, which Close
+	// ends.
+	res = write()
+	ctx2 := <-l.entered
+	if isClosed(ctx2.Done()) || ctx2.Err() != nil {
+		t.Fatalf("wait after clearing the deadline started ended: Err() = %v", ctx2.Err())
+	}
+	done2 := ctx2.Done()
+	_ = conn.Close()
+	l.proceed <- struct{}{}
+	if r := <-res; r.n != 0 || !errors.Is(r.err, net.ErrClosed) {
+		t.Fatalf("Write() ended by Close = %d, %v; want 0, %v", r.n, r.err, net.ErrClosed)
+	}
+	checkEnded(t, ctx2, done2, context.Canceled)
+	checkEnded(t, ctx, done, context.DeadlineExceeded)
+}
+
+// derivingLimiter is a ContextLimiter that derives a context from the one it
+// is given, as limiters that cap or watch their own wait do.
+type derivingLimiter struct{ entered chan struct{} }
+
+func (derivingLimiter) Get(int64)          {}
+func (derivingLimiter) ReturnBucket(int64) {}
+func (l derivingLimiter) GetContext(ctx context.Context, _ int64) error {
+	ctx, cancel := context.WithTimeout(ctx, time.Hour)
+	defer cancel()
+	l.entered <- struct{}{}
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+// A deadline that aborts a wait and is cleared at once must leave a context
+// that the context package can derive from: with an Err of nil after Done is
+// closed, it panics in a goroutine of its own and takes the process down.
+func TestRateConnDerivedContextAbortThenClear(t *testing.T) {
+	client, server := net.Pipe()
+	defer func() { _ = server.Close() }()
+	go drain(server)
+	l := derivingLimiter{entered: make(chan struct{})}
+	conn := NewRateConn(client, l)
+	defer func() { _ = conn.Close() }()
+
+	for i := 0; i < 1000; i++ {
+		res := make(chan ioResult, 1)
+		go func() {
+			n, err := conn.Write([]byte("x"))
+			res <- ioResult{n, err}
+		}()
+		<-l.entered
+		_ = conn.SetWriteDeadline(time.Now().Add(-time.Second))
+		_ = conn.SetWriteDeadline(time.Time{})
+		select {
+		case r := <-res:
+			if r.n != 0 || !isTimeout(r.err) {
+				t.Fatalf("Write() %d aborted by a deadline = %d, %v; want 0 and a timeout matching %v", i, r.n, r.err, os.ErrDeadlineExceeded)
+			}
+		case <-time.After(time.Second):
+			_ = conn.Close()
+			<-res
+			t.Fatalf("Write() %d still blocked in the limiter after its deadline", i)
+		}
+	}
+}
+
+// With *Rate, a wait aborted by a deadline that is then cleared must still
+// end with the deadline error and a refund, not as if it had waited.
+func TestRateConnAbortThenClearDeadline(t *testing.T) {
+	client, server := net.Pipe()
+	defer func() { _ = server.Close() }()
+	go drain(server)
+	r := NewRate(1024)
+	conn := NewRateConn(client, r)
+	defer func() { _ = conn.Close() }()
+
+	for i := 0; i < 50; i++ {
+		r.reserve(2048) // spend the burst, so that the Write waits about 1s
+		res := make(chan ioResult, 1)
+		start := time.Now()
+		go func() {
+			n, err := conn.Write(make([]byte, 1024))
+			res <- ioResult{n, err}
+		}()
+		time.Sleep(2 * time.Millisecond) // let it start waiting
+		_ = conn.SetWriteDeadline(time.Now().Add(-time.Second))
+		_ = conn.SetWriteDeadline(time.Time{})
+		res1 := <-res
+		if res1.err == nil && time.Since(start) < 900*time.Millisecond {
+			t.Fatalf("Write() %d aborted by a deadline = %d, nil after %v; want a timeout or a full wait", i, res1.n, time.Since(start))
+		}
+		if res1.err != nil && (res1.n != 0 || !isTimeout(res1.err)) {
+			t.Fatalf("Write() %d aborted by a deadline = %d, %v; want 0 and a timeout matching %v", i, res1.n, res1.err, os.ErrDeadlineExceeded)
+		}
+		r.ResetLimit(1024) // drop the debt, refunded or not
+	}
+}
+
+func TestRateConnTypedNilLimiter(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = ln.Close() }()
+	client, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = client.Close() }()
+
+	var rate *Rate
+	var hier *HierarchicalLimiter
+	for name, got := range map[string]any{
+		"NewRateConn(*Rate)":                      NewRateConn(client, rate),
+		"NewRateConn(*HierarchicalLimiter)":       NewRateConn(client, hier),
+		"NewDuplexRateConn":                       NewDuplexRateConn(client, rate, hier),
+		"NewRateReadWriteCloser(*Rate)":           NewRateReadWriteCloser(client, rate),
+		"NewDuplexRateReadWriteCloser(nil, hier)": NewDuplexRateReadWriteCloser(client, nil, hier),
+	} {
+		if got != any(client) {
+			t.Errorf("%s = %T, want the *net.TCPConn itself", name, got)
+		}
+	}
+
+	conn := NewDuplexRateConn(client, rate, NewRate(1024)).(*rateNetConn)
+	if conn.read.rate != nil || conn.read.ctxRate != nil {
+		t.Fatalf("read direction limiter = %v, want nil for a nil *Rate", conn.read.rate)
+	}
+}
+
+type halfCloseConn struct {
+	scriptedConn
+	closedRead bool
+}
+
+func (c *halfCloseConn) CloseRead() error {
+	c.closedRead = true
+	return nil
+}
+
+func TestRateConnCloseRead(t *testing.T) {
+	inner := &halfCloseConn{}
+	for _, conn := range []io.ReadWriteCloser{
+		NewRateReadWriteCloser(inner, NewRate(1<<20)),
+		NewDuplexRateReadWriteCloser(inner, nil, NewRate(1<<20)),
+	} {
+		inner.closedRead = false
+		cr, ok := conn.(interface{ CloseRead() error })
+		if !ok {
+			t.Fatalf("%T has no CloseRead", conn)
+		}
+		if err := cr.CloseRead(); err != nil || !inner.closedRead {
+			t.Fatalf("CloseRead() = %v, passed on = %v; want nil, true", err, inner.closedRead)
+		}
+	}
+
+	client, server := net.Pipe()
+	defer func() { _ = client.Close() }()
+	defer func() { _ = server.Close() }()
+	conn := NewDuplexRateConn(client, NewRate(1<<20), nil)
+	if err := conn.(interface{ CloseRead() error }).CloseRead(); !errors.Is(err, errors.ErrUnsupported) {
+		t.Fatalf("CloseRead() without support error = %v, want %v", err, errors.ErrUnsupported)
+	}
+	if err := NewRateReadWriteCloser(nil, NewRate(1)).(interface{ CloseRead() error }).CloseRead(); !errors.Is(err, ErrNilConn) {
+		t.Fatalf("CloseRead() on nil conn error = %v, want %v", err, ErrNilConn)
 	}
 }
