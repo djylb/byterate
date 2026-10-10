@@ -259,22 +259,30 @@ func TestRateConnNilArguments(t *testing.T) {
 	}
 }
 
-func TestRateConnCloseWrite(t *testing.T) {
+// tcpPair returns the two ends of a loopback TCP connection, closed when the
+// test ends.
+func tcpPair(t *testing.T) (client, server net.Conn) {
+	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = ln.Close() }()
-	client, err := net.Dial("tcp", ln.Addr().String())
+	client, err = net.Dial("tcp", ln.Addr().String())
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = client.Close() }()
-	server, err := ln.Accept()
+	t.Cleanup(func() { _ = client.Close() })
+	server, err = ln.Accept()
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = server.Close() }()
+	t.Cleanup(func() { _ = server.Close() })
+	return client, server
+}
+
+func TestRateConnCloseWrite(t *testing.T) {
+	client, server := tcpPair(t)
 
 	limited := NewRateConn(client, NewRate(1<<20))
 	cw, ok := limited.(interface{ CloseWrite() error })
@@ -642,16 +650,7 @@ func TestRateConnAbortThenClearDeadline(t *testing.T) {
 }
 
 func TestRateConnTypedNilLimiter(t *testing.T) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = ln.Close() }()
-	client, err := net.Dial("tcp", ln.Addr().String())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = client.Close() }()
+	client, _ := tcpPair(t)
 
 	var rate *Rate
 	var hier *HierarchicalLimiter

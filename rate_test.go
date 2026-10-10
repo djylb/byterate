@@ -234,7 +234,13 @@ func TestRateLargeGetDoesNotPoisonLimiter(t *testing.T) {
 }
 
 func TestNewRateStartsWithFullBurst(t *testing.T) {
-	r := NewRate(1000)
+	expectFullBurst(t, NewRate(1000))
+}
+
+// expectFullBurst checks that r, limited to 1000 bytes per second, starts
+// with its whole burst of two seconds and then waits.
+func expectFullBurst(t *testing.T, r *Rate) {
+	t.Helper()
 	if wait := r.reserve(2000); wait != 0 {
 		t.Fatalf("reserve(2000) within burst wait=%s, want 0", time.Duration(wait))
 	}
@@ -250,12 +256,7 @@ func TestZeroValueRateLimitsAfterStart(t *testing.T) {
 	}
 	r.SetLimit(1000)
 	r.Start()
-	if wait := r.reserve(2000); wait != 0 {
-		t.Fatalf("reserve(2000) within burst wait=%s, want 0", time.Duration(wait))
-	}
-	if wait := r.reserve(1000); wait < int64(900*time.Millisecond) || wait > int64(time.Second) {
-		t.Fatalf("reserve(1000) after burst wait=%s, want about 1s", time.Duration(wait))
-	}
+	expectFullBurst(t, &r)
 	last := r.lastSampleNs.Load()
 	r.updateRateWithNow(last + int64(2*time.Second))
 	if got := r.nowBps.Load(); got != 1500 {
