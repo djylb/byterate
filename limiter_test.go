@@ -257,3 +257,23 @@ func TestStopBetweenChargeAndWait(t *testing.T) {
 		})
 	}
 }
+
+// TestHierarchicalLimiterChargesRepeatedRateOnce checks that a Rate given at
+// more than one level, such as a user's that doubles as its group's, is not
+// charged twice.
+func TestHierarchicalLimiterChargesRepeatedRateOnce(t *testing.T) {
+	r := NewRate(1000)
+	if l := NewHierarchicalLimiter(r, nil, r); l != Limiter(r) {
+		t.Fatalf("a Rate given twice: got %T, want the Rate itself", l)
+	}
+	other := NewRate(0)
+	l := NewHierarchicalLimiter(r, other, r, other, r).(*HierarchicalLimiter)
+	if wait, _ := l.reserve(2000); wait != 0 {
+		t.Fatalf("reserve(2000) within the burst wait=%s, want 0", time.Duration(wait))
+	}
+	for _, rate := range []*Rate{r, other} {
+		if got := rate.bytesAcc.Load(); got != 2000 {
+			t.Fatalf("bytesAcc = %d, want 2000 charged once", got)
+		}
+	}
+}

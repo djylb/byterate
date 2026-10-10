@@ -1,6 +1,9 @@
 package byterate
 
-import "context"
+import (
+	"context"
+	"slices"
+)
 
 // Limiter charges and refunds byte budgets. *Rate and *HierarchicalLimiter
 // implement it.
@@ -40,9 +43,10 @@ type HierarchicalLimiter struct {
 }
 
 // NewHierarchicalLimiter combines rates, such as a connection's, its user's
-// and a global one, into one Limiter. Nil rates are left out; unlimited ones
-// are kept so that they meter and can be limited later. It returns nil if no
-// rate remains and that *Rate itself if only one remains.
+// and a global one, into one Limiter. Nil rates are left out, and so are
+// repeats, so that a Rate given twice is charged once; unlimited ones are
+// kept so that they meter and can be limited later. It returns nil if no rate
+// remains and that *Rate itself if only one remains.
 //
 // Pass nil for levels that should neither limit nor meter: a limiter of
 // unlimited Rates still charges every call, and wrapping a connection with
@@ -142,7 +146,7 @@ type hierarchicalLimiterBuilder struct {
 }
 
 func (b *hierarchicalLimiterBuilder) add(r *Rate) {
-	if r == nil {
+	if r == nil || r == b.first || r == b.second || r == b.third || slices.Contains(b.extra, r) {
 		return
 	}
 	switch b.count {

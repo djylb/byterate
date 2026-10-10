@@ -50,12 +50,12 @@ duplex := byterate.NewDuplexRateConn(c, byterate.NewRate(8<<20), byterate.NewRat
   `GetContext` also returns early when its context is done; the charge is
   kept, so refund bytes that were not transferred with `ReturnBucket`.
 - `NewHierarchicalLimiter` charges every started `Rate` and waits for the
-  longest delay. Nil rates are left out and it returns nil when none remain,
-  or the `Rate` itself when one does. Unlimited rates are kept, so they meter
-  the traffic and a limit set on them later applies to existing connections.
-  Pass nil for levels that should neither limit nor meter: wrapping a
-  connection costs a charge per call and hides `*net.TCPConn`'s zero-copy
-  `ReadFrom`/`WriteTo`.
+  longest delay. Nil rates and repeats are left out, so a `Rate` given twice
+  is charged once, and it returns nil when none remain, or the `Rate` itself
+  when one does. Unlimited rates are kept, so they meter the traffic and a
+  limit set on them later applies to existing connections. Pass nil for
+  levels that should neither limit nor meter: wrapping a connection costs a
+  charge per call and hides `*net.TCPConn`'s zero-copy `ReadFrom`/`WriteTo`.
 - `NewRateConn` and `NewRateReadWriteCloser` charge reads after the data
   arrives and writes before sending, refunding short writes. When the limiter
   implements `ContextLimiter` (`*Rate` and `*HierarchicalLimiter` do), `Close`
