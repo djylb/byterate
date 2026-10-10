@@ -587,7 +587,7 @@ func TestRateConnDerivedContextAbortThenClear(t *testing.T) {
 	conn := NewRateConn(client, l)
 	defer func() { _ = conn.Close() }()
 
-	for i := 0; i < 1000; i++ {
+	for i := range 1000 {
 		res := make(chan ioResult, 1)
 		go func() {
 			n, err := conn.Write([]byte("x"))
@@ -619,7 +619,7 @@ func TestRateConnAbortThenClearDeadline(t *testing.T) {
 	conn := NewRateConn(client, r)
 	defer func() { _ = conn.Close() }()
 
-	for i := 0; i < 50; i++ {
+	for i := range 50 {
 		r.reserve(2048) // spend the burst, so that the Write waits about 1s
 		res := make(chan ioResult, 1)
 		start := time.Now()
