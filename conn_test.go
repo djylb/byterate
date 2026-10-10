@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"runtime"
 	"testing"
 	"time"
 )
@@ -465,7 +466,7 @@ func TestRateConnDeadlineAfterClose(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, d := range []*direction{&conn.(*rateNetConn).read, &conn.(*rateNetConn).write} {
-		if d.cancel.timer != nil {
+		if d.cancel.armed || d.cancel.timer.t.Stop() {
 			t.Fatal("Close() left a deadline timer running")
 		}
 	}
@@ -509,6 +510,15 @@ func (l *gateLimiter) GetContext(ctx context.Context, _ int64) error {
 	<-ctx.Done()
 	<-l.proceed
 	return ctx.Err()
+}
+
+func isClosed(ch <-chan struct{}) bool {
+	select {
+	case <-ch:
+		return true
+	default:
+		return false
+	}
 }
 
 // checkEnded fails unless ctx, whose Done channel was done, still has that
@@ -709,3 +719,119 @@ func TestRateConnCloseRead(t *testing.T) {
 		t.Fatalf("CloseRead() on nil conn error = %v, want %v", err, ErrNilConn)
 	}
 }
+
+// errLimiter is a ContextLimiter whose GetContext fails on its own, as an
+// adapter refusing a charge larger than its burst does.
+type errLimiter struct {
+	err           error
+	got, returned int64
+}
+
+func (l *errLimiter) Get(size int64)          { l.got += size }
+func (l *errLimiter) ReturnBucket(size int64) { l.returned += size }
+func (l *errLimiter) GetContext(_ context.Context, size int64) error {
+	l.got += size
+	return l.err
+}
+
+// An error of the limiter's own must reach the caller as it is, not as a
+// deadline or a close.
+func TestRateConnPassesLimiterError(t *testing.T) {
+	wantErr := errors.New("charge exceeds burst")
+	l := &errLimiter{err: wantErr}
+	conn := NewRateReadWriteCloser(&scriptedConn{readBuf: []byte("abc"), writeN: 64}, l)
+
+	if n, err := conn.Write([]byte("hello")); n != 0 || !errors.Is(err, wantErr) {
+		t.Fatalf("Write() = %d, %v; want 0, %v", n, err, wantErr)
+	}
+	if l.got != 5 || l.returned != 5 {
+		t.Fatalf("limiter got/returned after failed Write() = %d/%d, want 5/5", l.got, l.returned)
+	}
+	if n, err := conn.Read(make([]byte, 8)); n != 3 || !errors.Is(err, wantErr) {
+		t.Fatalf("Read() = %d, %v; want 3, %v", n, err, wantErr)
+	}
+}
+
+// TestRateConnDeadlineTimerReuse moves, clears and expires the deadline of
+// one direction many times: each wait must end at the deadline in force
+// when it started, and never at an earlier one.
+func TestRateConnDeadlineTimerReuse(t *testing.T) {
+	client, server := net.Pipe()
+	defer func() { _ = server.Close() }()
+	go drain(server)
+	r := NewRate(1024)
+	conn := NewRateConn(client, r)
+	defer func() { _ = conn.Close() }()
+
+	write := func() <-chan ioResult {
+		res := make(chan ioResult, 1)
+		go func() {
+			n, err := conn.Write(make([]byte, 1024))
+			res <- ioResult{n, err}
+		}()
+		return res
+	}
+	for i := range 5 {
+		r.ResetLimit(1024)
+		r.reserve(2048) // spend the burst, so that the Write waits about 1s
+
+		// A deadline moved later, many times, must not end the wait early.
+		for range 100 {
+			_ = conn.SetWriteDeadline(time.Now().Add(time.Millisecond))
+			_ = conn.SetWriteDeadline(time.Now().Add(time.Hour))
+		}
+		_ = conn.SetWriteDeadline(time.Now().Add(80 * time.Millisecond))
+		start := time.Now()
+		res := write()
+		select {
+		case got := <-res:
+			if got.n != 0 || !isTimeout(got.err) {
+				t.Fatalf("round %d: Write() = %d, %v; want 0 and a timeout", i, got.n, got.err)
+			}
+			if elapsed := time.Since(start); elapsed < 60*time.Millisecond {
+				t.Fatalf("round %d: Write() timed out after %v, before its deadline", i, elapsed)
+			}
+		case <-time.After(time.Second):
+			r.Stop()
+			<-res
+			t.Fatalf("round %d: Write() blocked in the limiter past its deadline", i)
+		}
+
+		// The expired deadline fails new waits until it is moved.
+		r.reserve(2048)
+		if n, err := conn.Write(make([]byte, 1024)); n != 0 || !isTimeout(err) {
+			t.Fatalf("round %d: Write() after the deadline = %d, %v; want 0 and a timeout", i, n, err)
+		}
+		_ = conn.SetWriteDeadline(time.Time{})
+	}
+}
+
+// A pending deadline must not keep a connection that was dropped without
+// Close reachable until the deadline passes.
+func TestRateConnPendingDeadlineDoesNotPinConn(t *testing.T) {
+	collected := make(chan struct{})
+	func() {
+		conn := NewRateConn(&nopNetConn{}, NewRate(1024))
+		_ = conn.SetDeadline(time.Now().Add(time.Hour))
+		runtime.AddCleanup(conn.(*rateNetConn), func(ch chan struct{}) { close(ch) }, collected)
+	}()
+	for range 20 {
+		runtime.GC()
+		select {
+		case <-collected:
+			return
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	t.Fatal("a connection with a pending deadline was not garbage collected")
+}
+
+// nopNetConn is a net.Conn that does nothing.
+type nopNetConn struct{ net.Conn }
+
+func (*nopNetConn) Read(b []byte) (int, error)       { return len(b), nil }
+func (*nopNetConn) Write(b []byte) (int, error)      { return len(b), nil }
+func (*nopNetConn) Close() error                     { return nil }
+func (*nopNetConn) SetDeadline(time.Time) error      { return nil }
+func (*nopNetConn) SetReadDeadline(time.Time) error  { return nil }
+func (*nopNetConn) SetWriteDeadline(time.Time) error { return nil }

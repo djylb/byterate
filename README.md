@@ -50,17 +50,18 @@ duplex := byterate.NewDuplexRateConn(c, byterate.NewRate(8<<20), byterate.NewRat
   `GetContext` also returns early when its context is done; the charge is
   kept, so refund bytes that were not transferred with `ReturnBucket`.
 - `NewHierarchicalLimiter` charges every started `Rate` and waits for the
-  longest delay. Nil rates are left out and it returns nil when none remain,
-  or the `Rate` itself when one does. Unlimited rates are kept, so they meter
-  the traffic and a limit set on them later applies to existing connections.
-  Pass nil for levels that should neither limit nor meter: wrapping a
-  connection costs a charge per call and hides `*net.TCPConn`'s zero-copy
-  `ReadFrom`/`WriteTo`.
+  longest delay. Nil rates and repeats are left out, so a `Rate` given twice
+  is charged once, and it returns nil when none remain, or the `Rate` itself
+  when one does. Unlimited rates are kept, so they meter the traffic and a
+  limit set on them later applies to existing connections. Pass nil for
+  levels that should neither limit nor meter: wrapping a connection costs a
+  charge per call and hides `*net.TCPConn`'s zero-copy `ReadFrom`/`WriteTo`.
 - `NewRateConn` and `NewRateReadWriteCloser` charge reads after the data
   arrives and writes before sending, refunding short writes. When the limiter
   implements `ContextLimiter` (`*Rate` and `*HierarchicalLimiter` do), `Close`
   wakes a `Read` or `Write` blocked in the limiter, which then returns
-  `net.ErrClosed`. A nil limiter, including a nil `*Rate` or
+  `net.ErrClosed`; any other error from `GetContext` is returned as it is,
+  and a `Write` refunds its charge. A nil limiter, including a nil `*Rate` or
   `*HierarchicalLimiter`, returns the connection unchanged.
 - `NewRateConn` keeps the `net.Conn` addresses and deadlines, and its
   `RawConn` method returns the wrapped connection, so helpers such as
@@ -88,4 +89,7 @@ duplex := byterate.NewDuplexRateConn(c, byterate.NewRate(8<<20), byterate.NewRat
 allocation-free. A hierarchical charge reads the clock once for all levels,
 and hot counters sit on cache lines of their own, so `Rate`s and `Meter`s used
 by different cores do not slow each other down; this padding makes a `Rate`
-about 330 bytes and a `Meter` about 300.
+about 330 bytes and a `Meter` about 300. Wrapping a connection takes at most
+three allocations, about 200 bytes. Setting its deadlines allocates only for
+the first deadline and after one has expired, and a pending deadline does not
+keep a connection that was never closed from being garbage collected.
