@@ -370,11 +370,11 @@ func TestRateConnWriteDeadlineEndsLimiterWait(t *testing.T) {
 			conn := wrap(client, r)
 			defer func() { _ = conn.Close() }()
 
-			if err := conn.SetWriteDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
+			start := time.Now()
+			if err := conn.SetWriteDeadline(start.Add(100 * time.Millisecond)); err != nil {
 				t.Fatal(err)
 			}
 			done := make(chan ioResult, 1)
-			start := time.Now()
 			go func() {
 				n, err := conn.Write(make([]byte, 8<<10)) // waits 6s at 1 KiB/s
 				done <- ioResult{n, err}
@@ -384,7 +384,7 @@ func TestRateConnWriteDeadlineEndsLimiterWait(t *testing.T) {
 				if res.n != 0 || !isTimeout(res.err) {
 					t.Fatalf("Write() = %d, %v; want 0 and a timeout matching %v", res.n, res.err, os.ErrDeadlineExceeded)
 				}
-				if elapsed := time.Since(start); elapsed < 80*time.Millisecond {
+				if elapsed := time.Since(start); elapsed < 100*time.Millisecond {
 					t.Fatalf("Write() returned after %v, before its deadline", elapsed)
 				}
 			case <-time.After(time.Second):
@@ -466,7 +466,7 @@ func TestRateConnDeadlineAfterClose(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, d := range []*direction{&conn.(*rateNetConn).read, &conn.(*rateNetConn).write} {
-		if d.cancel.armed || d.cancel.timer.t.Stop() {
+		if d.cancel.timer.t.Stop() {
 			t.Fatal("Close() left a deadline timer running")
 		}
 	}
@@ -780,15 +780,15 @@ func TestRateConnDeadlineTimerReuse(t *testing.T) {
 			_ = conn.SetWriteDeadline(time.Now().Add(time.Millisecond))
 			_ = conn.SetWriteDeadline(time.Now().Add(time.Hour))
 		}
-		_ = conn.SetWriteDeadline(time.Now().Add(80 * time.Millisecond))
 		start := time.Now()
+		_ = conn.SetWriteDeadline(start.Add(80 * time.Millisecond))
 		res := write()
 		select {
 		case got := <-res:
 			if got.n != 0 || !isTimeout(got.err) {
 				t.Fatalf("round %d: Write() = %d, %v; want 0 and a timeout", i, got.n, got.err)
 			}
-			if elapsed := time.Since(start); elapsed < 60*time.Millisecond {
+			if elapsed := time.Since(start); elapsed < 80*time.Millisecond {
 				t.Fatalf("round %d: Write() timed out after %v, before its deadline", i, elapsed)
 			}
 		case <-time.After(time.Second):
@@ -835,3 +835,69 @@ func (*nopNetConn) Close() error                     { return nil }
 func (*nopNetConn) SetDeadline(time.Time) error      { return nil }
 func (*nopNetConn) SetReadDeadline(time.Time) error  { return nil }
 func (*nopNetConn) SetWriteDeadline(time.Time) error { return nil }
+
+// TestRateConnDeadlineMovedLater moves a pending deadline later: the wait
+// must outlast the first deadline and end at the second.
+func TestRateConnDeadlineMovedLater(t *testing.T) {
+	client, server := net.Pipe()
+	defer func() { _ = server.Close() }()
+	go drain(server)
+	r := NewRate(1024)
+	conn := NewRateConn(client, r)
+	defer func() { _ = conn.Close() }()
+
+	r.reserve(2048) // spend the burst, so that the Write waits about 1s
+	start := time.Now()
+	_ = conn.SetWriteDeadline(start.Add(20 * time.Millisecond))
+	_ = conn.SetWriteDeadline(start.Add(150 * time.Millisecond))
+	res := make(chan ioResult, 1)
+	go func() {
+		n, err := conn.Write(make([]byte, 1024))
+		res <- ioResult{n, err}
+	}()
+	select {
+	case got := <-res:
+		if got.n != 0 || !isTimeout(got.err) {
+			t.Fatalf("Write() = %d, %v; want 0 and a timeout", got.n, got.err)
+		}
+		if elapsed := time.Since(start); elapsed < 150*time.Millisecond {
+			t.Fatalf("Write() timed out after %v, at the deadline that was moved later", elapsed)
+		}
+	case <-time.After(time.Second):
+		r.Stop()
+		<-res
+		t.Fatal("Write() blocked in the limiter past its deadline")
+	}
+}
+
+// deadlineRejectingConn is a net.Conn without deadline support, as SSH
+// channels are.
+type deadlineRejectingConn struct{ nopNetConn }
+
+var errNoDeadline = errors.New("deadline not supported")
+
+func (*deadlineRejectingConn) SetDeadline(time.Time) error      { return errNoDeadline }
+func (*deadlineRejectingConn) SetReadDeadline(time.Time) error  { return errNoDeadline }
+func (*deadlineRejectingConn) SetWriteDeadline(time.Time) error { return errNoDeadline }
+
+// A deadline the wrapped connection rejects must not bound the waits in the
+// limiters either: I/O on it would otherwise time out only when throttled.
+func TestRateConnRejectedDeadline(t *testing.T) {
+	conn := NewRateConn(&deadlineRejectingConn{}, NewRate(1024))
+	past := time.Now().Add(-time.Second)
+	for name, set := range map[string]func(time.Time) error{
+		"SetDeadline":      conn.SetDeadline,
+		"SetReadDeadline":  conn.SetReadDeadline,
+		"SetWriteDeadline": conn.SetWriteDeadline,
+	} {
+		if err := set(past); !errors.Is(err, errNoDeadline) {
+			t.Fatalf("%s() error = %v, want %v", name, err, errNoDeadline)
+		}
+	}
+	rc := conn.(*rateNetConn)
+	for _, d := range []*direction{&rc.read, &rc.write} {
+		if d.cancel.current().ended() {
+			t.Fatal("a rejected deadline ended the waits in the limiter")
+		}
+	}
+}

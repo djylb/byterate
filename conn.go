@@ -301,18 +301,56 @@ type waitCancel struct {
 
 	mu     sync.Mutex
 	closed bool           // the connection is closed
-	armed  bool           // timer is set to end the current generation
 	timer  *deadlineTimer // made by the first deadline in the future, then reused
 }
 
 // deadlineTimer ends a generation at its deadline. It refers to the
-// generation alone, so a pending deadline keeps no connection reachable.
+// generation alone, so a pending deadline keeps no connection reachable. A
+// deadline moved later, as servers do before every read, leaves the runtime
+// timer alone: it fires at the earlier time and sets itself again.
 type deadlineTimer struct {
-	t   *time.Timer
-	gen atomic.Pointer[waitGen]
+	mu      sync.Mutex
+	t       *time.Timer
+	gen     *waitGen  // the generation to end
+	at      time.Time // the deadline, zero for none
+	firesAt time.Time // the deadline t is set for, zero once it has fired
 }
 
-func (dt *deadlineTimer) fire() { dt.gen.Load().end(genExpired) }
+func newDeadlineTimer(g *waitGen, at time.Time, d time.Duration) *deadlineTimer {
+	dt := &deadlineTimer{gen: g, at: at, firesAt: at}
+	dt.mu.Lock() // fire may run before t is set
+	dt.t = time.AfterFunc(d, dt.fire)
+	dt.mu.Unlock()
+	return dt
+}
+
+func (dt *deadlineTimer) fire() {
+	dt.mu.Lock()
+	defer dt.mu.Unlock()
+	dt.firesAt = time.Time{}
+	if dt.at.IsZero() {
+		return
+	}
+	if d := time.Until(dt.at); d > 0 {
+		dt.schedule(d) // the deadline was moved later
+		return
+	}
+	dt.gen.end(genExpired)
+}
+
+// set makes dt end g at at, which is d from now. dt.mu must be held.
+func (dt *deadlineTimer) set(g *waitGen, at time.Time, d time.Duration) {
+	dt.gen, dt.at = g, at
+	if dt.firesAt.IsZero() || dt.firesAt.After(at) {
+		dt.schedule(d)
+	}
+}
+
+// schedule sets t to fire after d, at dt.at. dt.mu must be held.
+func (dt *deadlineTimer) schedule(d time.Duration) {
+	dt.firesAt = dt.at
+	dt.t.Reset(d)
+}
 
 func (w *waitCancel) init() { w.gen.Store(&waitGen{}) }
 
@@ -327,38 +365,32 @@ func (w *waitCancel) setDeadline(t time.Time) {
 	if w.closed {
 		return
 	}
-	w.stopTimer()
+	dt := w.timer
+	if dt != nil {
+		dt.mu.Lock() // keeps fire from ending g while it is replaced
+		defer dt.mu.Unlock()
+		dt.at = time.Time{} // set again below for a deadline in the future
+	}
 
 	g := w.gen.Load()
-	expired := g.ended()
-	if t.IsZero() {
-		if expired {
-			w.init()
+	var d time.Duration
+	if !t.IsZero() {
+		if d = time.Until(t); d <= 0 {
+			g.end(genExpired)
+			return
 		}
-		return
 	}
-	if d := time.Until(t); d > 0 {
-		if expired {
-			w.init()
-			g = w.gen.Load()
-		}
-		w.arm(g, d)
-		return
+	if g.ended() {
+		g = &waitGen{} // waits on the ended generation stay ended
+		w.gen.Store(g)
 	}
-	g.end(genExpired)
-}
-
-// arm sets the timer to end g after d. w.mu must be held.
-func (w *waitCancel) arm(g *waitGen, d time.Duration) {
-	w.armed = true
-	if w.timer == nil {
-		w.timer = &deadlineTimer{}
-		w.timer.gen.Store(g)
-		w.timer.t = time.AfterFunc(d, w.timer.fire)
-		return
+	switch {
+	case t.IsZero():
+	case dt == nil:
+		w.timer = newDeadlineTimer(g, t, d)
+	default:
+		dt.set(g, t, d)
 	}
-	w.timer.gen.Store(g)
-	w.timer.t.Reset(d)
 }
 
 // close ends the wait signal for good, ending any wait.
@@ -370,25 +402,18 @@ func (w *waitCancel) close() {
 		return
 	}
 	w.closed = true
-	w.stopTimer()
+	if dt := w.timer; dt != nil {
+		dt.mu.Lock()
+		dt.at, dt.firesAt = time.Time{}, time.Time{}
+		dt.t.Stop()
+		dt.mu.Unlock()
+	}
 	if g.ended() {
 		// Waits on g keep their deadline error; later ones see the close.
 		w.gen.Store(closedGen)
 		return
 	}
 	g.end(genClosed)
-}
-
-// stopTimer disarms the deadline timer, waiting for it to end the current
-// generation if it has already fired. w.mu must be held.
-func (w *waitCancel) stopTimer() {
-	if !w.armed {
-		return
-	}
-	w.armed = false
-	if !w.timer.t.Stop() {
-		<-w.timer.gen.Load().Done()
-	}
 }
 
 type rateNetConn struct {
@@ -411,34 +436,43 @@ func (c *rateNetConn) RemoteAddr() net.Addr {
 }
 
 // SetDeadline sets the read and write deadlines of the wrapped connection
-// and of the waits in the limiters.
+// and, if it accepts them, of the waits in the limiters.
 func (c *rateNetConn) SetDeadline(t time.Time) error {
 	if c.conn == nil {
 		return ErrNilConn
 	}
+	if err := c.conn.SetDeadline(t); err != nil {
+		return err
+	}
 	c.read.setDeadline(t)
 	c.write.setDeadline(t)
-	return c.conn.SetDeadline(t)
+	return nil
 }
 
-// SetReadDeadline sets the read deadline of the wrapped connection and of
-// the waits in the read limiter.
+// SetReadDeadline sets the read deadline of the wrapped connection and, if
+// it accepts it, of the waits in the read limiter.
 func (c *rateNetConn) SetReadDeadline(t time.Time) error {
 	if c.conn == nil {
 		return ErrNilConn
 	}
+	if err := c.conn.SetReadDeadline(t); err != nil {
+		return err
+	}
 	c.read.setDeadline(t)
-	return c.conn.SetReadDeadline(t)
+	return nil
 }
 
-// SetWriteDeadline sets the write deadline of the wrapped connection and of
-// the waits in the write limiter.
+// SetWriteDeadline sets the write deadline of the wrapped connection and, if
+// it accepts it, of the waits in the write limiter.
 func (c *rateNetConn) SetWriteDeadline(t time.Time) error {
 	if c.conn == nil {
 		return ErrNilConn
 	}
+	if err := c.conn.SetWriteDeadline(t); err != nil {
+		return err
+	}
 	c.write.setDeadline(t)
-	return c.conn.SetWriteDeadline(t)
+	return nil
 }
 
 // RawConn returns the wrapped connection.

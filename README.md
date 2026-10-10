@@ -75,7 +75,8 @@ duplex := byterate.NewDuplexRateConn(c, byterate.NewRate(8<<20), byterate.NewRat
   passes refunds its charge and returns 0 and `os.ErrDeadlineExceeded`, a
   timeout `net.Error`. A `Read` has already received its bytes, so it keeps
   the charge and returns them with `os.ErrDeadlineExceeded`. Moving a deadline
-  later does not end a wait.
+  later does not end a wait, and a deadline the wrapped connection rejects
+  does not bound the limiter either.
 - `Rate.Now` and `Meter.Snapshot` report bytes per second over the last
   sampling window of at least one second, so they lag by up to about two
   seconds. Refunds come off the throughput: one for bytes metered in the
@@ -93,8 +94,10 @@ hot counters sit on cache lines of their own, so `Rate`s and `Meter`s used by
 different cores do not slow each other down; this padding makes a `Rate`
 about 340 bytes and a `Meter` about 300. Wrapping a connection takes at most
 three allocations, about 200 bytes. Setting its deadlines allocates only for
-the first deadline and after one has expired, and a pending deadline does not
-keep a connection that was never closed from being garbage collected.
+the first deadline and after one has expired, and moving a deadline later, as
+servers do before every read, leaves the runtime timer alone. A pending
+deadline does not keep a connection that was never closed from being garbage
+collected.
 
 Tests can use `testing/synctest`: inside a bubble, a `Rate` or `Meter` runs on
 the bubble's clock. Create it inside the bubble that uses it, since its
