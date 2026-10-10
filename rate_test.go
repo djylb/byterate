@@ -273,6 +273,10 @@ func TestZeroValueRateLimitsAfterStart(t *testing.T) {
 	}
 }
 
+// metered returns the bytes r has metered in its current sampling window,
+// net of refunds.
+func metered(r *Rate) int64 { return r.bytesAcc.Load() - r.refundAcc.Load() }
+
 // TestRateSetLimitDebt checks that debt is kept as bytes across limit
 // changes, also through a time without a limit, and that ResetLimit drops it.
 func TestRateSetLimitDebt(t *testing.T) {
@@ -435,8 +439,8 @@ func TestRateGetContextCancel(t *testing.T) {
 		r.Stop()
 		t.Fatal("GetContext() did not return promptly after cancel")
 	}
-	if got := r.bytesAcc.Load(); got != 64<<10 {
-		t.Fatalf("bytesAcc after canceled GetContext = %d, want charge kept", got)
+	if got := metered(r); got != 64<<10 {
+		t.Fatalf("metered after canceled GetContext = %d, want charge kept", got)
 	}
 
 	// No wait needed: a done context does not turn an allowed charge into an error.
@@ -553,5 +557,34 @@ func TestRateMeterDropsRefundsFromBeforeReset(t *testing.T) {
 	r.reserve(100 << 10)
 	if got := roll(); got != 100<<10 {
 		t.Fatalf("second window after the reset = %d B/s, want %d", got, 100<<10)
+	}
+}
+
+// TestRateMeterCarryBoundByCharges cancels a write charged in a window whose
+// own refunds netted it to 0: its refund must still come off the next
+// windows, as far as that window charged.
+func TestRateMeterCarryBoundByCharges(t *testing.T) {
+	r := NewRate(0)
+	last := nowNs() + int64(time.Hour)
+	r.lastSampleNs.Store(last) // only roll closes a window
+	roll := func() int64 {
+		last += sampleIntervalNs
+		r.updateRateWithNow(last)
+		return r.nowBps.Load()
+	}
+
+	r.reserve(100_000) // write B
+	roll()
+	r.reserve(100_000)      // write A
+	r.ReturnBucket(100_000) // B is canceled
+	roll()
+	r.reserve(50_000)
+	r.ReturnBucket(100_000) // A is canceled
+	if got := roll(); got != 0 {
+		t.Fatalf("window with A's refund = %d B/s, want 0", got)
+	}
+	r.reserve(50_000)
+	if got := roll(); got != 0 {
+		t.Fatalf("next window = %d B/s, want 0 with the rest of A's refund", got)
 	}
 }

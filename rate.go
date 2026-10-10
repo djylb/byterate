@@ -34,15 +34,16 @@ type Rate struct {
 
 	_ cacheLinePad
 	// Written by every charge, on a cache line of their own.
-	tat      atomic.Int64 // theoretical arrival time (ns since epoch), can be negative
-	bytesAcc atomic.Int64 // bytes charged in the current sampling window
-	_        cacheLinePad
+	tat       atomic.Int64 // theoretical arrival time (ns since epoch), can be negative
+	bytesAcc  atomic.Int64 // bytes charged in the current sampling window
+	refundAcc atomic.Int64 // bytes refunded in it, and refunds carried into it
+	_         cacheLinePad
 
-	nowBps    atomic.Int64 // throughput of the last sampling window, bytes/s
-	lastBytes atomic.Int64 // bytes metered in the last sampling window
-	mu        sync.Mutex
-	debtRate  int64 // the limit tat's debt is reckoned at: the last one above 0
-	stopped   bool
+	nowBps      atomic.Int64 // throughput of the last sampling window, bytes/s
+	lastCharged atomic.Int64 // bytes charged in the last sampling window
+	mu          sync.Mutex
+	debtRate    int64 // the limit tat's debt is reckoned at: the last one above 0
+	stopped     bool
 }
 
 // NewRate returns a started Rate limited to limitBps bytes per second with a
@@ -82,9 +83,10 @@ func (r *Rate) Clone() *Rate {
 	cloned.tat.Store(r.tat.Load())
 	cloned.enabled.Store(r.enabled.Load())
 	cloned.bytesAcc.Store(r.bytesAcc.Load())
+	cloned.refundAcc.Store(r.refundAcc.Load())
 	cloned.lastSampleNs.Store(r.lastSampleNs.Load())
 	cloned.nowBps.Store(r.nowBps.Load())
-	cloned.lastBytes.Store(r.lastBytes.Load())
+	cloned.lastCharged.Store(r.lastCharged.Load())
 
 	signal := &stopSignal{ch: make(chan struct{})}
 	if stopped {
@@ -203,9 +205,10 @@ func (r *Rate) Start() {
 		now := nowNs()
 		r.tat.Store(now - burstWindowNs) // full burst on (re)enable
 		r.bytesAcc.Store(0)
+		r.refundAcc.Store(0)
 		r.lastSampleNs.Store(now)
 		r.nowBps.Store(0)
-		r.lastBytes.Store(0)
+		r.lastCharged.Store(0)
 	}
 
 	r.enabled.Store(true)
@@ -228,8 +231,9 @@ func (r *Rate) Stop() {
 		r.stopped = true
 	}
 	r.bytesAcc.Store(0)
+	r.refundAcc.Store(0)
 	r.nowBps.Store(0)
-	r.lastBytes.Store(0)
+	r.lastCharged.Store(0)
 }
 
 // ReturnBucket refunds size bytes previously charged by Get, for example the
@@ -242,7 +246,7 @@ func (r *Rate) ReturnBucket(size int64) {
 		return
 	}
 
-	r.bytesAcc.Add(-size)
+	r.refundAcc.Add(size)
 
 	rate := r.rate.Load()
 	if rate <= 0 {
@@ -392,16 +396,17 @@ func (r *Rate) updateRateWithNow(now int64) {
 		return
 	}
 
-	bytes := r.bytesAcc.Swap(0)
+	charged := r.bytesAcc.Swap(0)
+	bytes := charged - r.refundAcc.Swap(0)
 	if bytes < 0 {
-		// Refunds of bytes metered in an earlier window, such as a canceled
+		// Refunds of bytes metered in the last window, such as a canceled
 		// write, outweigh this window's charges: carry the rest forward, up
-		// to what the last window metered. More refunds bytes charged before
+		// to what the last window charged. More refunds bytes charged before
 		// Start cleared the meter, which must not hold it at 0.
-		r.bytesAcc.Add(max(bytes, -r.lastBytes.Load()))
+		r.refundAcc.Add(min(-bytes, r.lastCharged.Load()))
 		bytes = 0
 	}
-	r.lastBytes.Store(bytes)
+	r.lastCharged.Store(charged)
 	dt := now - last
 	if dt <= 0 {
 		return

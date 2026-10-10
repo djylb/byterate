@@ -50,8 +50,8 @@ func TestRateConnReadChargesActualBytes(t *testing.T) {
 	if string(buf[:n]) != "ok" {
 		t.Fatalf("Read() data = %q, want %q", string(buf[:n]), "ok")
 	}
-	if got := r.bytesAcc.Load(); got != 2 {
-		t.Fatalf("bytesAcc after Read() = %d, want 2", got)
+	if got := metered(r); got != 2 {
+		t.Fatalf("metered after Read() = %d, want 2", got)
 	}
 }
 
@@ -67,8 +67,8 @@ func TestRateConnWriteRefundsShortWrite(t *testing.T) {
 	if n != 2 {
 		t.Fatalf("Write() n = %d, want 2", n)
 	}
-	if got := r.bytesAcc.Load(); got != 2 {
-		t.Fatalf("bytesAcc after Write() = %d, want 2", got)
+	if got := metered(r); got != 2 {
+		t.Fatalf("metered after Write() = %d, want 2", got)
 	}
 }
 
@@ -137,8 +137,8 @@ func TestRateConnCloseWakesBlockedWrite(t *testing.T) {
 	if res.n != 0 || !errors.Is(res.err, net.ErrClosed) {
 		t.Fatalf("Write() = %d, %v; want 0, %v", res.n, res.err, net.ErrClosed)
 	}
-	if got := r.bytesAcc.Load(); got != 0 {
-		t.Fatalf("bytesAcc after canceled Write() = %d, want 0", got)
+	if got := metered(r); got != 0 {
+		t.Fatalf("metered after canceled Write() = %d, want 0", got)
 	}
 	// The unsent write was refunded, so other users of r get the full burst.
 	if wait := r.reserve(2048); wait != 0 {
@@ -157,8 +157,8 @@ func TestRateConnCloseWakesBlockedRead(t *testing.T) {
 		t.Fatalf("Read() = %d, %v; want %d, %v", res.n, res.err, 64<<10, net.ErrClosed)
 	}
 	// The bytes were received, so they stay charged.
-	if got := r.bytesAcc.Load(); got != 64<<10 {
-		t.Fatalf("bytesAcc after canceled Read() = %d, want %d", got, 64<<10)
+	if got := metered(r); got != 64<<10 {
+		t.Fatalf("metered after canceled Read() = %d, want %d", got, 64<<10)
 	}
 }
 
@@ -173,11 +173,11 @@ func TestRateConnCloseWakesHierarchicalWrite(t *testing.T) {
 	if res.n != 0 || !errors.Is(res.err, net.ErrClosed) {
 		t.Fatalf("Write() = %d, %v; want 0, %v", res.n, res.err, net.ErrClosed)
 	}
-	if got := first.bytesAcc.Load(); got != 0 {
-		t.Fatalf("first bytesAcc after canceled Write() = %d, want 0", got)
+	if got := metered(first); got != 0 {
+		t.Fatalf("first metered after canceled Write() = %d, want 0", got)
 	}
-	if got := second.bytesAcc.Load(); got != 0 {
-		t.Fatalf("second bytesAcc after canceled Write() = %d, want 0", got)
+	if got := metered(second); got != 0 {
+		t.Fatalf("second metered after canceled Write() = %d, want 0", got)
 	}
 }
 
@@ -223,8 +223,8 @@ func TestRateConnKeepsNetConnBehavior(t *testing.T) {
 	if _, err := io.ReadFull(server, buf); err != nil || string(buf) != "abc" {
 		t.Fatalf("server read = %q, %v", buf, err)
 	}
-	if got := r.bytesAcc.Load(); got != 3 {
-		t.Fatalf("bytesAcc = %d, want 3", got)
+	if got := metered(r); got != 3 {
+		t.Fatalf("metered = %d, want 3", got)
 	}
 	if err := conn.Close(); err != nil {
 		t.Fatalf("Close() error = %v", err)
@@ -313,10 +313,10 @@ func TestDuplexRateConnChargesEachDirection(t *testing.T) {
 	if _, err := conn.Write([]byte("hello")); err != nil {
 		t.Fatal(err)
 	}
-	if got, want := in.bytesAcc.Load(), int64(3); got != want {
+	if got, want := metered(in), int64(3); got != want {
 		t.Fatalf("read limiter charged %d, want %d", got, want)
 	}
-	if got, want := out.bytesAcc.Load(), int64(5); got != want {
+	if got, want := metered(out), int64(5); got != want {
 		t.Fatalf("write limiter charged %d, want %d", got, want)
 	}
 
@@ -328,7 +328,7 @@ func TestDuplexRateConnChargesEachDirection(t *testing.T) {
 	if _, err := conn.Write([]byte("hi")); err != nil {
 		t.Fatal(err)
 	}
-	if got, want := out.bytesAcc.Load(), int64(7); got != want {
+	if got, want := metered(out), int64(7); got != want {
 		t.Fatalf("write limiter charged %d in total, want %d", got, want)
 	}
 
@@ -439,8 +439,8 @@ func TestRateConnReadDeadlineEndsLimiterWait(t *testing.T) {
 		t.Fatal("SetReadDeadline(now) did not end a Read blocked in the limiter")
 	}
 	// The bytes were received, so they stay charged.
-	if got := r.bytesAcc.Load(); got != 8<<10 {
-		t.Fatalf("bytesAcc after timed-out Read() = %d, want %d", got, 8<<10)
+	if got := metered(r); got != 8<<10 {
+		t.Fatalf("metered after timed-out Read() = %d, want %d", got, 8<<10)
 	}
 
 	// Clearing the expired deadline lets later waits run to completion again.
