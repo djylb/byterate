@@ -94,17 +94,31 @@ func (r *Rate) Clone() *Rate {
 }
 
 // SetLimit sets the limit in bytes per second; limitBps <= 0 means unlimited.
-// It applies to later reservations only: debt accrued at the previous limit is
-// kept and callers blocked in Get are not woken, so a raised limit takes full
-// effect once that debt is repaid. Use ResetLimit to apply a limit at once.
+// It applies from the next charge: raising or removing the limit forgives the
+// debt accrued at the lower one, and lowering it keeps the debt. Callers
+// blocked in Get are not woken; ResetLimit also wakes them, restores the full
+// burst and clears the meter.
 func (r *Rate) SetLimit(limitBps int64) {
 	if r == nil {
 		return
 	}
-	if limitBps <= 0 {
-		limitBps = 0
+	limitBps = max(limitBps, 0)
+	old := r.rate.Swap(limitBps)
+	if old <= 0 || (limitBps > 0 && limitBps <= old) {
+		return // lowered or unchanged: the debt stands
 	}
-	r.rate.Store(limitBps)
+	// Debt is kept as time, so debt accrued at the lower limit would hold
+	// back the higher one, and a refund converted at the higher limit would
+	// not cancel the charge it refunds. Charges load tat before the limit,
+	// and this always changes tat, so one that saw the old limit fails its
+	// CAS and retries at the new one.
+	now := nowNs()
+	for {
+		prev := r.tat.Load()
+		if r.tat.CompareAndSwap(prev, min(prev, now)-1) {
+			return
+		}
+	}
 }
 
 // ResetLimit is Stop, SetLimit and Start: it wakes blocked callers, clears the
@@ -277,15 +291,21 @@ func (r *Rate) reserveAt(size, now int64) int64 {
 	r.bytesAcc.Add(size)
 	r.updateRateWithNow(now)
 
-	currentRate := r.rate.Load()
-	if currentRate <= 0 {
+	rate := r.rate.Load()
+	if rate <= 0 {
 		return 0
 	}
-
-	cost := bytesToNsCeil(size, currentRate)
+	cost := bytesToNsCeil(size, rate)
 	minTat := now - burstWindowNs
 	for {
 		prev := r.tat.Load()
+		// The limit again, after tat: see SetLimit.
+		if cur := r.rate.Load(); cur != rate {
+			if cur <= 0 {
+				return 0
+			}
+			rate, cost = cur, bytesToNsCeil(size, cur)
+		}
 		next := clampAdd(max(prev, minTat), cost)
 		if r.tat.CompareAndSwap(prev, next) {
 			wait := max(next-now, 0)
