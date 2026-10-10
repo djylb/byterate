@@ -2,7 +2,6 @@ package byterate
 
 import (
 	"math/bits"
-	"sync"
 	"time"
 )
 
@@ -31,41 +30,6 @@ func nowNs() int64 {
 // the 128-byte lines of Apple silicon and the adjacent-line prefetch of x86.
 type cacheLinePad [128]byte
 
-var timerPool = sync.Pool{
-	New: func() any {
-		t := time.NewTimer(0)
-		if !t.Stop() {
-			select {
-			case <-t.C:
-			default:
-			}
-		}
-		return t
-	},
-}
-
-func getTimer(d time.Duration) *time.Timer {
-	t := timerPool.Get().(*time.Timer)
-	if !t.Stop() {
-		select {
-		case <-t.C:
-		default:
-		}
-	}
-	t.Reset(d)
-	return t
-}
-
-func putTimer(t *time.Timer) {
-	if !t.Stop() {
-		select {
-		case <-t.C:
-		default:
-		}
-	}
-	timerPool.Put(t)
-}
-
 // sleepNs waits waitNs, returning early when stopCh or done is closed.
 // It reports false only when done was closed before the wait elapsed.
 func sleepNs(waitNs int64, stopCh, done <-chan struct{}) bool {
@@ -77,8 +41,11 @@ func sleepNs(waitNs int64, stopCh, done <-chan struct{}) bool {
 		return true
 	}
 
-	t := getTimer(time.Duration(waitNs))
-	defer putTimer(t)
+	// A fresh timer rather than a pooled one: a timer belongs to the
+	// testing/synctest bubble that made it, and fails fatally when used from
+	// another or from outside one.
+	t := time.NewTimer(time.Duration(waitNs))
+	defer t.Stop()
 	select {
 	case <-t.C:
 		return true

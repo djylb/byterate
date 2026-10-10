@@ -85,11 +85,16 @@ duplex := byterate.NewDuplexRateConn(c, byterate.NewRate(8<<20), byterate.NewRat
 
 ## Concurrency
 
-`Get`, `ReturnBucket`, `Now` and `Meter.Add` are lock-free and
-allocation-free. A hierarchical charge reads the clock once for all levels,
-and hot counters sit on cache lines of their own, so `Rate`s and `Meter`s used
-by different cores do not slow each other down; this padding makes a `Rate`
+`Get`, `ReturnBucket`, `Now` and `Meter.Add` are lock-free, and they
+allocate nothing unless a `Get` or `GetContext` waits longer than 2 ms, which
+takes a timer. A hierarchical charge reads the clock once for all levels, and
+hot counters sit on cache lines of their own, so `Rate`s and `Meter`s used by
+different cores do not slow each other down; this padding makes a `Rate`
 about 330 bytes and a `Meter` about 300. Wrapping a connection takes at most
 three allocations, about 200 bytes. Setting its deadlines allocates only for
 the first deadline and after one has expired, and a pending deadline does not
 keep a connection that was never closed from being garbage collected.
+
+Tests can use `testing/synctest`: inside a bubble, a `Rate` or `Meter` runs on
+the bubble's clock. Create it inside the bubble that uses it, since its
+timestamps do not carry over between a bubble and the outside.
