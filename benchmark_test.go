@@ -3,6 +3,7 @@ package byterate
 import (
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // benchLimit is a limit that never makes a 32 KiB charge wait.
@@ -79,4 +80,22 @@ func BenchmarkMeterAdd(b *testing.B) {
 			}
 		})
 	})
+}
+
+func BenchmarkNewRateConn(b *testing.B) {
+	c, r := &nopNetConn{}, NewRate(benchLimit)
+	b.ReportAllocs()
+	for b.Loop() {
+		_ = NewRateConn(c, r)
+	}
+}
+
+// BenchmarkRateConnSetDeadline sets a deadline before every operation, as
+// servers with idle timeouts do.
+func BenchmarkRateConnSetDeadline(b *testing.B) {
+	c := NewRateConn(&nopNetConn{}, NewRate(benchLimit))
+	b.ReportAllocs()
+	for b.Loop() {
+		_ = c.SetReadDeadline(time.Now().Add(time.Minute))
+	}
 }

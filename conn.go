@@ -55,7 +55,9 @@ func NewDuplexRateReadWriteCloser(rwc io.ReadWriteCloser, read, write Limiter) i
 	if read == nil && write == nil {
 		return rwc
 	}
-	return newRateConn(rwc, read, write)
+	c := &rateConn{}
+	c.init(rwc, read, write)
+	return c
 }
 
 // NewRateConn is NewRateReadWriteCloser for a net.Conn. The result reports
@@ -80,14 +82,17 @@ func NewDuplexRateConn(c net.Conn, read, write Limiter) net.Conn {
 	if read == nil && write == nil {
 		return c
 	}
-	return &rateNetConn{rateConn: newRateConn(c, read, write), conn: c}
+	nc := &rateNetConn{conn: c}
+	nc.init(c, read, write)
+	return nc
 }
 
-func newRateConn(rwc io.ReadWriteCloser, read, write Limiter) *rateConn {
-	c := &rateConn{conn: rwc}
-	c.read.init(read)
-	c.write.init(write)
-	return c
+// init sets the wrapped connection and the limiters, which the constructors
+// have passed through nilLimiter.
+func (s *rateConn) init(rwc io.ReadWriteCloser, read, write Limiter) {
+	s.conn = rwc
+	s.read.init(read)
+	s.write.init(write)
 }
 
 // nilLimiter returns nil for a nil *Rate or *HierarchicalLimiter, which
@@ -112,8 +117,6 @@ func (d *direction) setDeadline(t time.Time) {
 	}
 }
 
-// init sets d's limiter, which the constructors have passed through
-// nilLimiter.
 func (d *direction) init(rate Limiter) {
 	d.rate = rate
 	d.ctxRate, _ = rate.(ContextLimiter)
@@ -198,7 +201,7 @@ func (s *rateConn) wait(d *direction, size int64) error {
 	case d.ctxRate != nil:
 		g := d.cancel.current() // the whole wait uses one generation
 		if err := d.ctxRate.GetContext(g, size); err != nil {
-			if isClosed(g.ch) {
+			if g.ended() {
 				return g.cause()
 			}
 			return err
@@ -209,50 +212,87 @@ func (s *rateConn) wait(d *direction, size int64) error {
 	return nil
 }
 
+// Generation states. A generation ends once, by a deadline or by Close.
+const (
+	genOpen uint32 = iota
+	genExpired
+	genClosed
+)
+
 // waitGen is one generation of a direction's wait signal and the context a
-// wait passes to GetContext. Its Done channel never changes, and Err is
-// non-nil once the channel is closed, as context.Context requires.
+// wait passes to GetContext. Its Done channel is made on first use, since
+// most waits need none, and never changes; Err is non-nil once it is closed,
+// as context.Context requires.
 type waitGen struct {
-	ch     chan struct{}
-	closed atomic.Bool // ch was closed by Close rather than a deadline; set before ch is closed
+	done  atomic.Value // chan struct{}, set by Done or end
+	state atomic.Uint32
 }
 
 var _ context.Context = (*waitGen)(nil)
 
+// closedChan is the Done channel of a generation that ended before any wait
+// asked for one.
+var closedChan = func() chan struct{} {
+	ch := make(chan struct{})
+	close(ch)
+	return ch
+}()
+
 // closedGen is the generation of every closed connection whose own
 // generation a deadline had already ended.
 var closedGen = func() *waitGen {
-	g := &waitGen{ch: make(chan struct{})}
-	g.closed.Store(true)
-	close(g.ch)
+	g := &waitGen{}
+	g.end(genClosed)
 	return g
 }()
 
 func (g *waitGen) Deadline() (time.Time, bool) { return time.Time{}, false }
 
-func (g *waitGen) Done() <-chan struct{} { return g.ch }
+func (g *waitGen) Done() <-chan struct{} {
+	if ch, ok := g.done.Load().(chan struct{}); ok {
+		return ch
+	}
+	g.done.CompareAndSwap(nil, make(chan struct{})) // loses only to end or another Done
+	return g.done.Load().(chan struct{})
+}
 
 func (g *waitGen) Err() error {
-	if !isClosed(g.ch) {
+	var err error
+	switch g.state.Load() {
+	case genOpen:
 		return nil
+	case genExpired:
+		err = context.DeadlineExceeded
+	default:
+		err = context.Canceled
 	}
-	if g.closed.Load() {
-		return context.Canceled
-	}
-	return context.DeadlineExceeded
+	<-g.Done() // end sets the state before it closes the channel
+	return err
 }
 
 func (g *waitGen) Value(any) any { return nil }
 
+// end ends g with state genExpired or genClosed, unless it has ended.
+func (g *waitGen) end(state uint32) {
+	if !g.state.CompareAndSwap(genOpen, state) {
+		return
+	}
+	if !g.done.CompareAndSwap(nil, closedChan) {
+		close(g.done.Load().(chan struct{}))
+	}
+}
+
+func (g *waitGen) ended() bool { return g.state.Load() != genOpen }
+
 // cause returns the error for a wait that g ended.
 func (g *waitGen) cause() error {
-	if g.closed.Load() {
+	if g.state.Load() == genClosed {
 		return net.ErrClosed
 	}
 	return os.ErrDeadlineExceeded
 }
 
-// waitCancel is a direction's wait signal. Its current generation is closed
+// waitCancel is a direction's wait signal. Its current generation is ended
 // when the connection is closed or the direction's deadline passes. A
 // deadline that has passed and is moved later or cleared starts a new
 // generation, as net.Pipe does, and waits on the old one stay ended.
@@ -260,16 +300,26 @@ type waitCancel struct {
 	gen atomic.Pointer[waitGen] // nil until init
 
 	mu     sync.Mutex
-	closed bool        // the connection is closed
-	timer  *time.Timer // closes the current generation at the deadline
+	closed bool           // the connection is closed
+	armed  bool           // timer is set to end the current generation
+	timer  *deadlineTimer // made by the first deadline in the future, then reused
 }
 
-func (w *waitCancel) init() { w.gen.Store(&waitGen{ch: make(chan struct{})}) }
+// deadlineTimer ends a generation at its deadline. It refers to the
+// generation alone, so a pending deadline keeps no connection reachable.
+type deadlineTimer struct {
+	t   *time.Timer
+	gen atomic.Pointer[waitGen]
+}
+
+func (dt *deadlineTimer) fire() { dt.gen.Load().end(genExpired) }
+
+func (w *waitCancel) init() { w.gen.Store(&waitGen{}) }
 
 // current returns the generation a new wait uses.
 func (w *waitCancel) current() *waitGen { return w.gen.Load() }
 
-// setDeadline sets the time at which the wait signal is closed; a zero t
+// setDeadline sets the time at which the current generation ends; a zero t
 // means never.
 func (w *waitCancel) setDeadline(t time.Time) {
 	w.mu.Lock()
@@ -280,7 +330,7 @@ func (w *waitCancel) setDeadline(t time.Time) {
 	w.stopTimer()
 
 	g := w.gen.Load()
-	expired := isClosed(g.ch)
+	expired := g.ended()
 	if t.IsZero() {
 		if expired {
 			w.init()
@@ -292,15 +342,26 @@ func (w *waitCancel) setDeadline(t time.Time) {
 			w.init()
 			g = w.gen.Load()
 		}
-		w.timer = time.AfterFunc(d, func() { close(g.ch) })
+		w.arm(g, d)
 		return
 	}
-	if !expired {
-		close(g.ch)
-	}
+	g.end(genExpired)
 }
 
-// close closes the wait signal for good, ending any wait.
+// arm sets the timer to end g after d. w.mu must be held.
+func (w *waitCancel) arm(g *waitGen, d time.Duration) {
+	w.armed = true
+	if w.timer == nil {
+		w.timer = &deadlineTimer{}
+		w.timer.gen.Store(g)
+		w.timer.t = time.AfterFunc(d, w.timer.fire)
+		return
+	}
+	w.timer.gen.Store(g)
+	w.timer.t.Reset(d)
+}
+
+// close ends the wait signal for good, ending any wait.
 func (w *waitCancel) close() {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -310,35 +371,28 @@ func (w *waitCancel) close() {
 	}
 	w.closed = true
 	w.stopTimer()
-	if isClosed(g.ch) {
+	if g.ended() {
 		// Waits on g keep their deadline error; later ones see the close.
 		w.gen.Store(closedGen)
 		return
 	}
-	g.closed.Store(true)
-	close(g.ch)
+	g.end(genClosed)
 }
 
-// stopTimer stops the deadline timer, waiting for it to close the current
+// stopTimer disarms the deadline timer, waiting for it to end the current
 // generation if it has already fired. w.mu must be held.
 func (w *waitCancel) stopTimer() {
-	if w.timer != nil && !w.timer.Stop() {
-		<-w.gen.Load().ch
+	if !w.armed {
+		return
 	}
-	w.timer = nil
-}
-
-func isClosed(ch <-chan struct{}) bool {
-	select {
-	case <-ch:
-		return true
-	default:
-		return false
+	w.armed = false
+	if !w.timer.t.Stop() {
+		<-w.timer.gen.Load().Done()
 	}
 }
 
 type rateNetConn struct {
-	*rateConn
+	rateConn
 	conn net.Conn
 }
 
