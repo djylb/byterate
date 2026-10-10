@@ -38,9 +38,10 @@ type Rate struct {
 	bytesAcc atomic.Int64 // bytes charged in the current sampling window
 	_        cacheLinePad
 
-	nowBps  atomic.Int64 // throughput of the last sampling window, bytes/s
-	mu      sync.Mutex
-	stopped bool
+	nowBps    atomic.Int64 // throughput of the last sampling window, bytes/s
+	lastBytes atomic.Int64 // bytes metered in the last sampling window
+	mu        sync.Mutex
+	stopped   bool
 }
 
 // NewRate returns a started Rate limited to limitBps bytes per second with a
@@ -68,9 +69,12 @@ func (r *Rate) Clone() *Rate {
 	if r == nil {
 		return nil
 	}
+	// Under r.mu, so that the started or stopped state is not torn by a
+	// concurrent Start or Stop: a clone with a closed stop channel that is
+	// enabled would charge without ever waiting.
 	r.mu.Lock()
+	defer r.mu.Unlock()
 	stopped := r.stopped
-	r.mu.Unlock()
 
 	cloned := &Rate{stopped: stopped}
 	cloned.rate.Store(r.rate.Load())
@@ -79,6 +83,7 @@ func (r *Rate) Clone() *Rate {
 	cloned.bytesAcc.Store(r.bytesAcc.Load())
 	cloned.lastSampleNs.Store(r.lastSampleNs.Load())
 	cloned.nowBps.Store(r.nowBps.Load())
+	cloned.lastBytes.Store(r.lastBytes.Load())
 
 	signal := &stopSignal{ch: make(chan struct{})}
 	if stopped {
@@ -125,8 +130,8 @@ func (r *Rate) Limit() int64 {
 // sampling window of at least one second, closing the current window if it is
 // due. It reports 0 while r is stopped.
 func (r *Rate) Now() int64 {
-	if r == nil {
-		return 0
+	if r == nil || !r.enabled.Load() {
+		return 0 // also when a charge that raced with Stop is still metered
 	}
 	r.updateRateWithNow(nowNs())
 	return r.nowBps.Load()
@@ -155,6 +160,7 @@ func (r *Rate) Start() {
 		r.bytesAcc.Store(0)
 		r.lastSampleNs.Store(now)
 		r.nowBps.Store(0)
+		r.lastBytes.Store(0)
 	}
 
 	r.enabled.Store(true)
@@ -178,13 +184,14 @@ func (r *Rate) Stop() {
 	}
 	r.bytesAcc.Store(0)
 	r.nowBps.Store(0)
+	r.lastBytes.Store(0)
 }
 
 // ReturnBucket refunds size bytes previously charged by Get, for example the
 // unwritten part of a short write. A refund never raises the available burst
 // above two seconds' worth of bytes. The bytes also come off the meter: a
-// refund of bytes metered in an earlier sampling window is taken off the
-// following windows.
+// refund of bytes metered in the previous sampling window is taken off the
+// next one.
 func (r *Rate) ReturnBucket(size int64) {
 	if r == nil || size <= 0 || !r.enabled.Load() {
 		return
@@ -222,7 +229,7 @@ func (r *Rate) Get(size int64) {
 	if wait <= coalesceWaitNs {
 		return
 	}
-	sleepNs(wait, stopCh, nil)
+	sleepNs(wait, r.startedStopCh(stopCh), nil)
 }
 
 // GetContext is like Get but returns ctx.Err() if ctx is done before the wait
@@ -233,7 +240,7 @@ func (r *Rate) GetContext(ctx context.Context, size int64) error {
 	if wait <= coalesceWaitNs {
 		return nil
 	}
-	if !sleepNs(wait, stopCh, ctx.Done()) {
+	if !sleepNs(wait, r.startedStopCh(stopCh), ctx.Done()) {
 		return ctx.Err()
 	}
 	return nil
@@ -315,6 +322,16 @@ func (r *Rate) stopCh() <-chan struct{} {
 	return nil
 }
 
+// startedStopCh returns stopCh, loaded before a charge that must wait, or if
+// it is nil the current one: r had never been started then, so the charge
+// came after the first Start, which stores the channel before enabling r.
+func (r *Rate) startedStopCh(stopCh <-chan struct{}) <-chan struct{} {
+	if stopCh == nil {
+		return r.stopCh()
+	}
+	return stopCh
+}
+
 func (r *Rate) updateRateWithNow(now int64) {
 	last := r.lastSampleNs.Load()
 	if now-last < sampleIntervalNs {
@@ -327,10 +344,13 @@ func (r *Rate) updateRateWithNow(now int64) {
 	bytes := r.bytesAcc.Swap(0)
 	if bytes < 0 {
 		// Refunds of bytes metered in an earlier window, such as a canceled
-		// write, outweigh this window's charges: carry the rest forward.
-		r.bytesAcc.Add(bytes)
+		// write, outweigh this window's charges: carry the rest forward, up
+		// to what the last window metered. More refunds bytes charged before
+		// Start cleared the meter, which must not hold it at 0.
+		r.bytesAcc.Add(max(bytes, -r.lastBytes.Load()))
 		bytes = 0
 	}
+	r.lastBytes.Store(bytes)
 	dt := now - last
 	if dt <= 0 {
 		return

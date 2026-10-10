@@ -388,3 +388,66 @@ func TestRateMeterCarriesRefunds(t *testing.T) {
 		t.Fatalf("idle window = %d B/s, want 0", got)
 	}
 }
+
+// TestRateCloneDuringStartStop clones a Rate that is being stopped and
+// started: every clone must be either stopped or able to wait.
+func TestRateCloneDuringStartStop(t *testing.T) {
+	r := NewRate(1000)
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			r.Stop()
+			r.Start()
+		}
+	}()
+	defer func() { close(stop); <-done }()
+	for range 100000 {
+		c := r.Clone()
+		if c.enabled.Load() && isClosed(c.stopCh()) {
+			t.Fatal("Clone() is enabled with a closed stop channel, so it would never wait")
+		}
+	}
+}
+
+// TestRateNowWhileStopped checks that a charge that raced with Stop is not
+// reported as throughput while the Rate is stopped.
+func TestRateNowWhileStopped(t *testing.T) {
+	r := NewRate(0)
+	r.Stop()
+	r.bytesAcc.Add(1000) // a charge that passed the enabled check before Stop
+	r.lastSampleNs.Store(nowNs() - int64(time.Second))
+	if got := r.Now(); got != 0 {
+		t.Fatalf("Now() of a stopped Rate = %d, want 0", got)
+	}
+}
+
+// TestRateMeterDropsRefundsFromBeforeReset refunds, after ResetLimit, a
+// charge made before it: the cleared meter must report new traffic again
+// within a window rather than stay at 0 until it outweighs the refund.
+func TestRateMeterDropsRefundsFromBeforeReset(t *testing.T) {
+	r := NewRate(0)
+	r.reserve(1 << 20)
+	r.ResetLimit(0)
+	r.ReturnBucket(1 << 20) // the write was not sent after all
+
+	last := nowNs() + int64(time.Hour)
+	r.lastSampleNs.Store(last) // only roll closes a window
+	roll := func() int64 {
+		last += sampleIntervalNs
+		r.updateRateWithNow(last)
+		return r.nowBps.Load()
+	}
+	r.reserve(100 << 10)
+	roll() // absorbs the refund
+	r.reserve(100 << 10)
+	if got := roll(); got != 100<<10 {
+		t.Fatalf("second window after the reset = %d B/s, want %d", got, 100<<10)
+	}
+}

@@ -77,10 +77,10 @@ duplex := byterate.NewDuplexRateConn(c, byterate.NewRate(8<<20), byterate.NewRat
   later does not end a wait.
 - `Rate.Now` and `Meter.Snapshot` report bytes per second over the last
   sampling window of at least one second, so they lag by up to about two
-  seconds. Refunds come off the throughput: one for bytes metered in an
-  earlier window, such as a write canceled by `Close`, is taken off the next
-  windows. `NewRateConn` charges both directions of a connection to one
-  limiter; `NewDuplexRateConn` and `NewDuplexRateReadWriteCloser` take one per
+  seconds. Refunds come off the throughput: one for bytes metered in the
+  previous window, such as a write canceled by `Close`, is taken off the next
+  one. `NewRateConn` charges both directions of a connection to one limiter;
+  `NewDuplexRateConn` and `NewDuplexRateReadWriteCloser` take one per
   direction, so uploads and downloads are limited and metered apart.
 
 ## Concurrency
@@ -90,7 +90,7 @@ allocate nothing unless a `Get` or `GetContext` waits longer than 2 ms, which
 takes a timer. A hierarchical charge reads the clock once for all levels, and
 hot counters sit on cache lines of their own, so `Rate`s and `Meter`s used by
 different cores do not slow each other down; this padding makes a `Rate`
-about 330 bytes and a `Meter` about 300. Wrapping a connection takes at most
+about 340 bytes and a `Meter` about 300. Wrapping a connection takes at most
 three allocations, about 200 bytes. Setting its deadlines allocates only for
 the first deadline and after one has expired, and a pending deadline does not
 keep a connection that was never closed from being garbage collected.
