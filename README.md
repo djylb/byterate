@@ -43,10 +43,11 @@ duplex := byterate.NewDuplexRateConn(c, byterate.NewRate(8<<20), byterate.NewRat
   without waiting.
 - `NewRate` returns a started `Rate`. The zero value is unlimited until
   `ResetLimit`, or `SetLimit` followed by `Start`.
-- `SetLimit` applies from the next charge: raising or removing a limit
-  forgives the debt accrued at the lower one, and lowering it keeps the debt.
-  It does not wake blocked callers; `ResetLimit` (`Stop`, `SetLimit`,
-  `Start`) does, and also restores the full burst and clears the meter.
+- `SetLimit` applies from the next charge and keeps debt as bytes: what is
+  owed at the old limit is repaid at the new one, also after a time without a
+  limit. It does not wake blocked callers, which keep their wait; `ResetLimit`
+  (`Stop`, `SetLimit`, `Start`) wakes them, drops the debt, restores the full
+  burst and clears the meter.
 - `Stop` disables limiting and wakes callers blocked in `Get`.
   `GetContext` also returns early when its context is done; the charge is
   kept, so refund bytes that were not transferred with `ReturnBucket`.

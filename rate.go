@@ -41,6 +41,7 @@ type Rate struct {
 	nowBps    atomic.Int64 // throughput of the last sampling window, bytes/s
 	lastBytes atomic.Int64 // bytes metered in the last sampling window
 	mu        sync.Mutex
+	debtRate  int64 // the limit tat's debt is reckoned at: the last one above 0
 	stopped   bool
 }
 
@@ -50,7 +51,7 @@ func NewRate(limitBps int64) *Rate {
 	if limitBps <= 0 {
 		limitBps = 0
 	}
-	r := &Rate{}
+	r := &Rate{debtRate: limitBps}
 	r.enabled.Store(true)
 	r.rate.Store(limitBps)
 	r.stop.Store(&stopSignal{ch: make(chan struct{})})
@@ -76,7 +77,7 @@ func (r *Rate) Clone() *Rate {
 	defer r.mu.Unlock()
 	stopped := r.stopped
 
-	cloned := &Rate{stopped: stopped}
+	cloned := &Rate{debtRate: r.debtRate, stopped: stopped}
 	cloned.rate.Store(r.rate.Load())
 	cloned.tat.Store(r.tat.Load())
 	cloned.enabled.Store(r.enabled.Load())
@@ -94,28 +95,58 @@ func (r *Rate) Clone() *Rate {
 }
 
 // SetLimit sets the limit in bytes per second; limitBps <= 0 means unlimited.
-// It applies from the next charge: raising or removing the limit forgives the
-// debt accrued at the lower one, and lowering it keeps the debt. Callers
-// blocked in Get are not woken; ResetLimit also wakes them, restores the full
-// burst and clears the meter.
+// It applies from the next charge, and debt is kept as bytes: what callers
+// owe at the old limit is repaid at the new one, also after a time without a
+// limit. Callers blocked in Get are not woken and keep their wait; ResetLimit
+// wakes them, drops the debt, restores the full burst and clears the meter.
 func (r *Rate) SetLimit(limitBps int64) {
 	if r == nil {
 		return
 	}
 	limitBps = max(limitBps, 0)
-	old := r.rate.Swap(limitBps)
-	if old <= 0 || (limitBps > 0 && limitBps <= old) {
-		return // lowered or unchanged: the debt stands
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	from := r.debtRate
+	if limitBps == 0 || from == 0 || limitBps == from {
+		// Nothing to convert: a Rate that never had a limit has no debt,
+		// and none is charged while unlimited, so the debt stays reckoned
+		// at the last limit until there is one again.
+		r.rate.Store(limitBps)
+		if limitBps > 0 {
+			r.debtRate = limitBps
+		}
+		return
 	}
-	// Debt is kept as time, so debt accrued at the lower limit would hold
-	// back the higher one, and a refund converted at the higher limit would
-	// not cancel the charge it refunds. Charges load tat before the limit,
-	// and this always changes tat, so one that saw the old limit fails its
-	// CAS and retries at the new one.
-	now := nowNs()
+	r.debtRate = limitBps
+	// Debt is kept as time, so it is converted to the new limit: debt at the
+	// old one would hold back a raised limit, or let a lowered one through
+	// early, and a refund converted at the new limit would not cancel the
+	// charge it refunds. Charges load tat before the limit and the
+	// conversion always changes tat, so a charge that read tat before it
+	// fails its CAS and retries. One that lands before it with the new
+	// limit has its cost converted too: raising shrinks the debt, so the
+	// limit is stored first and that charge is only undercharged; lowering
+	// grows it, so the limit is stored after.
+	if limitBps > from {
+		r.rate.Store(limitBps)
+		r.convertDebt(from, limitBps)
+	} else {
+		r.convertDebt(from, limitBps)
+		r.rate.Store(limitBps)
+	}
+}
+
+// convertDebt converts the debt in tat from time at limit from to time at
+// limit to, and always changes tat. r.mu must be held.
+func (r *Rate) convertDebt(from, to int64) {
 	for {
 		prev := r.tat.Load()
-		if r.tat.CompareAndSwap(prev, min(prev, now)-1) {
+		now := nowNs()
+		next := prev
+		if prev > now {
+			next = clampAdd(now, mulDiv(prev-now, from, to))
+		}
+		if r.tat.CompareAndSwap(prev, next-1) {
 			return
 		}
 	}

@@ -273,8 +273,8 @@ func TestZeroValueRateLimitsAfterStart(t *testing.T) {
 	}
 }
 
-// TestRateSetLimitDebt checks that lowering a limit keeps the debt, that
-// raising or removing one forgives it, and that ResetLimit clears it.
+// TestRateSetLimitDebt checks that debt is kept as bytes across limit
+// changes, also through a time without a limit, and that ResetLimit drops it.
 func TestRateSetLimitDebt(t *testing.T) {
 	inDebt := func() *Rate {
 		r := NewRate(1000)
@@ -282,27 +282,58 @@ func TestRateSetLimitDebt(t *testing.T) {
 		r.reserve(10000) // 10s of debt
 		return r
 	}
+	expectWait := func(r *Rate, lo, hi time.Duration) {
+		t.Helper()
+		if wait := time.Duration(r.reserve(1)); wait < lo || wait > hi {
+			t.Fatalf("reserve(1) wait=%s, want %s to %s", wait, lo, hi)
+		}
+	}
 
 	r := inDebt()
 	r.SetLimit(500)
-	if wait := r.reserve(1); wait < int64(9*time.Second) {
-		t.Fatalf("reserve(1) after lowering the limit wait=%s, want the debt kept", time.Duration(wait))
-	}
+	expectWait(r, 19*time.Second, 21*time.Second) // 10000 bytes at 500 B/s
 	r.SetLimit(1 << 30)
-	if wait := r.reserve(1); wait != 0 {
-		t.Fatalf("reserve(1) after raising the limit wait=%s, want the debt forgiven", time.Duration(wait))
-	}
+	expectWait(r, 0, time.Duration(coalesceWaitNs))
 
 	r = inDebt()
 	r.SetLimit(0)
-	r.SetLimit(1000)
-	if wait := r.reserve(1); wait > int64(time.Millisecond) {
-		t.Fatalf("reserve(1) after removing and restoring the limit wait=%s, want the debt forgiven", time.Duration(wait))
-	}
+	r.SetLimit(2000)
+	expectWait(r, 4*time.Second, 6*time.Second) // 10000 bytes at 2000 B/s
 
 	r = inDebt()
 	r.ResetLimit(1000)
 	expectFullBurst(t, r)
+}
+
+// TestRateRaisedLimitKeepsQueue raises the limit of a Rate with callers
+// queued: they keep their wait, so new charges must still wait behind their
+// bytes rather than go out alongside them.
+func TestRateRaisedLimitKeepsQueue(t *testing.T) {
+	r := NewRate(100_000)
+	r.reserve(200_000) // spend the burst
+	for range 100 {
+		r.reserve(10_000) // a 10s queue
+	}
+	r.SetLimit(101_000)
+	if wait := r.reserve(1); wait < int64(9800*time.Millisecond) {
+		t.Fatalf("reserve(1) after a 1%% raise wait=%s, want the queue's 9.9s", time.Duration(wait))
+	}
+}
+
+// TestRateRefundAfterLoweredLimit refunds one of several queued charges
+// after the limit was lowered: the refund must cancel that charge alone, not
+// the debt of the others.
+func TestRateRefundAfterLoweredLimit(t *testing.T) {
+	r := NewRate(1_000_000)
+	r.reserve(2_000_000) // spend the burst
+	for range 10 {
+		r.reserve(1_000_000) // 10s of queued writes
+	}
+	r.SetLimit(100_000)
+	r.ReturnBucket(1_000_000) // one write is canceled
+	if wait := r.reserve(1); wait < int64(85*time.Second) {
+		t.Fatalf("reserve(1) after the refund wait=%s, want the other writes' 90s", time.Duration(wait))
+	}
 }
 
 // TestRateRefundAfterRaisedLimit refunds a large blocked charge, such as a
@@ -319,11 +350,11 @@ func TestRateRefundAfterRaisedLimit(t *testing.T) {
 	}
 }
 
-// TestRateSetLimitRacesCharges raises a limit while other goroutines charge
-// at the old one: no charge may keep a debt computed at the old limit.
+// TestRateSetLimitRacesCharges changes a limit while other goroutines charge
+// at the old one: no charge may have its cost converted to the new limit
+// twice, or not at all.
 func TestRateSetLimitRacesCharges(t *testing.T) {
-	for range 100 {
-		r := NewRate(1)
+	charge := func(r *Rate, change func()) {
 		var stop atomic.Bool
 		var wg sync.WaitGroup
 		for range 4 {
@@ -334,13 +365,25 @@ func TestRateSetLimitRacesCharges(t *testing.T) {
 			})
 		}
 		time.Sleep(20 * time.Microsecond)
-		r.SetLimit(1 << 40)
+		change()
 		stop.Store(true)
 		wg.Wait()
+	}
+	for range 50 {
+		r := NewRate(1)
+		charge(r, func() { r.SetLimit(1 << 40) })
 		// Charges at 1 TiB/s add nanoseconds of debt; one 1 KiB charge at
-		// 1 B/s would add about 17 minutes.
+		// 1 B/s left unconverted would add about 17 minutes.
 		if wait := r.reserve(1); wait > int64(time.Second) {
 			t.Fatalf("reserve(1) after raising the limit under load wait=%s, want about 0", time.Duration(wait))
+		}
+
+		r = NewRate(1 << 40)
+		charge(r, func() { r.SetLimit(1 << 10) })
+		// Each charge after the change adds 1s of debt at 1 KiB/s; one
+		// converted from 1 TiB/s on top would add about 34,000 years.
+		if wait := r.reserve(1); wait > int64(100*365*24*time.Hour) {
+			t.Fatalf("reserve(1) after lowering the limit under load wait=%s, want the charges' own debt", time.Duration(wait))
 		}
 	}
 }

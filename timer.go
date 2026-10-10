@@ -80,11 +80,16 @@ func bytesPerSec(bytes, dtNs int64) int64 {
 	if bytes <= 0 || dtNs <= 0 {
 		return 0
 	}
-	hi, lo := bits.Mul64(uint64(bytes), uint64(time.Second))
-	if hi >= uint64(dtNs) { // quotient does not fit in 64 bits
+	return mulDiv(bytes, int64(time.Second), dtNs)
+}
+
+// mulDiv returns floor(a*b/c) for a, b >= 0 and c > 0, saturated to maxI64.
+func mulDiv(a, b, c int64) int64 {
+	hi, lo := bits.Mul64(uint64(a), uint64(b))
+	if hi >= uint64(c) { // quotient does not fit in 64 bits
 		return maxI64
 	}
-	q, _ := bits.Div64(hi, lo, uint64(dtNs))
+	q, _ := bits.Div64(hi, lo, uint64(c))
 	if q > uint64(maxI64) {
 		return maxI64
 	}
