@@ -50,8 +50,8 @@ func TestRateConnReadChargesActualBytes(t *testing.T) {
 	if string(buf[:n]) != "ok" {
 		t.Fatalf("Read() data = %q, want %q", string(buf[:n]), "ok")
 	}
-	if got := r.bytesAcc.Load(); got != 2 {
-		t.Fatalf("bytesAcc after Read() = %d, want 2", got)
+	if got := metered(r); got != 2 {
+		t.Fatalf("metered after Read() = %d, want 2", got)
 	}
 }
 
@@ -67,8 +67,8 @@ func TestRateConnWriteRefundsShortWrite(t *testing.T) {
 	if n != 2 {
 		t.Fatalf("Write() n = %d, want 2", n)
 	}
-	if got := r.bytesAcc.Load(); got != 2 {
-		t.Fatalf("bytesAcc after Write() = %d, want 2", got)
+	if got := metered(r); got != 2 {
+		t.Fatalf("metered after Write() = %d, want 2", got)
 	}
 }
 
@@ -137,8 +137,8 @@ func TestRateConnCloseWakesBlockedWrite(t *testing.T) {
 	if res.n != 0 || !errors.Is(res.err, net.ErrClosed) {
 		t.Fatalf("Write() = %d, %v; want 0, %v", res.n, res.err, net.ErrClosed)
 	}
-	if got := r.bytesAcc.Load(); got != 0 {
-		t.Fatalf("bytesAcc after canceled Write() = %d, want 0", got)
+	if got := metered(r); got != 0 {
+		t.Fatalf("metered after canceled Write() = %d, want 0", got)
 	}
 	// The unsent write was refunded, so other users of r get the full burst.
 	if wait := r.reserve(2048); wait != 0 {
@@ -157,8 +157,8 @@ func TestRateConnCloseWakesBlockedRead(t *testing.T) {
 		t.Fatalf("Read() = %d, %v; want %d, %v", res.n, res.err, 64<<10, net.ErrClosed)
 	}
 	// The bytes were received, so they stay charged.
-	if got := r.bytesAcc.Load(); got != 64<<10 {
-		t.Fatalf("bytesAcc after canceled Read() = %d, want %d", got, 64<<10)
+	if got := metered(r); got != 64<<10 {
+		t.Fatalf("metered after canceled Read() = %d, want %d", got, 64<<10)
 	}
 }
 
@@ -173,11 +173,11 @@ func TestRateConnCloseWakesHierarchicalWrite(t *testing.T) {
 	if res.n != 0 || !errors.Is(res.err, net.ErrClosed) {
 		t.Fatalf("Write() = %d, %v; want 0, %v", res.n, res.err, net.ErrClosed)
 	}
-	if got := first.bytesAcc.Load(); got != 0 {
-		t.Fatalf("first bytesAcc after canceled Write() = %d, want 0", got)
+	if got := metered(first); got != 0 {
+		t.Fatalf("first metered after canceled Write() = %d, want 0", got)
 	}
-	if got := second.bytesAcc.Load(); got != 0 {
-		t.Fatalf("second bytesAcc after canceled Write() = %d, want 0", got)
+	if got := metered(second); got != 0 {
+		t.Fatalf("second metered after canceled Write() = %d, want 0", got)
 	}
 }
 
@@ -223,8 +223,8 @@ func TestRateConnKeepsNetConnBehavior(t *testing.T) {
 	if _, err := io.ReadFull(server, buf); err != nil || string(buf) != "abc" {
 		t.Fatalf("server read = %q, %v", buf, err)
 	}
-	if got := r.bytesAcc.Load(); got != 3 {
-		t.Fatalf("bytesAcc = %d, want 3", got)
+	if got := metered(r); got != 3 {
+		t.Fatalf("metered = %d, want 3", got)
 	}
 	if err := conn.Close(); err != nil {
 		t.Fatalf("Close() error = %v", err)
@@ -313,10 +313,10 @@ func TestDuplexRateConnChargesEachDirection(t *testing.T) {
 	if _, err := conn.Write([]byte("hello")); err != nil {
 		t.Fatal(err)
 	}
-	if got, want := in.bytesAcc.Load(), int64(3); got != want {
+	if got, want := metered(in), int64(3); got != want {
 		t.Fatalf("read limiter charged %d, want %d", got, want)
 	}
-	if got, want := out.bytesAcc.Load(), int64(5); got != want {
+	if got, want := metered(out), int64(5); got != want {
 		t.Fatalf("write limiter charged %d, want %d", got, want)
 	}
 
@@ -328,7 +328,7 @@ func TestDuplexRateConnChargesEachDirection(t *testing.T) {
 	if _, err := conn.Write([]byte("hi")); err != nil {
 		t.Fatal(err)
 	}
-	if got, want := out.bytesAcc.Load(), int64(7); got != want {
+	if got, want := metered(out), int64(7); got != want {
 		t.Fatalf("write limiter charged %d in total, want %d", got, want)
 	}
 
@@ -370,11 +370,11 @@ func TestRateConnWriteDeadlineEndsLimiterWait(t *testing.T) {
 			conn := wrap(client, r)
 			defer func() { _ = conn.Close() }()
 
-			if err := conn.SetWriteDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
+			start := time.Now()
+			if err := conn.SetWriteDeadline(start.Add(100 * time.Millisecond)); err != nil {
 				t.Fatal(err)
 			}
 			done := make(chan ioResult, 1)
-			start := time.Now()
 			go func() {
 				n, err := conn.Write(make([]byte, 8<<10)) // waits 6s at 1 KiB/s
 				done <- ioResult{n, err}
@@ -384,7 +384,7 @@ func TestRateConnWriteDeadlineEndsLimiterWait(t *testing.T) {
 				if res.n != 0 || !isTimeout(res.err) {
 					t.Fatalf("Write() = %d, %v; want 0 and a timeout matching %v", res.n, res.err, os.ErrDeadlineExceeded)
 				}
-				if elapsed := time.Since(start); elapsed < 80*time.Millisecond {
+				if elapsed := time.Since(start); elapsed < 100*time.Millisecond {
 					t.Fatalf("Write() returned after %v, before its deadline", elapsed)
 				}
 			case <-time.After(time.Second):
@@ -439,8 +439,8 @@ func TestRateConnReadDeadlineEndsLimiterWait(t *testing.T) {
 		t.Fatal("SetReadDeadline(now) did not end a Read blocked in the limiter")
 	}
 	// The bytes were received, so they stay charged.
-	if got := r.bytesAcc.Load(); got != 8<<10 {
-		t.Fatalf("bytesAcc after timed-out Read() = %d, want %d", got, 8<<10)
+	if got := metered(r); got != 8<<10 {
+		t.Fatalf("metered after timed-out Read() = %d, want %d", got, 8<<10)
 	}
 
 	// Clearing the expired deadline lets later waits run to completion again.
@@ -466,7 +466,7 @@ func TestRateConnDeadlineAfterClose(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, d := range []*direction{&conn.(*rateNetConn).read, &conn.(*rateNetConn).write} {
-		if d.cancel.armed || d.cancel.timer.t.Stop() {
+		if d.cancel.timer.t.Stop() {
 			t.Fatal("Close() left a deadline timer running")
 		}
 	}
@@ -780,15 +780,15 @@ func TestRateConnDeadlineTimerReuse(t *testing.T) {
 			_ = conn.SetWriteDeadline(time.Now().Add(time.Millisecond))
 			_ = conn.SetWriteDeadline(time.Now().Add(time.Hour))
 		}
-		_ = conn.SetWriteDeadline(time.Now().Add(80 * time.Millisecond))
 		start := time.Now()
+		_ = conn.SetWriteDeadline(start.Add(80 * time.Millisecond))
 		res := write()
 		select {
 		case got := <-res:
 			if got.n != 0 || !isTimeout(got.err) {
 				t.Fatalf("round %d: Write() = %d, %v; want 0 and a timeout", i, got.n, got.err)
 			}
-			if elapsed := time.Since(start); elapsed < 60*time.Millisecond {
+			if elapsed := time.Since(start); elapsed < 80*time.Millisecond {
 				t.Fatalf("round %d: Write() timed out after %v, before its deadline", i, elapsed)
 			}
 		case <-time.After(time.Second):
@@ -835,3 +835,161 @@ func (*nopNetConn) Close() error                     { return nil }
 func (*nopNetConn) SetDeadline(time.Time) error      { return nil }
 func (*nopNetConn) SetReadDeadline(time.Time) error  { return nil }
 func (*nopNetConn) SetWriteDeadline(time.Time) error { return nil }
+
+// TestRateConnDeadlineMovedLater moves a pending deadline later: the wait
+// must outlast the first deadline and end at the second.
+func TestRateConnDeadlineMovedLater(t *testing.T) {
+	client, server := net.Pipe()
+	defer func() { _ = server.Close() }()
+	go drain(server)
+	r := NewRate(1024)
+	conn := NewRateConn(client, r)
+	defer func() { _ = conn.Close() }()
+
+	r.reserve(2048) // spend the burst, so that the Write waits about 1s
+	start := time.Now()
+	_ = conn.SetWriteDeadline(start.Add(20 * time.Millisecond))
+	_ = conn.SetWriteDeadline(start.Add(150 * time.Millisecond))
+	res := make(chan ioResult, 1)
+	go func() {
+		n, err := conn.Write(make([]byte, 1024))
+		res <- ioResult{n, err}
+	}()
+	select {
+	case got := <-res:
+		if got.n != 0 || !isTimeout(got.err) {
+			t.Fatalf("Write() = %d, %v; want 0 and a timeout", got.n, got.err)
+		}
+		if elapsed := time.Since(start); elapsed < 150*time.Millisecond {
+			t.Fatalf("Write() timed out after %v, at the deadline that was moved later", elapsed)
+		}
+	case <-time.After(time.Second):
+		r.Stop()
+		<-res
+		t.Fatal("Write() blocked in the limiter past its deadline")
+	}
+}
+
+// deadlineRejectingConn is a net.Conn without deadline support, as SSH
+// channels are.
+type deadlineRejectingConn struct{ nopNetConn }
+
+var errNoDeadline = errors.New("deadline not supported")
+
+func (*deadlineRejectingConn) SetDeadline(time.Time) error      { return errNoDeadline }
+func (*deadlineRejectingConn) SetReadDeadline(time.Time) error  { return errNoDeadline }
+func (*deadlineRejectingConn) SetWriteDeadline(time.Time) error { return errNoDeadline }
+
+// A deadline the wrapped connection rejects must not bound the waits in the
+// limiters either: I/O on it would otherwise time out only when throttled.
+func TestRateConnRejectedDeadline(t *testing.T) {
+	conn := NewRateConn(&deadlineRejectingConn{}, NewRate(1024))
+	past := time.Now().Add(-time.Second)
+	for name, set := range map[string]func(time.Time) error{
+		"SetDeadline":      conn.SetDeadline,
+		"SetReadDeadline":  conn.SetReadDeadline,
+		"SetWriteDeadline": conn.SetWriteDeadline,
+	} {
+		if err := set(past); !errors.Is(err, errNoDeadline) {
+			t.Fatalf("%s() error = %v, want %v", name, err, errNoDeadline)
+		}
+	}
+	rc := conn.(*rateNetConn)
+	for _, d := range []*direction{&rc.read, &rc.write} {
+		if d.cancel.current().ended() {
+			t.Fatal("a rejected deadline ended the waits in the limiter")
+		}
+	}
+}
+
+// TestRateConnDeadlineAfterPeerClose ends a Write blocked in the limiter
+// with a deadline in the past after the peer closed the pipe: the wrapped
+// connection rejects the deadline as closed, which must still end the wait.
+func TestRateConnDeadlineAfterPeerClose(t *testing.T) {
+	client, server := net.Pipe()
+	r := NewRate(1024)
+	conn := NewRateConn(client, r)
+	defer func() { _ = conn.Close() }()
+
+	r.reserve(2048) // spend the burst, so that the Write waits about 8s
+	res := make(chan ioResult, 1)
+	go func() {
+		n, err := conn.Write(make([]byte, 8<<10))
+		res <- ioResult{n, err}
+	}()
+	time.Sleep(20 * time.Millisecond)
+	_ = server.Close()
+	if err := conn.SetWriteDeadline(time.Now().Add(-time.Second)); !errors.Is(err, io.ErrClosedPipe) {
+		t.Fatalf("SetWriteDeadline() after the peer closed error = %v, want %v", err, io.ErrClosedPipe)
+	}
+	select {
+	case got := <-res:
+		if got.n != 0 || !isTimeout(got.err) {
+			t.Fatalf("Write() = %d, %v; want 0 and a timeout", got.n, got.err)
+		}
+	case <-time.After(time.Second):
+		r.Stop()
+		<-res
+		t.Fatal("a deadline in the past did not end the Write blocked in the limiter")
+	}
+}
+
+// TestRateConnWallClockDeadline sets a deadline without a monotonic reading,
+// as time.Unix returns: it must end the wait at that time all the same.
+func TestRateConnWallClockDeadline(t *testing.T) {
+	client, server := net.Pipe()
+	defer func() { _ = server.Close() }()
+	go drain(server)
+	r := NewRate(1024)
+	conn := NewRateConn(client, r)
+	defer func() { _ = conn.Close() }()
+
+	r.reserve(2048) // spend the burst, so that the Write waits about 1s
+	start := time.Now()
+	deadline := start.Add(100 * time.Millisecond).Round(0) // wall clock only
+	_ = conn.SetWriteDeadline(deadline)
+	rc := conn.(*rateNetConn)
+	rc.write.cancel.timer.mu.Lock()
+	at := rc.write.cancel.timer.at
+	rc.write.cancel.timer.mu.Unlock()
+	if at.Round(0) == at {
+		t.Fatal("the limiter keeps a wall-clock deadline without a monotonic reading")
+	}
+	n, err := conn.Write(make([]byte, 1024))
+	if n != 0 || !isTimeout(err) {
+		t.Fatalf("Write() = %d, %v; want 0 and a timeout", n, err)
+	}
+	if elapsed := time.Since(start); elapsed < 90*time.Millisecond || elapsed > 900*time.Millisecond {
+		t.Fatalf("Write() timed out after %v, want about 100ms", elapsed)
+	}
+}
+
+// TestRateConnDropsRefundFromBeforeReset wakes a Write blocked in the
+// limiter with ResetLimit, then fails it: its charge was cleared by the
+// reset, so its refund must not hold the cleared meter below 0.
+func TestRateConnDropsRefundFromBeforeReset(t *testing.T) {
+	r := NewRate(1024)
+	r.reserve(2048) // spend the burst, so that the Write waits about 4s
+	wantErr := errors.New("connection reset")
+	conn := NewRateReadWriteCloser(&scriptedConn{writeErr: wantErr}, r)
+	res := make(chan ioResult, 1)
+	go func() {
+		n, err := conn.Write(make([]byte, 4096))
+		res <- ioResult{n, err}
+	}()
+	time.Sleep(20 * time.Millisecond)
+	r.ResetLimit(1024)
+	select {
+	case got := <-res:
+		if got.n != 0 || !errors.Is(got.err, wantErr) {
+			t.Fatalf("Write() = %d, %v; want 0, %v", got.n, got.err, wantErr)
+		}
+	case <-time.After(time.Second):
+		r.Stop()
+		<-res
+		t.Fatal("ResetLimit did not wake the Write")
+	}
+	if got := metered(r); got != 0 {
+		t.Fatalf("metered after the failed Write = %d, want 0", got)
+	}
+}

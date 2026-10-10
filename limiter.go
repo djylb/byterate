@@ -110,7 +110,7 @@ func (l *HierarchicalLimiter) reserve(size int64) (int64, <-chan struct{}) {
 		stopCh := r.stopCh() // before reserving, as in Rate.Get
 		if wait := r.reserveAt(size, now); wait > maxWait {
 			maxWait = wait
-			maxStopCh = stopCh
+			maxStopCh = r.startedStopCh(stopCh)
 		}
 	}
 	charge(l.first)
@@ -134,6 +134,20 @@ func (l *HierarchicalLimiter) ReturnBucket(size int64) {
 	l.third.ReturnBucket(size)
 	for _, r := range l.extra {
 		r.ReturnBucket(size)
+	}
+}
+
+// returnSince refunds size bytes, charged when resetEpoch read epoch, to
+// every Rate not started since: see Rate.returnSince.
+func (l *HierarchicalLimiter) returnSince(size int64, epoch uint64) {
+	if l == nil || size <= 0 {
+		return
+	}
+	l.first.returnSince(size, epoch)
+	l.second.returnSince(size, epoch)
+	l.third.returnSince(size, epoch)
+	for _, r := range l.extra {
+		r.returnSince(size, epoch)
 	}
 }
 

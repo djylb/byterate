@@ -35,13 +35,19 @@ type Rate struct {
 	_ cacheLinePad
 	// Written by every charge, on a cache line of their own.
 	tat      atomic.Int64 // theoretical arrival time (ns since epoch), can be negative
-	bytesAcc atomic.Int64 // bytes charged in the current sampling window
+	bytesAcc atomic.Int64 // bytes charged in the current sampling window, net of refunds
 	_        cacheLinePad
 
-	nowBps  atomic.Int64 // throughput of the last sampling window, bytes/s
-	mu      sync.Mutex
-	stopped bool
+	nowBps     atomic.Int64  // throughput of the last sampling window, bytes/s
+	startEpoch atomic.Uint64 // resetEpoch of the last Start that cleared r
+	mu         sync.Mutex
+	debtRate   int64 // the limit tat's debt is reckoned at: the last one above 0
+	stopped    bool
 }
+
+// resetEpoch counts the Starts that cleared a Rate's debt and meter, so that
+// a refund can tell a charge made before them: see Rate.returnSince.
+var resetEpoch atomic.Uint64
 
 // NewRate returns a started Rate limited to limitBps bytes per second with a
 // full burst available. A limitBps <= 0 means unlimited.
@@ -49,7 +55,7 @@ func NewRate(limitBps int64) *Rate {
 	if limitBps <= 0 {
 		limitBps = 0
 	}
-	r := &Rate{}
+	r := &Rate{debtRate: limitBps}
 	r.enabled.Store(true)
 	r.rate.Store(limitBps)
 	r.stop.Store(&stopSignal{ch: make(chan struct{})})
@@ -68,17 +74,21 @@ func (r *Rate) Clone() *Rate {
 	if r == nil {
 		return nil
 	}
+	// Under r.mu, so that the started or stopped state is not torn by a
+	// concurrent Start or Stop: a clone with a closed stop channel that is
+	// enabled would charge without ever waiting.
 	r.mu.Lock()
+	defer r.mu.Unlock()
 	stopped := r.stopped
-	r.mu.Unlock()
 
-	cloned := &Rate{stopped: stopped}
+	cloned := &Rate{debtRate: r.debtRate, stopped: stopped}
 	cloned.rate.Store(r.rate.Load())
 	cloned.tat.Store(r.tat.Load())
 	cloned.enabled.Store(r.enabled.Load())
 	cloned.bytesAcc.Store(r.bytesAcc.Load())
 	cloned.lastSampleNs.Store(r.lastSampleNs.Load())
 	cloned.nowBps.Store(r.nowBps.Load())
+	cloned.startEpoch.Store(r.startEpoch.Load())
 
 	signal := &stopSignal{ch: make(chan struct{})}
 	if stopped {
@@ -89,17 +99,61 @@ func (r *Rate) Clone() *Rate {
 }
 
 // SetLimit sets the limit in bytes per second; limitBps <= 0 means unlimited.
-// It applies to later reservations only: debt accrued at the previous limit is
-// kept and callers blocked in Get are not woken, so a raised limit takes full
-// effect once that debt is repaid. Use ResetLimit to apply a limit at once.
+// It applies from the next charge, and debt is kept as bytes: what callers
+// owe at the old limit is repaid at the new one, also after a time without a
+// limit. Callers blocked in Get are not woken and keep their wait; ResetLimit
+// wakes them, drops the debt, restores the full burst and clears the meter.
 func (r *Rate) SetLimit(limitBps int64) {
 	if r == nil {
 		return
 	}
-	if limitBps <= 0 {
-		limitBps = 0
+	limitBps = max(limitBps, 0)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	from := r.debtRate
+	if limitBps == 0 || from == 0 || limitBps == from {
+		// Nothing to convert: a Rate that never had a limit has no debt,
+		// and none is charged while unlimited, so the debt stays reckoned
+		// at the last limit until there is one again.
+		r.rate.Store(limitBps)
+		if limitBps > 0 {
+			r.debtRate = limitBps
+		}
+		return
 	}
-	r.rate.Store(limitBps)
+	r.debtRate = limitBps
+	// Debt is kept as time, so it is converted to the new limit: debt at the
+	// old one would hold back a raised limit, or let a lowered one through
+	// early, and a refund converted at the new limit would not cancel the
+	// charge it refunds. Charges load tat before the limit and the
+	// conversion always changes tat, so a charge that read tat before it
+	// fails its CAS and retries. One that lands before it with the new
+	// limit has its cost converted too: raising shrinks the debt, so the
+	// limit is stored first and that charge is only undercharged; lowering
+	// grows it, so the limit is stored after.
+	if limitBps > from {
+		r.rate.Store(limitBps)
+		r.convertDebt(from, limitBps)
+	} else {
+		r.convertDebt(from, limitBps)
+		r.rate.Store(limitBps)
+	}
+}
+
+// convertDebt converts the debt in tat from time at limit from to time at
+// limit to, and always changes tat. r.mu must be held.
+func (r *Rate) convertDebt(from, to int64) {
+	for {
+		prev := r.tat.Load()
+		now := nowNs()
+		next := prev
+		if prev > now {
+			next = clampAdd(now, mulDiv(prev-now, from, to))
+		}
+		if r.tat.CompareAndSwap(prev, next-1) {
+			return
+		}
+	}
 }
 
 // ResetLimit is Stop, SetLimit and Start: it wakes blocked callers, clears the
@@ -125,8 +179,8 @@ func (r *Rate) Limit() int64 {
 // sampling window of at least one second, closing the current window if it is
 // due. It reports 0 while r is stopped.
 func (r *Rate) Now() int64 {
-	if r == nil {
-		return 0
+	if r == nil || !r.enabled.Load() {
+		return 0 // also when a charge that raced with Stop is still metered
 	}
 	r.updateRateWithNow(nowNs())
 	return r.nowBps.Load()
@@ -155,6 +209,7 @@ func (r *Rate) Start() {
 		r.bytesAcc.Store(0)
 		r.lastSampleNs.Store(now)
 		r.nowBps.Store(0)
+		r.startEpoch.Store(resetEpoch.Add(1))
 	}
 
 	r.enabled.Store(true)
@@ -184,7 +239,9 @@ func (r *Rate) Stop() {
 // unwritten part of a short write. A refund never raises the available burst
 // above two seconds' worth of bytes. The bytes also come off the meter: a
 // refund of bytes metered in an earlier sampling window is taken off the
-// following windows.
+// following windows. Bytes charged before the last Start, which cleared the
+// debt and the meter, are refunded all the same; the connection wrappers of
+// this package leave them out.
 func (r *Rate) ReturnBucket(size int64) {
 	if r == nil || size <= 0 || !r.enabled.Load() {
 		return
@@ -213,6 +270,17 @@ func (r *Rate) ReturnBucket(size int64) {
 	}
 }
 
+// returnSince is ReturnBucket for bytes charged when resetEpoch read epoch.
+// It drops them if r has been started since, as Start cleared the debt they
+// added and the meter that counted them: refunding them would credit the
+// new debt and hold the new meter down.
+func (r *Rate) returnSince(size int64, epoch uint64) {
+	if r == nil || epoch < r.startEpoch.Load() {
+		return
+	}
+	r.ReturnBucket(size)
+}
+
 // Get charges size bytes and blocks until the limit allows them. It returns
 // immediately if r is nil, stopped or unlimited; Stop and ResetLimit wake a
 // blocked Get early. Use GetContext to abandon a wait.
@@ -222,7 +290,7 @@ func (r *Rate) Get(size int64) {
 	if wait <= coalesceWaitNs {
 		return
 	}
-	sleepNs(wait, stopCh, nil)
+	sleepNs(wait, r.startedStopCh(stopCh), nil)
 }
 
 // GetContext is like Get but returns ctx.Err() if ctx is done before the wait
@@ -233,7 +301,7 @@ func (r *Rate) GetContext(ctx context.Context, size int64) error {
 	if wait <= coalesceWaitNs {
 		return nil
 	}
-	if !sleepNs(wait, stopCh, ctx.Done()) {
+	if !sleepNs(wait, r.startedStopCh(stopCh), ctx.Done()) {
 		return ctx.Err()
 	}
 	return nil
@@ -270,15 +338,21 @@ func (r *Rate) reserveAt(size, now int64) int64 {
 	r.bytesAcc.Add(size)
 	r.updateRateWithNow(now)
 
-	currentRate := r.rate.Load()
-	if currentRate <= 0 {
+	rate := r.rate.Load()
+	if rate <= 0 {
 		return 0
 	}
-
-	cost := bytesToNsCeil(size, currentRate)
+	cost := bytesToNsCeil(size, rate)
 	minTat := now - burstWindowNs
 	for {
 		prev := r.tat.Load()
+		// The limit again, after tat: see SetLimit.
+		if cur := r.rate.Load(); cur != rate {
+			if cur <= 0 {
+				return 0
+			}
+			rate, cost = cur, bytesToNsCeil(size, cur)
+		}
 		next := clampAdd(max(prev, minTat), cost)
 		if r.tat.CompareAndSwap(prev, next) {
 			wait := max(next-now, 0)
@@ -315,6 +389,16 @@ func (r *Rate) stopCh() <-chan struct{} {
 	return nil
 }
 
+// startedStopCh returns stopCh, loaded before a charge that must wait, or if
+// it is nil the current one: r had never been started then, so the charge
+// came after the first Start, which stores the channel before enabling r.
+func (r *Rate) startedStopCh(stopCh <-chan struct{}) <-chan struct{} {
+	if stopCh == nil {
+		return r.stopCh()
+	}
+	return stopCh
+}
+
 func (r *Rate) updateRateWithNow(now int64) {
 	last := r.lastSampleNs.Load()
 	if now-last < sampleIntervalNs {
@@ -328,6 +412,8 @@ func (r *Rate) updateRateWithNow(now int64) {
 	if bytes < 0 {
 		// Refunds of bytes metered in an earlier window, such as a canceled
 		// write, outweigh this window's charges: carry the rest forward.
+		// Charges and refunds share one counter, so a refund never lands
+		// in an earlier window than its charge.
 		r.bytesAcc.Add(bytes)
 		bytes = 0
 	}

@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -271,16 +273,122 @@ func TestZeroValueRateLimitsAfterStart(t *testing.T) {
 	}
 }
 
-func TestRateSetLimitKeepsDebtResetLimitClearsIt(t *testing.T) {
-	r := NewRate(1)
-	r.reserve(100)
-	r.SetLimit(1 << 30)
-	if wait := r.reserve(1); wait < int64(90*time.Second) {
-		t.Fatalf("reserve(1) after SetLimit wait=%s, want the old debt kept", time.Duration(wait))
+// metered returns the bytes r has metered in its current sampling window,
+// net of refunds.
+func metered(r *Rate) int64 { return r.bytesAcc.Load() }
+
+// TestRateSetLimitDebt checks that debt is kept as bytes across limit
+// changes, also through a time without a limit, and that ResetLimit drops it.
+func TestRateSetLimitDebt(t *testing.T) {
+	inDebt := func() *Rate {
+		r := NewRate(1000)
+		r.reserve(2000)  // spend the burst
+		r.reserve(10000) // 10s of debt
+		return r
 	}
-	r.ResetLimit(1 << 30)
-	if wait := r.reserve(1); wait != 0 {
-		t.Fatalf("reserve(1) after ResetLimit wait=%s, want 0", time.Duration(wait))
+	expectWait := func(r *Rate, lo, hi time.Duration) {
+		t.Helper()
+		if wait := time.Duration(r.reserve(1)); wait < lo || wait > hi {
+			t.Fatalf("reserve(1) wait=%s, want %s to %s", wait, lo, hi)
+		}
+	}
+
+	r := inDebt()
+	r.SetLimit(500)
+	expectWait(r, 19*time.Second, 21*time.Second) // 10000 bytes at 500 B/s
+	r.SetLimit(1 << 30)
+	expectWait(r, 0, time.Duration(coalesceWaitNs))
+
+	r = inDebt()
+	r.SetLimit(0)
+	r.SetLimit(2000)
+	expectWait(r, 4*time.Second, 6*time.Second) // 10000 bytes at 2000 B/s
+
+	r = inDebt()
+	r.ResetLimit(1000)
+	expectFullBurst(t, r)
+}
+
+// TestRateRaisedLimitKeepsQueue raises the limit of a Rate with callers
+// queued: they keep their wait, so new charges must still wait behind their
+// bytes rather than go out alongside them.
+func TestRateRaisedLimitKeepsQueue(t *testing.T) {
+	r := NewRate(100_000)
+	r.reserve(200_000) // spend the burst
+	for range 100 {
+		r.reserve(10_000) // a 10s queue
+	}
+	r.SetLimit(101_000)
+	if wait := r.reserve(1); wait < int64(9800*time.Millisecond) {
+		t.Fatalf("reserve(1) after a 1%% raise wait=%s, want the queue's 9.9s", time.Duration(wait))
+	}
+}
+
+// TestRateRefundAfterLoweredLimit refunds one of several queued charges
+// after the limit was lowered: the refund must cancel that charge alone, not
+// the debt of the others.
+func TestRateRefundAfterLoweredLimit(t *testing.T) {
+	r := NewRate(1_000_000)
+	r.reserve(2_000_000) // spend the burst
+	for range 10 {
+		r.reserve(1_000_000) // 10s of queued writes
+	}
+	r.SetLimit(100_000)
+	r.ReturnBucket(1_000_000) // one write is canceled
+	if wait := r.reserve(1); wait < int64(85*time.Second) {
+		t.Fatalf("reserve(1) after the refund wait=%s, want the other writes' 90s", time.Duration(wait))
+	}
+}
+
+// TestRateRefundAfterRaisedLimit refunds a large blocked charge, such as a
+// write that Close canceled, after its limit was raised: no debt for the
+// unsent bytes may remain to stall the Rate's other users.
+func TestRateRefundAfterRaisedLimit(t *testing.T) {
+	r := NewRate(1024)
+	r.reserve(2048)    // spend the burst
+	r.reserve(1 << 20) // a 1 MiB write waiting about 17 minutes
+	r.SetLimit(1 << 30)
+	r.ReturnBucket(1 << 20)
+	if wait := r.reserve(1); wait > int64(time.Millisecond) {
+		t.Fatalf("reserve(1) after the refund wait=%s, want about 0", time.Duration(wait))
+	}
+}
+
+// TestRateSetLimitRacesCharges changes a limit while other goroutines charge
+// at the old one: no charge may have its cost converted to the new limit
+// twice, or not at all.
+func TestRateSetLimitRacesCharges(t *testing.T) {
+	charge := func(r *Rate, change func()) {
+		var stop atomic.Bool
+		var wg sync.WaitGroup
+		for range 4 {
+			wg.Go(func() {
+				for !stop.Load() {
+					r.reserve(1 << 10)
+				}
+			})
+		}
+		time.Sleep(20 * time.Microsecond)
+		change()
+		stop.Store(true)
+		wg.Wait()
+	}
+	for range 50 {
+		r := NewRate(1)
+		charge(r, func() { r.SetLimit(1 << 40) })
+		// Charges at 1 TiB/s add nanoseconds of debt; one 1 KiB charge at
+		// 1 B/s left unconverted would add about 17 minutes.
+		if wait := r.reserve(1); wait > int64(time.Second) {
+			t.Fatalf("reserve(1) after raising the limit under load wait=%s, want about 0", time.Duration(wait))
+		}
+
+		r = NewRate(1 << 40)
+		charge(r, func() { r.SetLimit(1 << 10) })
+		// Each charge after the change adds 1s of debt at 1 KiB/s; one
+		// converted from 1 TiB/s on top would add about 34,000 years.
+		if wait := r.reserve(1); wait > int64(100*365*24*time.Hour) {
+			t.Fatalf("reserve(1) after lowering the limit under load wait=%s, want the charges' own debt", time.Duration(wait))
+		}
 	}
 }
 
@@ -331,8 +439,8 @@ func TestRateGetContextCancel(t *testing.T) {
 		r.Stop()
 		t.Fatal("GetContext() did not return promptly after cancel")
 	}
-	if got := r.bytesAcc.Load(); got != 64<<10 {
-		t.Fatalf("bytesAcc after canceled GetContext = %d, want charge kept", got)
+	if got := metered(r); got != 64<<10 {
+		t.Fatalf("metered after canceled GetContext = %d, want charge kept", got)
 	}
 
 	// No wait needed: a done context does not turn an allowed charge into an error.
@@ -386,5 +494,156 @@ func TestRateMeterCarriesRefunds(t *testing.T) {
 	}
 	if got := roll(); got != 0 {
 		t.Fatalf("idle window = %d B/s, want 0", got)
+	}
+}
+
+// TestRateCloneDuringStartStop clones a Rate that is being stopped and
+// started: every clone must be either stopped or able to wait.
+func TestRateCloneDuringStartStop(t *testing.T) {
+	r := NewRate(1000)
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			r.Stop()
+			r.Start()
+		}
+	}()
+	defer func() { close(stop); <-done }()
+	for range 100000 {
+		c := r.Clone()
+		if c.enabled.Load() && isClosed(c.stopCh()) {
+			t.Fatal("Clone() is enabled with a closed stop channel, so it would never wait")
+		}
+	}
+}
+
+// TestRateNowWhileStopped checks that a charge that raced with Stop is not
+// reported as throughput while the Rate is stopped.
+func TestRateNowWhileStopped(t *testing.T) {
+	r := NewRate(0)
+	r.Stop()
+	r.bytesAcc.Add(1000) // a charge that passed the enabled check before Stop
+	r.lastSampleNs.Store(nowNs() - int64(time.Second))
+	if got := r.Now(); got != 0 {
+		t.Fatalf("Now() of a stopped Rate = %d, want 0", got)
+	}
+}
+
+// meterWindows sets r up so that only the returned roll closes a sampling
+// window, a second long, and returns its throughput.
+func meterWindows(r *Rate) (roll func() int64) {
+	last := nowNs() + int64(time.Hour)
+	r.lastSampleNs.Store(last)
+	return func() int64 {
+		last += sampleIntervalNs
+		r.updateRateWithNow(last)
+		return r.nowBps.Load()
+	}
+}
+
+// TestRateRefundSinceDropsChargesBeforeReset refunds, after ResetLimit, a
+// charge made before it, as a write that ResetLimit woke and that then
+// failed does: the cleared meter must not go below 0, and the refund must
+// not credit the debt charged since.
+func TestRateRefundSinceDropsChargesBeforeReset(t *testing.T) {
+	r := NewRate(1000)
+	epoch := resetEpoch.Load()
+	r.reserve(1 << 20)
+	r.ResetLimit(1000)
+	r.reserve(2000)  // spend the new burst
+	r.reserve(10000) // 10s of debt since the reset
+	r.returnSince(1<<20, epoch)
+	if got := metered(r); got != 12000 {
+		t.Fatalf("metered after the stale refund = %d, want 12000", got)
+	}
+	if wait := r.reserve(1); wait < int64(9*time.Second) {
+		t.Fatalf("reserve(1) after the stale refund wait=%s, want the 10s of debt kept", time.Duration(wait))
+	}
+
+	// A refund of a charge made since the last Start is applied.
+	epoch = resetEpoch.Load()
+	r.reserve(1000)
+	r.returnSince(1000, epoch)
+	if got := metered(r); got != 12001 {
+		t.Fatalf("metered after a current refund = %d, want 12001", got)
+	}
+}
+
+// TestRateMeterCarriesRefundAcrossIdleWindows refunds a write that waited
+// through idle windows closed by Now before Close canceled it: the refund
+// must still come off the following windows.
+func TestRateMeterCarriesRefundAcrossIdleWindows(t *testing.T) {
+	r := NewRate(0)
+	roll := meterWindows(r)
+	r.reserve(64 << 10)
+	roll()
+	roll() // idle
+	roll() // idle
+	r.ReturnBucket(64 << 10)
+	r.reserve(10 << 10)
+	if got := roll(); got != 0 {
+		t.Fatalf("window with the refund = %d B/s, want 0", got)
+	}
+	r.reserve(100 << 10)
+	if got, want := roll(), int64((10+100-64)<<10); got != want {
+		t.Fatalf("next window = %d B/s, want %d after the rest of the refund", got, want)
+	}
+}
+
+// TestRateMeterChargeRefundRace charges and refunds the same bytes while
+// windows close: as the pairs net to 0, so must the windows together with
+// the refunds still carried, however a charge and its refund fall around a
+// window's end.
+func TestRateMeterChargeRefundRace(t *testing.T) {
+	r := NewRate(0)
+	roll := meterWindows(r)
+	var stop atomic.Bool
+	var wg sync.WaitGroup
+	for range 4 {
+		wg.Go(func() {
+			for !stop.Load() {
+				r.reserve(1000)
+				r.ReturnBucket(1000)
+			}
+		})
+	}
+	var reported int64
+	for range 10000 {
+		reported += roll()
+	}
+	stop.Store(true)
+	wg.Wait()
+	reported += roll()
+	if carried := -metered(r); reported != carried {
+		t.Fatalf("windows reported %d bytes of charges that were all refunded, with %d bytes of refunds carried", reported, carried)
+	}
+}
+
+// TestRateMeterCarriesRefundPastNettedWindow cancels a write charged in a
+// window that another refund netted to 0: its refund must still come off
+// the next windows.
+func TestRateMeterCarriesRefundPastNettedWindow(t *testing.T) {
+	r := NewRate(0)
+	roll := meterWindows(r)
+	r.reserve(100_000) // write B
+	roll()
+	r.reserve(100_000)      // write A
+	r.ReturnBucket(100_000) // B is canceled
+	roll()
+	r.reserve(50_000)
+	r.ReturnBucket(100_000) // A is canceled
+	if got := roll(); got != 0 {
+		t.Fatalf("window with A's refund = %d B/s, want 0", got)
+	}
+	r.reserve(50_000)
+	if got := roll(); got != 0 {
+		t.Fatalf("next window = %d B/s, want 0 with the rest of A's refund", got)
 	}
 }

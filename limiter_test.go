@@ -88,11 +88,11 @@ func TestHierarchicalLimiterRefundsAllChildrenOnShortWrite(t *testing.T) {
 	if n != 2 {
 		t.Fatalf("Write() n = %d, want 2", n)
 	}
-	if got := first.bytesAcc.Load(); got != 2 {
-		t.Fatalf("first bytesAcc after Write() = %d, want 2", got)
+	if got := metered(first); got != 2 {
+		t.Fatalf("first metered after Write() = %d, want 2", got)
 	}
-	if got := second.bytesAcc.Load(); got != 2 {
-		t.Fatalf("second bytesAcc after Write() = %d, want 2", got)
+	if got := metered(second); got != 2 {
+		t.Fatalf("second metered after Write() = %d, want 2", got)
 	}
 }
 
@@ -272,8 +272,27 @@ func TestHierarchicalLimiterChargesRepeatedRateOnce(t *testing.T) {
 		t.Fatalf("reserve(2000) within the burst wait=%s, want 0", time.Duration(wait))
 	}
 	for _, rate := range []*Rate{r, other} {
-		if got := rate.bytesAcc.Load(); got != 2000 {
-			t.Fatalf("bytesAcc = %d, want 2000 charged once", got)
+		if got := metered(rate); got != 2000 {
+			t.Fatalf("metered = %d, want 2000 charged once", got)
 		}
+	}
+}
+
+// TestHierarchicalLimiterRefundSkipsRestartedLevels refunds a charge to a
+// limiter one of whose levels was stopped at the charge and started before
+// the refund: that level was not charged, so it must not be refunded.
+func TestHierarchicalLimiterRefundSkipsRestartedLevels(t *testing.T) {
+	conn, user := NewRate(1000), NewRate(1000)
+	l := NewHierarchicalLimiter2(conn, user).(*HierarchicalLimiter)
+	user.Stop()
+	epoch := resetEpoch.Load()
+	l.reserve(500)
+	user.Start()
+	l.returnSince(500, epoch)
+	if got := metered(conn); got != 0 {
+		t.Fatalf("metered of the charged level after the refund = %d, want 0", got)
+	}
+	if got := metered(user); got != 0 {
+		t.Fatalf("metered of the restarted level after the refund = %d, want 0", got)
 	}
 }

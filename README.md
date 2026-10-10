@@ -43,9 +43,11 @@ duplex := byterate.NewDuplexRateConn(c, byterate.NewRate(8<<20), byterate.NewRat
   without waiting.
 - `NewRate` returns a started `Rate`. The zero value is unlimited until
   `ResetLimit`, or `SetLimit` followed by `Start`.
-- `SetLimit` keeps debt accrued at the previous limit and does not wake
-  blocked callers. `ResetLimit` (`Stop`, `SetLimit`, `Start`) applies the new
-  limit at once.
+- `SetLimit` applies from the next charge and keeps debt as bytes: what is
+  owed at the old limit is repaid at the new one, also after a time without a
+  limit. It does not wake blocked callers, which keep their wait; `ResetLimit`
+  (`Stop`, `SetLimit`, `Start`) wakes them, drops the debt, restores the full
+  burst and clears the meter.
 - `Stop` disables limiting and wakes callers blocked in `Get`.
   `GetContext` also returns early when its context is done; the charge is
   kept, so refund bytes that were not transferred with `ReturnBucket`.
@@ -74,22 +76,33 @@ duplex := byterate.NewDuplexRateConn(c, byterate.NewRate(8<<20), byterate.NewRat
   passes refunds its charge and returns 0 and `os.ErrDeadlineExceeded`, a
   timeout `net.Error`. A `Read` has already received its bytes, so it keeps
   the charge and returns them with `os.ErrDeadlineExceeded`. Moving a deadline
-  later does not end a wait.
+  later does not end a wait. A deadline the wrapped connection rejects, as
+  one without deadline support does, does not bound the limiter either,
+  unless the connection is closed.
 - `Rate.Now` and `Meter.Snapshot` report bytes per second over the last
   sampling window of at least one second, so they lag by up to about two
   seconds. Refunds come off the throughput: one for bytes metered in an
   earlier window, such as a write canceled by `Close`, is taken off the next
-  windows. `NewRateConn` charges both directions of a connection to one
+  windows. The connection wrappers drop the refund of a charge made before
+  its `Rate` was last started, as `Start` cleared that charge from the debt
+  and the meter. `NewRateConn` charges both directions of a connection to one
   limiter; `NewDuplexRateConn` and `NewDuplexRateReadWriteCloser` take one per
   direction, so uploads and downloads are limited and metered apart.
 
 ## Concurrency
 
-`Get`, `ReturnBucket`, `Now` and `Meter.Add` are lock-free and
-allocation-free. A hierarchical charge reads the clock once for all levels,
-and hot counters sit on cache lines of their own, so `Rate`s and `Meter`s used
-by different cores do not slow each other down; this padding makes a `Rate`
-about 330 bytes and a `Meter` about 300. Wrapping a connection takes at most
+`Get`, `ReturnBucket`, `Now` and `Meter.Add` are lock-free, and they
+allocate nothing unless a `Get` or `GetContext` waits longer than 2 ms, which
+takes a timer. A hierarchical charge reads the clock once for all levels, and
+hot counters sit on cache lines of their own, so `Rate`s and `Meter`s used by
+different cores do not slow each other down; this padding makes a `Rate`
+about 340 bytes and a `Meter` about 300. Wrapping a connection takes at most
 three allocations, about 200 bytes. Setting its deadlines allocates only for
-the first deadline and after one has expired, and a pending deadline does not
-keep a connection that was never closed from being garbage collected.
+the first deadline and after one has expired, and moving a deadline later, as
+servers do before every read, leaves the runtime timer alone. A pending
+deadline does not keep a connection that was never closed from being garbage
+collected.
+
+Tests can use `testing/synctest`: inside a bubble, a `Rate` or `Meter` runs on
+the bubble's clock. Create it inside the bubble that uses it, since its
+timestamps do not carry over between a bubble and the outside.

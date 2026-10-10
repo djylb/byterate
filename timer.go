@@ -2,7 +2,6 @@ package byterate
 
 import (
 	"math/bits"
-	"sync"
 	"time"
 )
 
@@ -31,41 +30,6 @@ func nowNs() int64 {
 // the 128-byte lines of Apple silicon and the adjacent-line prefetch of x86.
 type cacheLinePad [128]byte
 
-var timerPool = sync.Pool{
-	New: func() any {
-		t := time.NewTimer(0)
-		if !t.Stop() {
-			select {
-			case <-t.C:
-			default:
-			}
-		}
-		return t
-	},
-}
-
-func getTimer(d time.Duration) *time.Timer {
-	t := timerPool.Get().(*time.Timer)
-	if !t.Stop() {
-		select {
-		case <-t.C:
-		default:
-		}
-	}
-	t.Reset(d)
-	return t
-}
-
-func putTimer(t *time.Timer) {
-	if !t.Stop() {
-		select {
-		case <-t.C:
-		default:
-		}
-	}
-	timerPool.Put(t)
-}
-
 // sleepNs waits waitNs, returning early when stopCh or done is closed.
 // It reports false only when done was closed before the wait elapsed.
 func sleepNs(waitNs int64, stopCh, done <-chan struct{}) bool {
@@ -77,8 +41,11 @@ func sleepNs(waitNs int64, stopCh, done <-chan struct{}) bool {
 		return true
 	}
 
-	t := getTimer(time.Duration(waitNs))
-	defer putTimer(t)
+	// A fresh timer rather than a pooled one: a timer belongs to the
+	// testing/synctest bubble that made it, and fails fatally when used from
+	// another or from outside one.
+	t := time.NewTimer(time.Duration(waitNs))
+	defer t.Stop()
 	select {
 	case <-t.C:
 		return true
@@ -113,11 +80,16 @@ func bytesPerSec(bytes, dtNs int64) int64 {
 	if bytes <= 0 || dtNs <= 0 {
 		return 0
 	}
-	hi, lo := bits.Mul64(uint64(bytes), uint64(time.Second))
-	if hi >= uint64(dtNs) { // quotient does not fit in 64 bits
+	return mulDiv(bytes, int64(time.Second), dtNs)
+}
+
+// mulDiv returns floor(a*b/c) for a, b >= 0 and c > 0, saturated to maxI64.
+func mulDiv(a, b, c int64) int64 {
+	hi, lo := bits.Mul64(uint64(a), uint64(b))
+	if hi >= uint64(c) { // quotient does not fit in 64 bits
 		return maxI64
 	}
-	q, _ := bits.Div64(hi, lo, uint64(dtNs))
+	q, _ := bits.Div64(hi, lo, uint64(c))
 	if q > uint64(maxI64) {
 		return maxI64
 	}
