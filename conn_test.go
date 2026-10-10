@@ -963,3 +963,33 @@ func TestRateConnWallClockDeadline(t *testing.T) {
 		t.Fatalf("Write() timed out after %v, want about 100ms", elapsed)
 	}
 }
+
+// TestRateConnDropsRefundFromBeforeReset wakes a Write blocked in the
+// limiter with ResetLimit, then fails it: its charge was cleared by the
+// reset, so its refund must not hold the cleared meter below 0.
+func TestRateConnDropsRefundFromBeforeReset(t *testing.T) {
+	r := NewRate(1024)
+	r.reserve(2048) // spend the burst, so that the Write waits about 4s
+	wantErr := errors.New("connection reset")
+	conn := NewRateReadWriteCloser(&scriptedConn{writeErr: wantErr}, r)
+	res := make(chan ioResult, 1)
+	go func() {
+		n, err := conn.Write(make([]byte, 4096))
+		res <- ioResult{n, err}
+	}()
+	time.Sleep(20 * time.Millisecond)
+	r.ResetLimit(1024)
+	select {
+	case got := <-res:
+		if got.n != 0 || !errors.Is(got.err, wantErr) {
+			t.Fatalf("Write() = %d, %v; want 0, %v", got.n, got.err, wantErr)
+		}
+	case <-time.After(time.Second):
+		r.Stop()
+		<-res
+		t.Fatal("ResetLimit did not wake the Write")
+	}
+	if got := metered(r); got != 0 {
+		t.Fatalf("metered after the failed Write = %d, want 0", got)
+	}
+}

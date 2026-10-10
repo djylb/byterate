@@ -145,17 +145,30 @@ func (s *rateConn) Write(b []byte) (n int, err error) {
 		return 0, ErrNilConn
 	}
 	limited := len(b) > 0 && s.write.rate != nil
+	var epoch uint64
 	if limited {
+		epoch = resetEpoch.Load() // before the charge: see Rate.returnSince
 		if err = s.wait(&s.write, int64(len(b))); err != nil {
-			s.write.rate.ReturnBucket(int64(len(b)))
+			s.write.refund(int64(len(b)), epoch)
 			return 0, err
 		}
 	}
 	n, err = s.conn.Write(b)
 	if limited && n < len(b) {
-		s.write.rate.ReturnBucket(int64(len(b) - n))
+		s.write.refund(int64(len(b)-n), epoch)
 	}
 	return
+}
+
+// refund returns size bytes, charged when resetEpoch read epoch, to d's
+// limiter. *Rate and *HierarchicalLimiter drop the bytes for each Rate that
+// was started since.
+func (d *direction) refund(size int64, epoch uint64) {
+	if r, ok := d.rate.(interface{ returnSince(int64, uint64) }); ok {
+		r.returnSince(size, epoch)
+		return
+	}
+	d.rate.ReturnBucket(size)
 }
 
 // CloseRead shuts down the reading side of the wrapped connection, as

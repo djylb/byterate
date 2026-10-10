@@ -275,7 +275,7 @@ func TestZeroValueRateLimitsAfterStart(t *testing.T) {
 
 // metered returns the bytes r has metered in its current sampling window,
 // net of refunds.
-func metered(r *Rate) int64 { return r.bytesAcc.Load() - r.refundAcc.Load() }
+func metered(r *Rate) int64 { return r.bytesAcc.Load() }
 
 // TestRateSetLimitDebt checks that debt is kept as bytes across limit
 // changes, also through a time without a limit, and that ResetLimit drops it.
@@ -536,43 +536,102 @@ func TestRateNowWhileStopped(t *testing.T) {
 	}
 }
 
-// TestRateMeterDropsRefundsFromBeforeReset refunds, after ResetLimit, a
-// charge made before it: the cleared meter must report new traffic again
-// within a window rather than stay at 0 until it outweighs the refund.
-func TestRateMeterDropsRefundsFromBeforeReset(t *testing.T) {
-	r := NewRate(0)
-	r.reserve(1 << 20)
-	r.ResetLimit(0)
-	r.ReturnBucket(1 << 20) // the write was not sent after all
-
+// meterWindows sets r up so that only the returned roll closes a sampling
+// window, a second long, and returns its throughput.
+func meterWindows(r *Rate) (roll func() int64) {
 	last := nowNs() + int64(time.Hour)
-	r.lastSampleNs.Store(last) // only roll closes a window
-	roll := func() int64 {
+	r.lastSampleNs.Store(last)
+	return func() int64 {
 		last += sampleIntervalNs
 		r.updateRateWithNow(last)
 		return r.nowBps.Load()
-	}
-	r.reserve(100 << 10)
-	roll() // absorbs the refund
-	r.reserve(100 << 10)
-	if got := roll(); got != 100<<10 {
-		t.Fatalf("second window after the reset = %d B/s, want %d", got, 100<<10)
 	}
 }
 
-// TestRateMeterCarryBoundByCharges cancels a write charged in a window whose
-// own refunds netted it to 0: its refund must still come off the next
-// windows, as far as that window charged.
-func TestRateMeterCarryBoundByCharges(t *testing.T) {
-	r := NewRate(0)
-	last := nowNs() + int64(time.Hour)
-	r.lastSampleNs.Store(last) // only roll closes a window
-	roll := func() int64 {
-		last += sampleIntervalNs
-		r.updateRateWithNow(last)
-		return r.nowBps.Load()
+// TestRateRefundSinceDropsChargesBeforeReset refunds, after ResetLimit, a
+// charge made before it, as a write that ResetLimit woke and that then
+// failed does: the cleared meter must not go below 0, and the refund must
+// not credit the debt charged since.
+func TestRateRefundSinceDropsChargesBeforeReset(t *testing.T) {
+	r := NewRate(1000)
+	epoch := resetEpoch.Load()
+	r.reserve(1 << 20)
+	r.ResetLimit(1000)
+	r.reserve(2000)  // spend the new burst
+	r.reserve(10000) // 10s of debt since the reset
+	r.returnSince(1<<20, epoch)
+	if got := metered(r); got != 12000 {
+		t.Fatalf("metered after the stale refund = %d, want 12000", got)
+	}
+	if wait := r.reserve(1); wait < int64(9*time.Second) {
+		t.Fatalf("reserve(1) after the stale refund wait=%s, want the 10s of debt kept", time.Duration(wait))
 	}
 
+	// A refund of a charge made since the last Start is applied.
+	epoch = resetEpoch.Load()
+	r.reserve(1000)
+	r.returnSince(1000, epoch)
+	if got := metered(r); got != 12001 {
+		t.Fatalf("metered after a current refund = %d, want 12001", got)
+	}
+}
+
+// TestRateMeterCarriesRefundAcrossIdleWindows refunds a write that waited
+// through idle windows closed by Now before Close canceled it: the refund
+// must still come off the following windows.
+func TestRateMeterCarriesRefundAcrossIdleWindows(t *testing.T) {
+	r := NewRate(0)
+	roll := meterWindows(r)
+	r.reserve(64 << 10)
+	roll()
+	roll() // idle
+	roll() // idle
+	r.ReturnBucket(64 << 10)
+	r.reserve(10 << 10)
+	if got := roll(); got != 0 {
+		t.Fatalf("window with the refund = %d B/s, want 0", got)
+	}
+	r.reserve(100 << 10)
+	if got, want := roll(), int64((10+100-64)<<10); got != want {
+		t.Fatalf("next window = %d B/s, want %d after the rest of the refund", got, want)
+	}
+}
+
+// TestRateMeterChargeRefundRace charges and refunds the same bytes while
+// windows close: as the pairs net to 0, so must the windows together with
+// the refunds still carried, however a charge and its refund fall around a
+// window's end.
+func TestRateMeterChargeRefundRace(t *testing.T) {
+	r := NewRate(0)
+	roll := meterWindows(r)
+	var stop atomic.Bool
+	var wg sync.WaitGroup
+	for range 4 {
+		wg.Go(func() {
+			for !stop.Load() {
+				r.reserve(1000)
+				r.ReturnBucket(1000)
+			}
+		})
+	}
+	var reported int64
+	for range 10000 {
+		reported += roll()
+	}
+	stop.Store(true)
+	wg.Wait()
+	reported += roll()
+	if carried := -metered(r); reported != carried {
+		t.Fatalf("windows reported %d bytes of charges that were all refunded, with %d bytes of refunds carried", reported, carried)
+	}
+}
+
+// TestRateMeterCarriesRefundPastNettedWindow cancels a write charged in a
+// window that another refund netted to 0: its refund must still come off
+// the next windows.
+func TestRateMeterCarriesRefundPastNettedWindow(t *testing.T) {
+	r := NewRate(0)
+	roll := meterWindows(r)
 	r.reserve(100_000) // write B
 	roll()
 	r.reserve(100_000)      // write A

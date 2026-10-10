@@ -137,6 +137,20 @@ func (l *HierarchicalLimiter) ReturnBucket(size int64) {
 	}
 }
 
+// returnSince refunds size bytes, charged when resetEpoch read epoch, to
+// every Rate not started since: see Rate.returnSince.
+func (l *HierarchicalLimiter) returnSince(size int64, epoch uint64) {
+	if l == nil || size <= 0 {
+		return
+	}
+	l.first.returnSince(size, epoch)
+	l.second.returnSince(size, epoch)
+	l.third.returnSince(size, epoch)
+	for _, r := range l.extra {
+		r.returnSince(size, epoch)
+	}
+}
+
 type hierarchicalLimiterBuilder struct {
 	first  *Rate
 	second *Rate

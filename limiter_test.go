@@ -277,3 +277,22 @@ func TestHierarchicalLimiterChargesRepeatedRateOnce(t *testing.T) {
 		}
 	}
 }
+
+// TestHierarchicalLimiterRefundSkipsRestartedLevels refunds a charge to a
+// limiter one of whose levels was stopped at the charge and started before
+// the refund: that level was not charged, so it must not be refunded.
+func TestHierarchicalLimiterRefundSkipsRestartedLevels(t *testing.T) {
+	conn, user := NewRate(1000), NewRate(1000)
+	l := NewHierarchicalLimiter2(conn, user).(*HierarchicalLimiter)
+	user.Stop()
+	epoch := resetEpoch.Load()
+	l.reserve(500)
+	user.Start()
+	l.returnSince(500, epoch)
+	if got := metered(conn); got != 0 {
+		t.Fatalf("metered of the charged level after the refund = %d, want 0", got)
+	}
+	if got := metered(user); got != 0 {
+		t.Fatalf("metered of the restarted level after the refund = %d, want 0", got)
+	}
+}
