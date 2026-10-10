@@ -76,8 +76,9 @@ duplex := byterate.NewDuplexRateConn(c, byterate.NewRate(8<<20), byterate.NewRat
   passes refunds its charge and returns 0 and `os.ErrDeadlineExceeded`, a
   timeout `net.Error`. A `Read` has already received its bytes, so it keeps
   the charge and returns them with `os.ErrDeadlineExceeded`. Moving a deadline
-  later does not end a wait, and a deadline the wrapped connection rejects
-  does not bound the limiter either.
+  later does not end a wait. A deadline the wrapped connection rejects, as
+  one without deadline support does, does not bound the limiter either,
+  unless the connection is closed.
 - `Rate.Now` and `Meter.Snapshot` report bytes per second over the last
   sampling window of at least one second, so they lag by up to about two
   seconds. Refunds come off the throughput: one for bytes metered in the

@@ -901,3 +901,65 @@ func TestRateConnRejectedDeadline(t *testing.T) {
 		}
 	}
 }
+
+// TestRateConnDeadlineAfterPeerClose ends a Write blocked in the limiter
+// with a deadline in the past after the peer closed the pipe: the wrapped
+// connection rejects the deadline as closed, which must still end the wait.
+func TestRateConnDeadlineAfterPeerClose(t *testing.T) {
+	client, server := net.Pipe()
+	r := NewRate(1024)
+	conn := NewRateConn(client, r)
+	defer func() { _ = conn.Close() }()
+
+	r.reserve(2048) // spend the burst, so that the Write waits about 8s
+	res := make(chan ioResult, 1)
+	go func() {
+		n, err := conn.Write(make([]byte, 8<<10))
+		res <- ioResult{n, err}
+	}()
+	time.Sleep(20 * time.Millisecond)
+	_ = server.Close()
+	if err := conn.SetWriteDeadline(time.Now().Add(-time.Second)); !errors.Is(err, io.ErrClosedPipe) {
+		t.Fatalf("SetWriteDeadline() after the peer closed error = %v, want %v", err, io.ErrClosedPipe)
+	}
+	select {
+	case got := <-res:
+		if got.n != 0 || !isTimeout(got.err) {
+			t.Fatalf("Write() = %d, %v; want 0 and a timeout", got.n, got.err)
+		}
+	case <-time.After(time.Second):
+		r.Stop()
+		<-res
+		t.Fatal("a deadline in the past did not end the Write blocked in the limiter")
+	}
+}
+
+// TestRateConnWallClockDeadline sets a deadline without a monotonic reading,
+// as time.Unix returns: it must end the wait at that time all the same.
+func TestRateConnWallClockDeadline(t *testing.T) {
+	client, server := net.Pipe()
+	defer func() { _ = server.Close() }()
+	go drain(server)
+	r := NewRate(1024)
+	conn := NewRateConn(client, r)
+	defer func() { _ = conn.Close() }()
+
+	r.reserve(2048) // spend the burst, so that the Write waits about 1s
+	start := time.Now()
+	deadline := start.Add(100 * time.Millisecond).Round(0) // wall clock only
+	_ = conn.SetWriteDeadline(deadline)
+	rc := conn.(*rateNetConn)
+	rc.write.cancel.timer.mu.Lock()
+	at := rc.write.cancel.timer.at
+	rc.write.cancel.timer.mu.Unlock()
+	if at.Round(0) == at {
+		t.Fatal("the limiter keeps a wall-clock deadline without a monotonic reading")
+	}
+	n, err := conn.Write(make([]byte, 1024))
+	if n != 0 || !isTimeout(err) {
+		t.Fatalf("Write() = %d, %v; want 0 and a timeout", n, err)
+	}
+	if elapsed := time.Since(start); elapsed < 90*time.Millisecond || elapsed > 900*time.Millisecond {
+		t.Fatalf("Write() timed out after %v, want about 100ms", elapsed)
+	}
+}

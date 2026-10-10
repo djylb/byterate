@@ -375,10 +375,15 @@ func (w *waitCancel) setDeadline(t time.Time) {
 	g := w.gen.Load()
 	var d time.Duration
 	if !t.IsZero() {
-		if d = time.Until(t); d <= 0 {
+		now := time.Now()
+		if d = t.Sub(now); d <= 0 {
 			g.end(genExpired)
 			return
 		}
+		// On the monotonic clock, as the wrapped connection keeps it: a
+		// deadline without a monotonic reading would otherwise move with
+		// wall-clock steps each time the timer checks it.
+		t = now.Add(d)
 	}
 	if g.ended() {
 		g = &waitGen{} // waits on the ended generation stay ended
@@ -436,43 +441,53 @@ func (c *rateNetConn) RemoteAddr() net.Addr {
 }
 
 // SetDeadline sets the read and write deadlines of the wrapped connection
-// and, if it accepts them, of the waits in the limiters.
+// and, unless it rejects them, of the waits in the limiters.
 func (c *rateNetConn) SetDeadline(t time.Time) error {
 	if c.conn == nil {
 		return ErrNilConn
 	}
-	if err := c.conn.SetDeadline(t); err != nil {
-		return err
+	err := c.conn.SetDeadline(t)
+	if limitsWaits(err) {
+		c.read.setDeadline(t)
+		c.write.setDeadline(t)
 	}
-	c.read.setDeadline(t)
-	c.write.setDeadline(t)
-	return nil
+	return err
 }
 
-// SetReadDeadline sets the read deadline of the wrapped connection and, if
-// it accepts it, of the waits in the read limiter.
+// SetReadDeadline sets the read deadline of the wrapped connection and,
+// unless it rejects it, of the waits in the read limiter.
 func (c *rateNetConn) SetReadDeadline(t time.Time) error {
 	if c.conn == nil {
 		return ErrNilConn
 	}
-	if err := c.conn.SetReadDeadline(t); err != nil {
-		return err
+	err := c.conn.SetReadDeadline(t)
+	if limitsWaits(err) {
+		c.read.setDeadline(t)
 	}
-	c.read.setDeadline(t)
-	return nil
+	return err
 }
 
-// SetWriteDeadline sets the write deadline of the wrapped connection and, if
-// it accepts it, of the waits in the write limiter.
+// SetWriteDeadline sets the write deadline of the wrapped connection and,
+// unless it rejects it, of the waits in the write limiter.
 func (c *rateNetConn) SetWriteDeadline(t time.Time) error {
 	if c.conn == nil {
 		return ErrNilConn
 	}
-	if err := c.conn.SetWriteDeadline(t); err != nil {
-		return err
+	err := c.conn.SetWriteDeadline(t)
+	if limitsWaits(err) {
+		c.write.setDeadline(t)
 	}
-	c.write.setDeadline(t)
-	return nil
+	return err
+}
+
+// limitsWaits reports whether a deadline that the wrapped connection
+// answered with err also bounds the waits in the limiters. A connection
+// without deadline support, such as an SSH channel, rejects it, and I/O on
+// it must not time out only when throttled; one that is closed, or whose peer
+// closed a pipe, rejects it too, but a deadline in the past must still end a
+// wait there.
+func limitsWaits(err error) bool {
+	return err == nil || errors.Is(err, net.ErrClosed) || errors.Is(err, io.ErrClosedPipe)
 }
 
 // RawConn returns the wrapped connection.
