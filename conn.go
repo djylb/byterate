@@ -37,10 +37,11 @@ type direction struct {
 // charged to rate. Read charges the bytes received before returning them;
 // Write charges len(b) before writing and refunds any unwritten part. If rate
 // is a ContextLimiter, Close also ends a wait in progress, which then returns
-// net.ErrClosed. CloseRead and CloseWrite are passed on to rwc when it has
-// them, so relays can half-close through the wrapper. A nil rate, including a
-// nil *Rate or *HierarchicalLimiter, returns rwc unchanged. Methods return
-// ErrNilConn if rwc is nil.
+// net.ErrClosed; any other error from GetContext is returned as it is, and a
+// Write refunds its charge. CloseRead and CloseWrite are passed on to rwc when
+// it has them, so relays can half-close through the wrapper. A nil rate,
+// including a nil *Rate or *HierarchicalLimiter, returns rwc unchanged.
+// Methods return ErrNilConn if rwc is nil.
 func NewRateReadWriteCloser(rwc io.ReadWriteCloser, rate Limiter) io.ReadWriteCloser {
 	return NewDuplexRateReadWriteCloser(rwc, rate, rate)
 }
@@ -190,13 +191,17 @@ func (s *rateConn) Close() error {
 }
 
 // wait charges size to d's limiter, if any. It returns net.ErrClosed if Close
-// ended the wait and os.ErrDeadlineExceeded if d's deadline did.
+// ended the wait, os.ErrDeadlineExceeded if d's deadline did, and any other
+// error from the limiter as it is.
 func (s *rateConn) wait(d *direction, size int64) error {
 	switch {
 	case d.ctxRate != nil:
 		g := d.cancel.current() // the whole wait uses one generation
-		if d.ctxRate.GetContext(g, size) != nil {
-			return g.cause()
+		if err := d.ctxRate.GetContext(g, size); err != nil {
+			if isClosed(g.ch) {
+				return g.cause()
+			}
+			return err
 		}
 	case d.rate != nil:
 		d.rate.Get(size)

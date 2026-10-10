@@ -709,3 +709,35 @@ func TestRateConnCloseRead(t *testing.T) {
 		t.Fatalf("CloseRead() on nil conn error = %v, want %v", err, ErrNilConn)
 	}
 }
+
+// errLimiter is a ContextLimiter whose GetContext fails on its own, as an
+// adapter refusing a charge larger than its burst does.
+type errLimiter struct {
+	err           error
+	got, returned int64
+}
+
+func (l *errLimiter) Get(size int64)          { l.got += size }
+func (l *errLimiter) ReturnBucket(size int64) { l.returned += size }
+func (l *errLimiter) GetContext(_ context.Context, size int64) error {
+	l.got += size
+	return l.err
+}
+
+// An error of the limiter's own must reach the caller as it is, not as a
+// deadline or a close.
+func TestRateConnPassesLimiterError(t *testing.T) {
+	wantErr := errors.New("charge exceeds burst")
+	l := &errLimiter{err: wantErr}
+	conn := NewRateReadWriteCloser(&scriptedConn{readBuf: []byte("abc"), writeN: 64}, l)
+
+	if n, err := conn.Write([]byte("hello")); n != 0 || !errors.Is(err, wantErr) {
+		t.Fatalf("Write() = %d, %v; want 0, %v", n, err, wantErr)
+	}
+	if l.got != 5 || l.returned != 5 {
+		t.Fatalf("limiter got/returned after failed Write() = %d/%d, want 5/5", l.got, l.returned)
+	}
+	if n, err := conn.Read(make([]byte, 8)); n != 3 || !errors.Is(err, wantErr) {
+		t.Fatalf("Read() = %d, %v; want 3, %v", n, err, wantErr)
+	}
+}

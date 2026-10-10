@@ -60,7 +60,8 @@ duplex := byterate.NewDuplexRateConn(c, byterate.NewRate(8<<20), byterate.NewRat
   arrives and writes before sending, refunding short writes. When the limiter
   implements `ContextLimiter` (`*Rate` and `*HierarchicalLimiter` do), `Close`
   wakes a `Read` or `Write` blocked in the limiter, which then returns
-  `net.ErrClosed`. A nil limiter, including a nil `*Rate` or
+  `net.ErrClosed`; any other error from `GetContext` is returned as it is,
+  and a `Write` refunds its charge. A nil limiter, including a nil `*Rate` or
   `*HierarchicalLimiter`, returns the connection unchanged.
 - `NewRateConn` keeps the `net.Conn` addresses and deadlines, and its
   `RawConn` method returns the wrapped connection, so helpers such as

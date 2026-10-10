@@ -13,7 +13,8 @@ type Limiter interface {
 
 // ContextLimiter is a Limiter whose wait can be abandoned. NewRateConn and
 // NewRateReadWriteCloser use it so that Close, and for NewRateConn a
-// deadline, ends a Read or Write blocked in the limiter.
+// deadline, ends a Read or Write blocked in the limiter. Other errors from
+// GetContext are returned by that Read or Write as they are.
 type ContextLimiter interface {
 	Limiter
 	// GetContext is like Get but returns ctx.Err() if ctx is done before the
