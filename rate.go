@@ -239,17 +239,34 @@ func (r *Rate) Stop() {
 // unwritten part of a short write. A refund never raises the available burst
 // above two seconds' worth of bytes. The bytes also come off the meter: a
 // refund of bytes metered in an earlier sampling window is taken off the
-// following windows. Bytes charged before the last Start, which cleared the
-// debt and the meter, are refunded all the same; the connection wrappers of
-// this package leave them out.
+// following windows. While r is unlimited, the refund still comes off the
+// debt left from the last limit, which SetLimit keeps as bytes. Bytes
+// charged before the last Start, which cleared the debt and the meter, are
+// refunded all the same; the connection wrappers of this package leave them
+// out.
 func (r *Rate) ReturnBucket(size int64) {
-	if r == nil || size <= 0 || !r.enabled.Load() {
+	if r == nil || size <= 0 {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.refund(size)
+}
+
+// refund refunds size bytes. r.mu must be held, which serializes it with
+// Start, Stop and SetLimit: the epoch check in returnSince and the
+// conversion at debtRate then see the same start and the same limit as the
+// tat they change. Charges still move tat concurrently, hence the CAS.
+func (r *Rate) refund(size int64) {
+	if !r.enabled.Load() {
 		return
 	}
 
 	r.bytesAcc.Add(-size)
 
-	rate := r.rate.Load()
+	// While temporarily unlimited, old debt is still denominated at the
+	// last positive limit. Canceling an old write must remove that debt too.
+	rate := r.debtRate
 	if rate <= 0 {
 		return
 	}
@@ -264,9 +281,6 @@ func (r *Rate) ReturnBucket(size int64) {
 		if r.tat.CompareAndSwap(prev, next) {
 			return
 		}
-		if !r.enabled.Load() {
-			return
-		}
 	}
 }
 
@@ -275,10 +289,14 @@ func (r *Rate) ReturnBucket(size int64) {
 // added and the meter that counted them: refunding them would credit the
 // new debt and hold the new meter down.
 func (r *Rate) returnSince(size int64, epoch uint64) {
-	if r == nil || epoch < r.startEpoch.Load() {
+	if r == nil || size <= 0 {
 		return
 	}
-	r.ReturnBucket(size)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if epoch >= r.startEpoch.Load() {
+		r.refund(size)
+	}
 }
 
 // Get charges size bytes and blocks until the limit allows them. It returns

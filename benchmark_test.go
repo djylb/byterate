@@ -1,10 +1,42 @@
 package byterate
 
 import (
+	"context"
 	"sync/atomic"
 	"testing"
 	"time"
 )
+
+func BenchmarkCanceledGetContext(b *testing.B) {
+	r := NewRate(1)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	b.ReportAllocs()
+	for b.Loop() {
+		_ = r.GetContext(ctx, 3)
+	}
+}
+
+func BenchmarkRateRefund(b *testing.B) {
+	r := NewRate(benchLimit)
+	b.ReportAllocs()
+	for b.Loop() {
+		r.Get(32 << 10)
+		r.ReturnBucket(32 << 10)
+	}
+}
+
+// BenchmarkRateRefundShared charges and refunds one Rate from every
+// goroutine, the worst case for the lock ReturnBucket takes.
+func BenchmarkRateRefundShared(b *testing.B) {
+	r := NewRate(benchLimit)
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			r.Get(32 << 10)
+			r.ReturnBucket(32 << 10)
+		}
+	})
+}
 
 // benchLimit is a limit that never makes a 32 KiB charge wait.
 const benchLimit = 1 << 50

@@ -51,6 +51,9 @@ duplex := byterate.NewDuplexRateConn(c, byterate.NewRate(8<<20), byterate.NewRat
 - `Stop` disables limiting and wakes callers blocked in `Get`.
   `GetContext` also returns early when its context is done; the charge is
   kept, so refund bytes that were not transferred with `ReturnBucket`.
+  Waits of at most 200 µs are accumulated as debt without sleeping. A plain
+  `Get` sleep of at most 2 ms finishes normally even if `Stop` is called;
+  cancelable `GetContext` waits watch cancellation even below 2 ms.
 - `NewHierarchicalLimiter` charges every started `Rate` and waits for the
   longest delay. Nil rates and repeats are left out, so a `Rate` given twice
   is charged once, and it returns nil when none remain, or the `Rate` itself
@@ -69,7 +72,8 @@ duplex := byterate.NewDuplexRateConn(c, byterate.NewRate(8<<20), byterate.NewRat
   `RawConn` method returns the wrapped connection, so helpers such as
   `netx.RawConnOf` can unwrap it. `CloseRead` and `CloseWrite` are passed on
   when the wrapped connection has them, so relays such as `netx.Relay` can
-  half-close through the wrapper.
+  half-close through the wrapper; when they succeed, they also end a wait in
+  that direction's limiter with `net.ErrClosed`, as `Close` does for both.
 - With a `ContextLimiter`, the read and write deadlines of `NewRateConn` also
   bound the wait in the limiter, and a deadline set in the past ends a wait in
   progress, as `net/http` does to abort a read. A `Write` whose deadline
@@ -91,9 +95,14 @@ duplex := byterate.NewDuplexRateConn(c, byterate.NewRate(8<<20), byterate.NewRat
 
 ## Concurrency
 
-`Get`, `ReturnBucket`, `Now` and `Meter.Add` are lock-free, and they
-allocate nothing unless a `Get` or `GetContext` waits longer than 2 ms, which
-takes a timer. A hierarchical charge reads the clock once for all levels, and
+`Get`, `Now` and `Meter.Add` are lock-free. `ReturnBucket` takes the `Rate`'s
+lock briefly, so that a refund sees the same limit and start as the debt it
+changes; refunds are rare next to charges. Nothing allocates unless a wait
+needs a timer: a `Get` waiting longer than 2 ms, or a `GetContext` with a
+cancelable context, including the waits of the connection wrappers, waiting
+longer than 200 µs, so that a deadline or `Close` ends even a short wait.
+An already-canceled wait returns without allocating a timer.
+A hierarchical charge reads the clock once for all levels, and
 hot counters sit on cache lines of their own, so `Rate`s and `Meter`s used by
 different cores do not slow each other down; this padding makes a `Rate`
 about 340 bytes and a `Meter` about 300. Wrapping a connection takes at most

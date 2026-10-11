@@ -32,13 +32,27 @@ type cacheLinePad [128]byte
 
 // sleepNs waits waitNs, returning early when stopCh or done is closed.
 // It reports false only when done was closed before the wait elapsed.
+//
+// Without done, a wait of up to shortWaitNs sleeps without a timer: only
+// Stop could end it, and it ends within 2 ms anyway. A wait with done always
+// watches it, however short, since a deadline or Close must end it.
 func sleepNs(waitNs int64, stopCh, done <-chan struct{}) bool {
 	if waitNs <= 0 {
 		return true
 	}
-	if waitNs <= shortWaitNs || (stopCh == nil && done == nil) {
+	if done == nil && (stopCh == nil || waitNs <= shortWaitNs) {
 		time.Sleep(time.Duration(waitNs))
 		return true
+	}
+	// A canceled operation needs no timer, including repeated writes after
+	// Close. Keep the check before the allocation, but do not skip a live
+	// cancellation signal even for a sub-millisecond wait.
+	select {
+	case <-done:
+		return false
+	case <-stopCh:
+		return true
+	default:
 	}
 
 	// A fresh timer rather than a pooled one: a timer belongs to the

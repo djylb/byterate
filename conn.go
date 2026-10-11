@@ -173,26 +173,36 @@ func (d *direction) refund(size int64, epoch uint64) {
 
 // CloseRead shuts down the reading side of the wrapped connection, as
 // *net.TCPConn does, or returns an error matching errors.ErrUnsupported when
-// it cannot.
+// it cannot. On success it also ends a read's limiter wait with net.ErrClosed,
+// retaining any bytes already read and their charge.
 func (s *rateConn) CloseRead() error {
 	if s == nil || s.conn == nil {
 		return ErrNilConn
 	}
 	if cr, ok := s.conn.(interface{ CloseRead() error }); ok {
-		return cr.CloseRead()
+		err := cr.CloseRead()
+		if err == nil {
+			s.read.cancel.close()
+		}
+		return err
 	}
 	return errCloseReadUnsupported
 }
 
 // CloseWrite shuts down the writing side of the wrapped connection, as
 // *net.TCPConn and *tls.Conn do, or returns an error matching
-// errors.ErrUnsupported when it cannot.
+// errors.ErrUnsupported when it cannot. On success it also ends a write's
+// limiter wait with net.ErrClosed and refunds the unsent bytes.
 func (s *rateConn) CloseWrite() error {
 	if s == nil || s.conn == nil {
 		return ErrNilConn
 	}
 	if cw, ok := s.conn.(interface{ CloseWrite() error }); ok {
-		return cw.CloseWrite()
+		err := cw.CloseWrite()
+		if err == nil {
+			s.write.cancel.close()
+		}
+		return err
 	}
 	return errCloseWriteUnsupported
 }
@@ -404,6 +414,10 @@ func (w *waitCancel) setDeadline(t time.Time) {
 	}
 	switch {
 	case t.IsZero():
+		if dt != nil {
+			dt.t.Stop()
+			dt.firesAt = time.Time{}
+		}
 	case dt == nil:
 		w.timer = newDeadlineTimer(g, t, d)
 	default:
@@ -437,6 +451,11 @@ func (w *waitCancel) close() {
 type rateNetConn struct {
 	rateConn
 	conn net.Conn
+	// Held across setting the wrapped connection's deadline and the
+	// limiter's, so that concurrent setters leave both at the same one:
+	// otherwise an earlier setter could overwrite the limiter's deadline
+	// after a later one had set both. SetDeadline takes readMu first.
+	readMu, writeMu sync.Mutex
 }
 
 func (c *rateNetConn) LocalAddr() net.Addr {
@@ -459,6 +478,10 @@ func (c *rateNetConn) SetDeadline(t time.Time) error {
 	if c.conn == nil {
 		return ErrNilConn
 	}
+	c.readMu.Lock()
+	defer c.readMu.Unlock()
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
 	err := c.conn.SetDeadline(t)
 	if limitsWaits(err) {
 		c.read.setDeadline(t)
@@ -473,6 +496,8 @@ func (c *rateNetConn) SetReadDeadline(t time.Time) error {
 	if c.conn == nil {
 		return ErrNilConn
 	}
+	c.readMu.Lock()
+	defer c.readMu.Unlock()
 	err := c.conn.SetReadDeadline(t)
 	if limitsWaits(err) {
 		c.read.setDeadline(t)
@@ -486,6 +511,8 @@ func (c *rateNetConn) SetWriteDeadline(t time.Time) error {
 	if c.conn == nil {
 		return ErrNilConn
 	}
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
 	err := c.conn.SetWriteDeadline(t)
 	if limitsWaits(err) {
 		c.write.setDeadline(t)
