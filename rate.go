@@ -12,6 +12,10 @@ import (
 // to two seconds' worth of bytes through without waiting.
 const burstWindowNs = int64(2 * time.Second)
 
+// stopSignal is one generation of a Rate: Start makes a new one when it
+// clears the Rate, and Stop closes its channel. Write receipts refer to the
+// generation they charged, so a refund skips a Rate restarted since without
+// the charge taking a lock.
 type stopSignal struct {
 	ch chan struct{}
 }
@@ -33,13 +37,12 @@ type Rate struct {
 	stopped      bool // protected by mu; fills otherwise unused alignment space
 	_            cacheLinePad
 	// Written by every charge, isolated from configuration and lifecycle state.
-	tat        atomic.Int64 // theoretical arrival time (ns since epoch), can be negative
-	bytesAcc   atomic.Int64 // bytes charged in the current sampling window, net of refunds
-	_          cacheLinePad
-	nowBps     atomic.Int64  // throughput of the last sampling window, bytes/s
-	startEpoch atomic.Uint64 // generation of the last Start that cleared r
-	debtRate   int64         // the limit tat's debt is reckoned at: the last one above 0
-	mu         sync.Mutex
+	tat      atomic.Int64 // theoretical arrival time (ns since epoch), can be negative
+	bytesAcc atomic.Int64 // bytes charged in the current sampling window, net of refunds
+	_        cacheLinePad
+	nowBps   atomic.Int64 // throughput of the last sampling window, bytes/s
+	debtRate int64        // the limit tat's debt is reckoned at: the last one above 0
+	mu       sync.Mutex   // serializes Start, Stop, SetLimit and refunds; charges take no lock
 }
 
 // NewRate returns a started Rate limited to limitBps bytes per second with a
@@ -81,7 +84,6 @@ func (r *Rate) Clone() *Rate {
 	cloned.bytesAcc.Store(r.bytesAcc.Load())
 	cloned.lastSampleNs.Store(r.lastSampleNs.Load())
 	cloned.nowBps.Store(r.nowBps.Load())
-	cloned.startEpoch.Store(r.startEpoch.Load())
 
 	signal := &stopSignal{ch: make(chan struct{})}
 	if stopped {
@@ -191,18 +193,18 @@ func (r *Rate) Start() {
 	prevEnabled := r.enabled.Load()
 	needReset := r.stopped || !prevEnabled || r.stop.Load() == nil
 
-	if r.stopped || r.stop.Load() == nil {
+	if needReset {
+		// A new generation, stored before tat is reset: a charge that still
+		// sees the old one after its CAS was made before the reset, and is
+		// cleared by it. A Rate that was not stopped has no waiters on the
+		// old channel, since it was not enabled.
 		r.stop.Store(&stopSignal{ch: make(chan struct{})})
 		r.stopped = false
-	}
-
-	if needReset {
 		now := nowNs()
 		r.tat.Store(now - burstWindowNs) // full burst on (re)enable
 		r.bytesAcc.Store(0)
 		r.lastSampleNs.Store(now)
 		r.nowBps.Store(0)
-		r.startEpoch.Add(1)
 	}
 
 	r.enabled.Store(true)
@@ -332,16 +334,16 @@ func (r *Rate) reserve(size int64) int64 {
 // long the caller must wait. A HierarchicalLimiter passes one now to all its
 // Rates, reading the clock once.
 func (r *Rate) reserveAt(size, now int64) int64 {
-	wait := r.reserveCore(size, now)
+	wait, _, _ := r.reserveCore(size, now)
 	r.notifyReserved(wait)
 	return wait
 }
 
-// reserveCore is also used by writes holding mu, so that
-// their refund receipt describes the exact generation and limit charged.
-func (r *Rate) reserveCore(size, now int64) int64 {
+// reserveCore is reserveAt without the test hook. It also reports whether
+// the charge was metered, and whether it added debt, for write receipts.
+func (r *Rate) reserveCore(size, now int64) (wait int64, metered, debt bool) {
 	if r == nil || size <= 0 || !r.enabled.Load() {
-		return 0
+		return 0, false, false
 	}
 
 	r.bytesAcc.Add(size)
@@ -349,7 +351,7 @@ func (r *Rate) reserveCore(size, now int64) int64 {
 
 	rate := r.rate.Load()
 	if rate <= 0 {
-		return 0
+		return 0, true, false
 	}
 	cost := bytesToNsCeil(size, rate)
 	minTat := now - burstWindowNs
@@ -358,18 +360,18 @@ func (r *Rate) reserveCore(size, now int64) int64 {
 		// The limit again, after tat: see SetLimit.
 		if cur := r.rate.Load(); cur != rate {
 			if cur <= 0 {
-				return 0
+				return 0, true, false
 			}
 			rate, cost = cur, bytesToNsCeil(size, cur)
 		}
 		next := clampAdd(max(prev, minTat), cost)
 		if r.tat.CompareAndSwap(prev, next) {
-			return max(next-now, 0)
+			return max(next-now, 0), true, true
 		}
 		// Retry at once with the same now: reading the clock again would
 		// widen the window in which other cores win the race.
 		if !r.enabled.Load() {
-			return 0
+			return 0, true, false
 		}
 	}
 }

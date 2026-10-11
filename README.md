@@ -99,19 +99,23 @@ duplex := byterate.NewDuplexRateConn(c, byterate.NewRate(8<<20), byterate.NewRat
 
 ## Concurrency
 
-`Get`, `Now` and `Meter.Add` are lock-free. `ReturnBucket` takes the `Rate`'s
-lock briefly, so that a refund sees the same limit and start as the debt it
-changes. Connection writes also hold each Rate's lock while charging and
-recording its refund receipt, never while waiting or doing I/O. Up to eight
-hierarchy levels keep these receipts on the stack; larger hierarchies allocate
-one slice per write. Apart from that, charges allocate only when a wait
-needs a timer: a `Get` waiting longer than 2 ms, or a `GetContext` with a
-cancelable context, including the waits of the connection wrappers, waiting
-longer than 200 µs, so that a deadline or `Close` ends even a short wait.
-An already-canceled wait returns without allocating a timer.
+`Get`, `Now`, `Meter.Add` and the charges of connection reads and writes are
+lock-free. `ReturnBucket`, and the refund of a short or failed write, take
+the `Rate`'s lock briefly, so that a refund sees the same limit and start as
+the debt it changes. A write's refund receipt records the generation each
+`Rate` was in, which `Start` replaces when it clears the `Rate`; a write
+charged while a restart was under way keeps its charge without a refund. Up
+to eight hierarchy levels keep these receipts on the stack; larger
+hierarchies allocate one slice per write. Apart from that, charges allocate
+only when a wait needs a timer: a `Get` waiting longer than 2 ms, or a
+`GetContext` with a cancelable context, waiting longer than 200 µs, so that a
+deadline or `Close` ends even a short wait. The connection wrappers reuse one
+timer per direction for the waits of a `*Rate` or `*HierarchicalLimiter`, so a
+throttled connection does not allocate per wait. An already-canceled wait
+returns without allocating a timer.
 A hierarchical charge reads the clock once for all levels. Padding separates
-neighboring instances' hot counters; a `Rate` is about 340 bytes and a `Meter`
-about 300. Wrapping a connection takes at most three allocations, about 220
+neighboring instances' hot counters; a `Rate` is about 330 bytes and a `Meter`
+about 300. Wrapping a connection takes at most three allocations, about 240
 bytes. Setting its deadlines allocates only for
 the first deadline and after one has expired, and moving a deadline later, as
 servers do before every read, leaves the runtime timer alone. A pending

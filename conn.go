@@ -31,6 +31,7 @@ type direction struct {
 	rate    Limiter
 	ctxRate ContextLimiter // rate, if it supports cancellation
 	cancel  waitCancel     // used only with ctxRate
+	timer   waitTimer      // reused by the waits of *Rate and *HierarchicalLimiter
 }
 
 // NewRateReadWriteCloser wraps rwc so that its traffic in both directions is
@@ -208,6 +209,16 @@ func (s *rateConn) Close() error {
 // ended the wait, os.ErrDeadlineExceeded if d's deadline did, and any other
 // error from the limiter as it is.
 func (s *rateConn) wait(d *direction, size int64) error {
+	switch l := d.rate.(type) {
+	case *Rate:
+		g := d.cancel.current() // before charging, as in chargeWrite
+		stop := l.stopCh()
+		return d.sleep(l.reserve(size), l.startedStopCh(stop), g)
+	case *HierarchicalLimiter:
+		g := d.cancel.current()
+		wait, stop := l.reserve(size)
+		return d.sleep(wait, stop, g)
+	}
 	switch {
 	case d.ctxRate != nil:
 		g := d.cancel.current() // the whole wait uses one generation
@@ -219,6 +230,15 @@ func (s *rateConn) wait(d *direction, size int64) error {
 		}
 	case d.rate != nil:
 		d.rate.Get(size)
+	}
+	return nil
+}
+
+// sleep waits wait in d's timer until stop or g's end. It returns g's cause
+// if g ended the wait.
+func (d *direction) sleep(wait int64, stop <-chan struct{}, g *waitGen) error {
+	if wait > coalesceWaitNs && !d.timer.sleep(wait, stop, g.Done()) {
+		return g.cause()
 	}
 	return nil
 }

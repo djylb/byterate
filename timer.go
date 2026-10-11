@@ -2,6 +2,7 @@ package byterate
 
 import (
 	"math/bits"
+	"sync/atomic"
 	"time"
 )
 
@@ -37,6 +38,20 @@ type cacheLinePad [128]byte
 // Stop could end it, and it ends within 2 ms anyway. A wait with done always
 // watches it, however short, since a deadline or Close must end it.
 func sleepNs(waitNs int64, stopCh, done <-chan struct{}) bool {
+	return (*waitTimer)(nil).sleep(waitNs, stopCh, done)
+}
+
+// waitTimer keeps the timer of a connection direction's last wait for the
+// next one, so that a throttled connection does not make a timer for every
+// Read and Write. It is not shared between connections: a timer belongs to
+// the testing/synctest bubble that made it, and fails fatally when used from
+// another or from outside one. A nil *waitTimer makes a timer for each wait.
+type waitTimer struct {
+	t atomic.Pointer[time.Timer] // idle timer, nil while a wait holds it
+}
+
+// sleep is sleepNs with w's timer.
+func (w *waitTimer) sleep(waitNs int64, stopCh, done <-chan struct{}) bool {
 	if waitNs <= 0 {
 		return true
 	}
@@ -45,7 +60,7 @@ func sleepNs(waitNs int64, stopCh, done <-chan struct{}) bool {
 		return true
 	}
 	// A canceled operation needs no timer, including repeated writes after
-	// Close. Keep the check before the allocation, but do not skip a live
+	// Close. Keep the check before taking one, but do not skip a live
 	// cancellation signal even for a sub-millisecond wait.
 	select {
 	case <-done:
@@ -55,11 +70,8 @@ func sleepNs(waitNs int64, stopCh, done <-chan struct{}) bool {
 	default:
 	}
 
-	// A fresh timer rather than a pooled one: a timer belongs to the
-	// testing/synctest bubble that made it, and fails fatally when used from
-	// another or from outside one.
-	t := time.NewTimer(time.Duration(waitNs))
-	defer t.Stop()
+	t := w.take(time.Duration(waitNs))
+	defer w.put(t)
 	select {
 	case <-t.C:
 		return true
@@ -67,6 +79,28 @@ func sleepNs(waitNs int64, stopCh, done <-chan struct{}) bool {
 		return true
 	case <-done:
 		return false
+	}
+}
+
+// take returns a timer set to fire after d: w's idle one, or a new one if a
+// concurrent wait holds it.
+func (w *waitTimer) take(d time.Duration) *time.Timer {
+	if w != nil {
+		if t := w.t.Swap(nil); t != nil {
+			// Since Go 1.23 a receive after Reset never sees a value of the
+			// timer's earlier settings, so the channel needs no draining.
+			t.Reset(d)
+			return t
+		}
+	}
+	return time.NewTimer(d)
+}
+
+// put stops t and keeps it for w's next wait.
+func (w *waitTimer) put(t *time.Timer) {
+	t.Stop()
+	if w != nil {
+		w.t.CompareAndSwap(nil, t)
 	}
 }
 
