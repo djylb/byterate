@@ -19,25 +19,19 @@ type writeCharge struct {
 }
 
 // reserve charges size to r at now and fills in c. It takes no lock: the
-// generation is read before and after the charge, and a charge that a
-// Start came between leaves no receipt, since it may have landed on either
-// side of the reset. That forgoes the refund of a write racing with a
-// restart, which wakes its waiters anyway.
+// charge reports the generation its debt landed in. The meter of a charge
+// racing with Start may count it on either side, so a charge of the meter
+// alone leaves no receipt if the generation changed during it.
 func (c *rateCharge) reserve(r *Rate, size, now int64) (int64, <-chan struct{}) {
 	if r == nil {
 		return 0, nil
 	}
-	gen := r.stop.Load()
-	wait, metered, debt := r.reserveCore(size, now)
-	if metered && gen != nil && r.stop.Load() == gen {
+	wait, gen, metered, debt := r.reserveCore(size, now)
+	if debt || metered && gen != nil && r.stop.Load() == gen {
 		c.rate, c.gen, c.debt = r, gen, debt
 	}
 	r.notifyReserved(wait)
-	var stop <-chan struct{}
-	if gen != nil {
-		stop = gen.ch
-	}
-	return wait, r.startedStopCh(stop)
+	return wait, gen.stopCh()
 }
 
 func (c *rateCharge) refund(size int64) {

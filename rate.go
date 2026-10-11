@@ -13,11 +13,26 @@ import (
 const burstWindowNs = int64(2 * time.Second)
 
 // stopSignal is one generation of a Rate: Start makes a new one when it
-// clears the Rate, and Stop closes its channel. Write receipts refer to the
-// generation they charged, so a refund skips a Rate restarted since without
-// the charge taking a lock.
+// clears the Rate, and Stop closes its channel. A charge waits on the
+// channel of the generation it charged, and write receipts refer to it, so
+// a refund skips a Rate restarted since without the charge taking a lock.
 type stopSignal struct {
-	ch chan struct{}
+	ch    chan struct{}
+	ready atomic.Bool // set once Start has reset tat for this generation
+}
+
+func newStopSignal() *stopSignal {
+	s := &stopSignal{ch: make(chan struct{})}
+	s.ready.Store(true)
+	return s
+}
+
+// stopCh returns s's channel, or nil for no generation.
+func (s *stopSignal) stopCh() <-chan struct{} {
+	if s == nil {
+		return nil
+	}
+	return s.ch
 }
 
 // Rate is a bytes-per-second limiter (GCRA, a token-bucket variant) with a
@@ -35,6 +50,7 @@ type Rate struct {
 	lastSampleNs atomic.Int64 // start of the sampling window
 	enabled      atomic.Bool
 	stopped      bool // protected by mu; fills otherwise unused alignment space
+	reset        bool // protected by mu: Start has reset tat, to resetTat
 	_            cacheLinePad
 	// Written by every charge, isolated from configuration and lifecycle state.
 	tat      atomic.Int64 // theoretical arrival time (ns since epoch), can be negative
@@ -42,6 +58,7 @@ type Rate struct {
 	_        cacheLinePad
 	nowBps   atomic.Int64 // throughput of the last sampling window, bytes/s
 	debtRate int64        // the limit tat's debt is reckoned at: the last one above 0
+	resetTat int64        // protected by mu: the tat Start last reset to
 	mu       sync.Mutex   // serializes Start, Stop, SetLimit and refunds; charges take no lock
 }
 
@@ -54,7 +71,7 @@ func NewRate(limitBps int64) *Rate {
 	r := &Rate{debtRate: limitBps}
 	r.enabled.Store(true)
 	r.rate.Store(limitBps)
-	r.stop.Store(&stopSignal{ch: make(chan struct{})})
+	r.stop.Store(newStopSignal())
 
 	now := nowNs()
 	r.tat.Store(now - burstWindowNs) // full burst, also for a limit set later
@@ -77,7 +94,7 @@ func (r *Rate) Clone() *Rate {
 	defer r.mu.Unlock()
 	stopped := r.stopped
 
-	cloned := &Rate{debtRate: r.debtRate, stopped: stopped}
+	cloned := &Rate{debtRate: r.debtRate, stopped: stopped, reset: r.reset, resetTat: r.resetTat}
 	cloned.rate.Store(r.rate.Load())
 	cloned.tat.Store(r.tat.Load())
 	cloned.enabled.Store(r.enabled.Load())
@@ -85,7 +102,7 @@ func (r *Rate) Clone() *Rate {
 	cloned.lastSampleNs.Store(r.lastSampleNs.Load())
 	cloned.nowBps.Store(r.nowBps.Load())
 
-	signal := &stopSignal{ch: make(chan struct{})}
+	signal := newStopSignal()
 	if stopped {
 		close(signal.ch)
 	}
@@ -194,17 +211,27 @@ func (r *Rate) Start() {
 	needReset := r.stopped || !prevEnabled || r.stop.Load() == nil
 
 	if needReset {
-		// A new generation, stored before tat is reset: a charge that still
-		// sees the old one after its CAS was made before the reset, and is
-		// cleared by it. A Rate that was not stopped has no waiters on the
-		// old channel, since it was not enabled.
-		r.stop.Store(&stopSignal{ch: make(chan struct{})})
+		// The new generation is stored before tat is reset, and is ready
+		// after: a charge that sees the old one after loading tat lands
+		// before the reset, which clears it, and one that sees a ready one
+		// lands after. A Rate that was not stopped has no waiters on the old
+		// channel, since it was not enabled.
+		gen := &stopSignal{ch: make(chan struct{})}
+		r.stop.Store(gen)
 		r.stopped = false
 		now := nowNs()
-		r.tat.Store(now - burstWindowNs) // full burst on (re)enable
+		// Every reset stores a new tat, also within one tick of a coarse
+		// clock, so that a charge that loaded tat before it fails its CAS.
+		tat := now - burstWindowNs // full burst on (re)enable
+		if r.reset && tat <= r.resetTat {
+			tat = r.resetTat + 1
+		}
+		r.reset, r.resetTat = true, tat
+		r.tat.Store(tat)
 		r.bytesAcc.Store(0)
 		r.lastSampleNs.Store(now)
 		r.nowBps.Store(0)
+		gen.ready.Store(true)
 	}
 
 	r.enabled.Store(true)
@@ -288,23 +315,21 @@ func (r *Rate) refund(size int64) {
 // immediately if r is nil, stopped or unlimited; Stop and ResetLimit wake a
 // blocked Get early. Use GetContext to abandon a wait.
 func (r *Rate) Get(size int64) {
-	stopCh := r.stopCh() // before reserving, so that a Stop after the charge ends the wait
-	wait := r.reserve(size)
+	wait, stopCh := r.reserveAt(size, nowNs())
 	if wait <= coalesceWaitNs {
 		return
 	}
-	sleepNs(wait, r.startedStopCh(stopCh), nil)
+	sleepNs(wait, stopCh, nil)
 }
 
 // GetContext is like Get but returns ctx.Err() if ctx is done before the wait
 // ends. The charge is kept either way; refund unused bytes with ReturnBucket.
 func (r *Rate) GetContext(ctx context.Context, size int64) error {
-	stopCh := r.stopCh() // before reserving, as in Get
-	wait := r.reserve(size)
+	wait, stopCh := r.reserveAt(size, nowNs())
 	if wait <= coalesceWaitNs {
 		return nil
 	}
-	if !sleepNs(wait, r.startedStopCh(stopCh), ctx.Done()) {
+	if !sleepNs(wait, stopCh, ctx.Done()) {
 		return ctx.Err()
 	}
 	return nil
@@ -327,23 +352,36 @@ func (r *Rate) MarshalJSON() ([]byte, error) {
 }
 
 func (r *Rate) reserve(size int64) int64 {
-	return r.reserveAt(size, nowNs())
-}
-
-// reserveAt charges size at time now, as returned by nowNs, and returns how
-// long the caller must wait. A HierarchicalLimiter passes one now to all its
-// Rates, reading the clock once.
-func (r *Rate) reserveAt(size, now int64) int64 {
-	wait, _, _ := r.reserveCore(size, now)
-	r.notifyReserved(wait)
+	wait, _ := r.reserveAt(size, nowNs())
 	return wait
 }
 
-// reserveCore is reserveAt without the test hook. It also reports whether
-// the charge was metered, and whether it added debt, for write receipts.
-func (r *Rate) reserveCore(size, now int64) (wait int64, metered, debt bool) {
-	if r == nil || size <= 0 || !r.enabled.Load() {
-		return 0, false, false
+// reserveAt charges size at time now, as returned by nowNs, and returns how
+// long the caller must wait and the channel that ends the wait: that of the
+// generation charged, which Stop closes. A HierarchicalLimiter passes one now
+// to all its Rates, reading the clock once.
+func (r *Rate) reserveAt(size, now int64) (int64, <-chan struct{}) {
+	wait, gen, _, _ := r.reserveCore(size, now)
+	r.notifyReserved(wait)
+	return wait, gen.stopCh()
+}
+
+// reserveCore is reserveAt without the test hook. It returns the generation
+// charged, and reports whether the charge was metered and whether it added
+// debt, for write receipts. Debt is charged in exactly that generation; the
+// meter of a charge racing with Start may count it on either side.
+func (r *Rate) reserveCore(size, now int64) (wait int64, gen *stopSignal, metered, debt bool) {
+	if r == nil || size <= 0 {
+		return 0, nil, false, false
+	}
+	// The generation before enabled, so that a Stop after this charge
+	// closes the channel the caller waits on.
+	gen = r.stop.Load()
+	if !r.enabled.Load() {
+		return 0, gen, false, false
+	}
+	if hook := testHookCharging.Load(); hook != nil {
+		(*hook)(r)
 	}
 
 	r.bytesAcc.Add(size)
@@ -351,27 +389,44 @@ func (r *Rate) reserveCore(size, now int64) (wait int64, metered, debt bool) {
 
 	rate := r.rate.Load()
 	if rate <= 0 {
-		return 0, true, false
+		return 0, gen, true, false
 	}
 	cost := bytesToNsCeil(size, rate)
 	minTat := now - burstWindowNs
 	for {
+		// A charge must wait in, and be refunded to, the generation whose
+		// tat it lands on, so it reads the generation before tat and checks
+		// it after: a ready generation has had its reset, and an unchanged
+		// one has not had the next. While a Start is resetting tat, wait for
+		// it on mu.
+		gen = r.stop.Load()
+		if gen == nil || !gen.ready.Load() {
+			r.mu.Lock()
+			r.mu.Unlock()
+			if !r.enabled.Load() {
+				return 0, r.stop.Load(), true, false
+			}
+			continue
+		}
 		prev := r.tat.Load()
+		if r.stop.Load() != gen {
+			continue
+		}
 		// The limit again, after tat: see SetLimit.
 		if cur := r.rate.Load(); cur != rate {
 			if cur <= 0 {
-				return 0, true, false
+				return 0, gen, true, false
 			}
 			rate, cost = cur, bytesToNsCeil(size, cur)
 		}
 		next := clampAdd(max(prev, minTat), cost)
 		if r.tat.CompareAndSwap(prev, next) {
-			return max(next-now, 0), true, true
+			return max(next-now, 0), gen, true, true
 		}
 		// Retry at once with the same now: reading the clock again would
 		// widen the window in which other cores win the race.
 		if !r.enabled.Load() {
-			return 0, true, false
+			return 0, gen, true, false
 		}
 	}
 }
@@ -384,32 +439,20 @@ func (r *Rate) notifyReserved(wait int64) {
 	}
 }
 
+// testHookCharging, if set, is called with a Rate at the start of a charge,
+// so that tests can restart the Rate there.
+var testHookCharging atomic.Pointer[func(*Rate)]
+
 // testHookReserved, if set, is called with a Rate whose charge must wait,
 // between the charge and the wait, so that tests can stop the Rate there.
 var testHookReserved atomic.Pointer[func(*Rate)]
 
-// stopCh returns the channel that Stop closes. Callers load it before they
-// reserve: a Stop between the reservation and the wait closes the channel
-// they hold, whereas one loaded afterwards may already belong to the next
-// Start and miss that Stop.
+// stopCh returns the channel that Stop closes.
 func (r *Rate) stopCh() <-chan struct{} {
 	if r == nil {
 		return nil
 	}
-	if s := r.stop.Load(); s != nil {
-		return s.ch
-	}
-	return nil
-}
-
-// startedStopCh returns stopCh, loaded before a charge that must wait, or if
-// it is nil the current one: r had never been started then, so the charge
-// came after the first Start, which stores the channel before enabling r.
-func (r *Rate) startedStopCh(stopCh <-chan struct{}) <-chan struct{} {
-	if stopCh == nil {
-		return r.stopCh()
-	}
-	return stopCh
+	return r.stop.Load().stopCh()
 }
 
 func (r *Rate) updateRateWithNow(now int64) {

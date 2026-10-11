@@ -107,10 +107,8 @@ func (l *HierarchicalLimiter) reserve(size int64) (int64, <-chan struct{}) {
 	var maxWait int64
 	var maxStopCh <-chan struct{}
 	charge := func(r *Rate) {
-		stopCh := r.stopCh() // before reserving, as in Rate.Get
-		if wait := r.reserveAt(size, now); wait > maxWait {
-			maxWait = wait
-			maxStopCh = r.startedStopCh(stopCh)
+		if wait, stopCh := r.reserveAt(size, now); wait > maxWait {
+			maxWait, maxStopCh = wait, stopCh
 		}
 	}
 	charge(l.first)
