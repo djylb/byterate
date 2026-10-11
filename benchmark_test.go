@@ -150,3 +150,30 @@ func BenchmarkRateConnSetDeadline(b *testing.B) {
 		_ = c.SetReadDeadline(time.Now().Add(time.Minute))
 	}
 }
+
+// BenchmarkRateConnWriteShared writes small packets on one connection per
+// goroutine, each charged to its own Rate, one of four user Rates and a
+// global Rate, as a proxy does.
+func BenchmarkRateConnWriteShared(b *testing.B) {
+	for _, limit := range []int64{0, benchLimit} {
+		name := "unlimited"
+		if limit > 0 {
+			name = "limited"
+		}
+		b.Run(name, func(b *testing.B) {
+			global := NewRate(limit)
+			users := []*Rate{NewRate(limit), NewRate(limit), NewRate(limit), NewRate(limit)}
+			var next atomic.Int64
+			b.ReportAllocs()
+			b.RunParallel(func(pb *testing.PB) {
+				user := users[next.Add(1)%int64(len(users))]
+				c := NewRateConn(&nopNetConn{}, NewHierarchicalLimiter(NewRate(limit), user, global))
+				defer func() { _ = c.Close() }()
+				buf := make([]byte, 1500)
+				for pb.Next() {
+					_, _ = c.Write(buf)
+				}
+			})
+		})
+	}
+}

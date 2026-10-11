@@ -1,12 +1,13 @@
 package byterate
 
-// rateCharge is a write's receipt. Unlimited charges affect the meter only;
-// stopped rates affect neither it nor the debt. A restart invalidates both.
+// rateCharge is a write's receipt for one Rate: the generation it charged,
+// and whether the charge added debt or was only metered, as it is while
+// unlimited. A Rate stopped at the charge leaves no receipt, and a restart
+// since the charge voids it.
 type rateCharge struct {
-	rate    *Rate
-	epoch   uint64
-	metered bool
-	debt    bool
+	rate *Rate
+	gen  *stopSignal
+	debt bool
 }
 
 // Keep common hierarchies on the write's stack.
@@ -17,29 +18,36 @@ type writeCharge struct {
 	custom Limiter
 }
 
+// reserve charges size to r at now and fills in c. It takes no lock: the
+// generation is read before and after the charge, and a charge that a
+// Start came between leaves no receipt, since it may have landed on either
+// side of the reset. That forgoes the refund of a write racing with a
+// restart, which wakes its waiters anyway.
 func (c *rateCharge) reserve(r *Rate, size, now int64) (int64, <-chan struct{}) {
 	if r == nil {
 		return 0, nil
 	}
-	r.mu.Lock()
-	c.rate, c.epoch = r, r.startEpoch.Load()
-	c.metered = r.enabled.Load()
-	c.debt = c.metered && r.rate.Load() > 0
-	stop := r.stopCh()
-	wait := r.reserveCore(size, now)
-	r.mu.Unlock()
+	gen := r.stop.Load()
+	wait, metered, debt := r.reserveCore(size, now)
+	if metered && gen != nil && r.stop.Load() == gen {
+		c.rate, c.gen, c.debt = r, gen, debt
+	}
 	r.notifyReserved(wait)
-	return wait, stop
+	var stop <-chan struct{}
+	if gen != nil {
+		stop = gen.ch
+	}
+	return wait, r.startedStopCh(stop)
 }
 
 func (c *rateCharge) refund(size int64) {
 	r := c.rate
-	if r == nil || !c.metered || size <= 0 {
+	if r == nil || size <= 0 {
 		return
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if !r.enabled.Load() || c.epoch != r.startEpoch.Load() {
+	if !r.enabled.Load() || r.stop.Load() != c.gen {
 		return
 	}
 	if c.debt {
@@ -100,8 +108,5 @@ func (s *rateConn) chargeWrite(size int64, receipt *writeCharge) error {
 		receipt.custom = l
 		return s.wait(d, size)
 	}
-	if wait > coalesceWaitNs && !sleepNs(wait, stop, g.Done()) {
-		return g.cause()
-	}
-	return nil
+	return d.sleep(wait, stop, g)
 }
