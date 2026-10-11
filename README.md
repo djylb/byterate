@@ -102,9 +102,12 @@ duplex := byterate.NewDuplexRateConn(c, byterate.NewRate(8<<20), byterate.NewRat
 `Get`, `Now`, `Meter.Add` and the charges of connection reads and writes are
 lock-free. `ReturnBucket`, and the refund of a short or failed write, take
 the `Rate`'s lock briefly, so that a refund sees the same limit and start as
-the debt it changes. A write's refund receipt records the generation each
-`Rate` was in, which `Start` replaces when it clears the `Rate`; a write
-charged while a restart was under way keeps its charge without a refund. Up
+the debt it changes. A charge waits in, and a write's refund receipt records,
+the generation of each `Rate` whose debt it landed on, which `Start` replaces
+when it clears the `Rate`: a charge racing with a restart waits and is
+refunded in the generation it was charged to, and only the meter may count
+it on either side of the restart. A charge that finds a `Start` resetting the
+`Rate` waits for it on the `Rate`'s lock. Up
 to eight hierarchy levels keep these receipts on the stack; larger
 hierarchies allocate one slice per write. Apart from that, charges allocate
 only when a wait needs a timer: a `Get` waiting longer than 2 ms, or a
@@ -114,7 +117,7 @@ timer per direction for the waits of a `*Rate` or `*HierarchicalLimiter`, so a
 throttled connection does not allocate per wait. An already-canceled wait
 returns without allocating a timer.
 A hierarchical charge reads the clock once for all levels. Padding separates
-neighboring instances' hot counters; a `Rate` is about 330 bytes and a `Meter`
+neighboring instances' hot counters; a `Rate` is about 340 bytes and a `Meter`
 about 300. Wrapping a connection takes at most three allocations, about 240
 bytes. Setting its deadlines allocates only for
 the first deadline and after one has expired, and moving a deadline later, as

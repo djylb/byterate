@@ -212,8 +212,8 @@ func (s *rateConn) wait(d *direction, size int64) error {
 	switch l := d.rate.(type) {
 	case *Rate:
 		g := d.cancel.current() // before charging, as in chargeWrite
-		stop := l.stopCh()
-		return d.sleep(l.reserve(size), l.startedStopCh(stop), g)
+		wait, stop := l.reserveAt(size, nowNs())
+		return d.sleep(wait, stop, g)
 	case *HierarchicalLimiter:
 		g := d.cancel.current()
 		wait, stop := l.reserve(size)
