@@ -952,7 +952,7 @@ func TestRateConnWallClockDeadline(t *testing.T) {
 	rc.write.cancel.timer.mu.Lock()
 	at := rc.write.cancel.timer.at
 	rc.write.cancel.timer.mu.Unlock()
-	if at.Round(0) == at {
+	if at.Round(0) == at { //nolint:staticcheck // == compares the monotonic reading, which Equal ignores
 		t.Fatal("the limiter keeps a wall-clock deadline without a monotonic reading")
 	}
 	n, err := conn.Write(make([]byte, 1024))

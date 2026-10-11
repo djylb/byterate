@@ -47,7 +47,7 @@ func TestShortReadWaitDeadline(t *testing.T) {
 		r.Get(2000)
 		inner := &deadlineReadConn{scriptedConn: scriptedConn{readBuf: []byte("x")}}
 		c := NewRateConn(inner, r)
-		defer c.Close()
+		defer func() { _ = c.Close() }()
 		if err := c.SetReadDeadline(time.Now().Add(100 * time.Microsecond)); err != nil {
 			t.Fatal(err)
 		}
@@ -85,7 +85,7 @@ func TestHalfCloseWakesLimiter(t *testing.T) {
 				} else {
 					c = NewDuplexRateReadWriteCloser(inner, nil, r)
 				}
-				defer c.Close()
+				defer func() { _ = c.Close() }()
 				done := make(chan ioResult, 1)
 				go func() {
 					var n int
@@ -189,7 +189,7 @@ func TestConcurrentDeadlineSettersStayConsistent(t *testing.T) {
 			inner := &interleavedDeadlineConn{release: make(chan struct{}), entered: make(chan struct{})}
 			inner.readBuf = []byte("x")
 			c := NewRateConn(inner, r)
-			defer c.Close()
+			defer func() { _ = c.Close() }()
 			done := make(chan error, 1)
 			second := make(chan error, 1)
 			past := time.Now().Add(-time.Second)
@@ -238,7 +238,7 @@ func TestConcurrentDeadlineSettersStayConsistent(t *testing.T) {
 func TestDeadlineSettersOfOtherDirectionDoNotWait(t *testing.T) {
 	inner := &interleavedDeadlineConn{release: make(chan struct{}), entered: make(chan struct{})}
 	c := NewRateConn(inner, NewRate(1000))
-	defer c.Close()
+	defer func() { _ = c.Close() }()
 	first := make(chan error, 1)
 	go func() { first <- c.SetReadDeadline(time.Now().Add(time.Minute)) }()
 	<-inner.entered

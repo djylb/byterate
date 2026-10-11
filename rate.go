@@ -25,29 +25,22 @@ type stopSignal struct {
 // ResetLimit, or SetLimit and Start, before use. A Rate must not be copied
 // after first use; use Clone.
 type Rate struct {
-	// Read by every charge and written rarely, so they stay cached on every
-	// core.
+	// Keep the frequently read configuration off the counters' cache line.
+	stop         atomic.Pointer[stopSignal]
 	rate         atomic.Int64 // bytes/s, <=0 => unlimited
 	lastSampleNs atomic.Int64 // start of the sampling window
-	stop         atomic.Pointer[stopSignal]
 	enabled      atomic.Bool
-
-	_ cacheLinePad
-	// Written by every charge, on a cache line of their own.
-	tat      atomic.Int64 // theoretical arrival time (ns since epoch), can be negative
-	bytesAcc atomic.Int64 // bytes charged in the current sampling window, net of refunds
-	_        cacheLinePad
-
+	stopped      bool // protected by mu; fills otherwise unused alignment space
+	_            cacheLinePad
+	// Written by every charge, isolated from configuration and lifecycle state.
+	tat        atomic.Int64 // theoretical arrival time (ns since epoch), can be negative
+	bytesAcc   atomic.Int64 // bytes charged in the current sampling window, net of refunds
+	_          cacheLinePad
 	nowBps     atomic.Int64  // throughput of the last sampling window, bytes/s
-	startEpoch atomic.Uint64 // resetEpoch of the last Start that cleared r
+	startEpoch atomic.Uint64 // generation of the last Start that cleared r
+	debtRate   int64         // the limit tat's debt is reckoned at: the last one above 0
 	mu         sync.Mutex
-	debtRate   int64 // the limit tat's debt is reckoned at: the last one above 0
-	stopped    bool
 }
-
-// resetEpoch counts the Starts that cleared a Rate's debt and meter, so that
-// a refund can tell a charge made before them: see Rate.returnSince.
-var resetEpoch atomic.Uint64
 
 // NewRate returns a started Rate limited to limitBps bytes per second with a
 // full burst available. A limitBps <= 0 means unlimited.
@@ -209,7 +202,7 @@ func (r *Rate) Start() {
 		r.bytesAcc.Store(0)
 		r.lastSampleNs.Store(now)
 		r.nowBps.Store(0)
-		r.startEpoch.Store(resetEpoch.Add(1))
+		r.startEpoch.Add(1)
 	}
 
 	r.enabled.Store(true)
@@ -244,6 +237,11 @@ func (r *Rate) Stop() {
 // charged before the last Start, which cleared the debt and the meter, are
 // refunded all the same; the connection wrappers of this package leave them
 // out.
+//
+// This method takes no receipt: callers must match refunds to limited
+// charges when limits change, and avoid refunding charges cleared by Start.
+// The connection wrappers track both conditions automatically, including
+// meter-only refunds for writes charged while unlimited.
 func (r *Rate) ReturnBucket(size int64) {
 	if r == nil || size <= 0 {
 		return
@@ -254,7 +252,7 @@ func (r *Rate) ReturnBucket(size int64) {
 }
 
 // refund refunds size bytes. r.mu must be held, which serializes it with
-// Start, Stop and SetLimit: the epoch check in returnSince and the
+// Start, Stop and SetLimit: a receipt's generation check and the
 // conversion at debtRate then see the same start and the same limit as the
 // tat they change. Charges still move tat concurrently, hence the CAS.
 func (r *Rate) refund(size int64) {
@@ -281,21 +279,6 @@ func (r *Rate) refund(size int64) {
 		if r.tat.CompareAndSwap(prev, next) {
 			return
 		}
-	}
-}
-
-// returnSince is ReturnBucket for bytes charged when resetEpoch read epoch.
-// It drops them if r has been started since, as Start cleared the debt they
-// added and the meter that counted them: refunding them would credit the
-// new debt and hold the new meter down.
-func (r *Rate) returnSince(size int64, epoch uint64) {
-	if r == nil || size <= 0 {
-		return
-	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if epoch >= r.startEpoch.Load() {
-		r.refund(size)
 	}
 }
 
@@ -349,6 +332,14 @@ func (r *Rate) reserve(size int64) int64 {
 // long the caller must wait. A HierarchicalLimiter passes one now to all its
 // Rates, reading the clock once.
 func (r *Rate) reserveAt(size, now int64) int64 {
+	wait := r.reserveCore(size, now)
+	r.notifyReserved(wait)
+	return wait
+}
+
+// reserveCore is also used by writes holding mu, so that
+// their refund receipt describes the exact generation and limit charged.
+func (r *Rate) reserveCore(size, now int64) int64 {
 	if r == nil || size <= 0 || !r.enabled.Load() {
 		return 0
 	}
@@ -373,18 +364,20 @@ func (r *Rate) reserveAt(size, now int64) int64 {
 		}
 		next := clampAdd(max(prev, minTat), cost)
 		if r.tat.CompareAndSwap(prev, next) {
-			wait := max(next-now, 0)
-			if wait > 0 {
-				if hook := testHookReserved.Load(); hook != nil {
-					(*hook)(r)
-				}
-			}
-			return wait
+			return max(next-now, 0)
 		}
 		// Retry at once with the same now: reading the clock again would
 		// widen the window in which other cores win the race.
 		if !r.enabled.Load() {
 			return 0
+		}
+	}
+}
+
+func (r *Rate) notifyReserved(wait int64) {
+	if wait > 0 {
+		if hook := testHookReserved.Load(); hook != nil {
+			(*hook)(r)
 		}
 	}
 }

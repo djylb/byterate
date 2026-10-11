@@ -89,7 +89,11 @@ duplex := byterate.NewDuplexRateConn(c, byterate.NewRate(8<<20), byterate.NewRat
   earlier window, such as a write canceled by `Close`, is taken off the next
   windows. The connection wrappers drop the refund of a charge made before
   its `Rate` was last started, as `Start` cleared that charge from the debt
-  and the meter. `NewRateConn` charges both directions of a connection to one
+  and the meter. Each write records whether each level actually charged debt:
+  refunding a write charged while unlimited only adjusts its meter, even if
+  a limit was enabled before the write failed. Direct `Get`/`ReturnBucket`
+  calls carry no receipt: callers must coordinate refunds with limit changes
+  and restarts themselves. `NewRateConn` charges both directions of a connection to one
   limiter; `NewDuplexRateConn` and `NewDuplexRateReadWriteCloser` take one per
   direction, so uploads and downloads are limited and metered apart.
 
@@ -97,16 +101,18 @@ duplex := byterate.NewDuplexRateConn(c, byterate.NewRate(8<<20), byterate.NewRat
 
 `Get`, `Now` and `Meter.Add` are lock-free. `ReturnBucket` takes the `Rate`'s
 lock briefly, so that a refund sees the same limit and start as the debt it
-changes; refunds are rare next to charges. Nothing allocates unless a wait
+changes. Connection writes also hold each Rate's lock while charging and
+recording its refund receipt, never while waiting or doing I/O. Up to eight
+hierarchy levels keep these receipts on the stack; larger hierarchies allocate
+one slice per write. Apart from that, charges allocate only when a wait
 needs a timer: a `Get` waiting longer than 2 ms, or a `GetContext` with a
 cancelable context, including the waits of the connection wrappers, waiting
 longer than 200 µs, so that a deadline or `Close` ends even a short wait.
 An already-canceled wait returns without allocating a timer.
-A hierarchical charge reads the clock once for all levels, and
-hot counters sit on cache lines of their own, so `Rate`s and `Meter`s used by
-different cores do not slow each other down; this padding makes a `Rate`
-about 340 bytes and a `Meter` about 300. Wrapping a connection takes at most
-three allocations, about 200 bytes. Setting its deadlines allocates only for
+A hierarchical charge reads the clock once for all levels. Padding separates
+neighboring instances' hot counters; a `Rate` is about 340 bytes and a `Meter`
+about 300. Wrapping a connection takes at most three allocations, about 220
+bytes. Setting its deadlines allocates only for
 the first deadline and after one has expired, and moving a deadline later, as
 servers do before every read, leaves the runtime timer alone. A pending
 deadline does not keep a connection that was never closed from being garbage

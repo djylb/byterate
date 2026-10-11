@@ -548,18 +548,18 @@ func meterWindows(r *Rate) (roll func() int64) {
 	}
 }
 
-// TestRateRefundSinceDropsChargesBeforeReset refunds, after ResetLimit, a
+// TestRateChargeRefundDropsChargesBeforeReset refunds, after ResetLimit, a
 // charge made before it, as a write that ResetLimit woke and that then
 // failed does: the cleared meter must not go below 0, and the refund must
 // not credit the debt charged since.
-func TestRateRefundSinceDropsChargesBeforeReset(t *testing.T) {
+func TestRateChargeRefundDropsChargesBeforeReset(t *testing.T) {
 	r := NewRate(1000)
-	epoch := resetEpoch.Load()
-	r.reserve(1 << 20)
+	var charge rateCharge
+	charge.reserve(r, 1<<20, nowNs())
 	r.ResetLimit(1000)
 	r.reserve(2000)  // spend the new burst
 	r.reserve(10000) // 10s of debt since the reset
-	r.returnSince(1<<20, epoch)
+	charge.refund(1 << 20)
 	if got := metered(r); got != 12000 {
 		t.Fatalf("metered after the stale refund = %d, want 12000", got)
 	}
@@ -568,9 +568,8 @@ func TestRateRefundSinceDropsChargesBeforeReset(t *testing.T) {
 	}
 
 	// A refund of a charge made since the last Start is applied.
-	epoch = resetEpoch.Load()
-	r.reserve(1000)
-	r.returnSince(1000, epoch)
+	charge.reserve(r, 1000, nowNs())
+	charge.refund(1000)
 	if got := metered(r); got != 12001 {
 		t.Fatalf("metered after a current refund = %d, want 12001", got)
 	}

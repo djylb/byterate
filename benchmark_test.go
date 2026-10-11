@@ -2,10 +2,29 @@ package byterate
 
 import (
 	"context"
+	"fmt"
 	"sync/atomic"
 	"testing"
 	"time"
 )
+
+func BenchmarkRateConnWrite(b *testing.B) {
+	for _, levels := range []int{1, 3, 5} {
+		b.Run(fmt.Sprint(levels), func(b *testing.B) {
+			rates := make([]*Rate, levels)
+			for i := range rates {
+				rates[i] = NewRate(benchLimit)
+			}
+			c := NewRateConn(&nopNetConn{}, NewHierarchicalLimiter(rates...))
+			defer func() { _ = c.Close() }()
+			buf := make([]byte, 32<<10)
+			b.ReportAllocs()
+			for b.Loop() {
+				_, _ = c.Write(buf)
+			}
+		})
+	}
+}
 
 func BenchmarkCanceledGetContext(b *testing.B) {
 	r := NewRate(1)
