@@ -24,6 +24,8 @@ type rateConn struct {
 	conn        io.ReadWriteCloser
 	datagram    bool // every Read and Write carries one whole message
 	read, write direction
+	group       *Group      // whose connection slot Close gives back, if set
+	released    atomic.Bool // the slot was given back
 }
 
 // direction holds the limiter charged for one direction of a rateConn and
@@ -198,6 +200,14 @@ func nilLimiter(l Limiter) Limiter {
 		if v == nil {
 			return nil
 		}
+	case *groupReader:
+		if v == nil {
+			return nil
+		}
+	case *groupWriter:
+		if v == nil {
+			return nil
+		}
 	}
 	return l
 }
@@ -318,6 +328,9 @@ func (s *rateConn) Close() error {
 	}
 	s.read.cancel.close()
 	s.write.cancel.close()
+	if s.group != nil && s.released.CompareAndSwap(false, true) {
+		s.group.Release()
+	}
 	return s.conn.Close()
 }
 

@@ -10,5 +10,8 @@
 // a large transfer neither bursts past the limit nor holds a shared one; a
 // Limiter's Ready and Charge methods serve the same purpose for relays that
 // call a hook before each read and after each write. A Counter adds up the
-// bytes transferred and measures their throughput, without limiting them.
+// bytes transferred and measures their throughput, without limiting them. A
+// Group is a level of a tree, such as a server, a user and a tunnel, whose
+// connections are limited and counted at every level, with their number
+// capped where needed.
 package byterate

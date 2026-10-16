@@ -163,3 +163,33 @@ func ExampleNewBudget() {
 	// 0 16106127360
 	// -1 0
 }
+
+// Account for and limit connections in a tree of levels, such as a server, a
+// user, a client and a tunnel: every level counts the bytes and connections
+// below it, caps connections and can set limits of its own.
+func ExampleGroup() {
+	server := byterate.NewGroup(nil)
+	user := byterate.NewGroup(server)
+	tunnel := byterate.NewGroup(user)
+	user.SetReadLimiter(byterate.NewRate(1 << 20)) // 1 MiB/s each way
+	user.SetWriteLimiter(byterate.NewRate(1 << 20))
+	user.SetMaxConns(100)
+
+	client, peer := net.Pipe()
+	defer func() { _ = peer.Close() }()
+	go func() { _, _ = io.Copy(io.Discard, peer) }()
+	conn, err := tunnel.Open(client)
+	if err != nil {
+		return // byterate.ErrTooManyConns
+	}
+	_, _ = conn.Write(make([]byte, 1000))
+	fmt.Println(server.Conns(), user.Conns())
+	_, out := user.Traffic().Load()
+	fmt.Println(out)
+	_ = conn.Close()
+	fmt.Println(server.Conns())
+	// Output:
+	// 1 1
+	// 1000
+	// 0
+}

@@ -178,3 +178,24 @@ func BenchmarkConnWriteShared(b *testing.B) {
 		})
 	}
 }
+
+// BenchmarkGroupWrite writes through a connection opened in the leaf of a
+// tree of four Groups, each with a Rate and its traffic counted.
+func BenchmarkGroupWrite(b *testing.B) {
+	_, user, client, tunnel := tree()
+	root := user.Parent()
+	for _, g := range []*Group{root, user, client, tunnel} {
+		g.SetReadLimiter(NewRate(benchLimit))
+		g.SetWriteLimiter(NewRate(benchLimit))
+	}
+	c, err := tunnel.Open(&nopNetConn{})
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer func() { _ = c.Close() }()
+	buf := make([]byte, 32<<10)
+	b.ReportAllocs()
+	for b.Loop() {
+		_, _ = c.Write(buf)
+	}
+}

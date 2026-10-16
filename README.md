@@ -43,6 +43,39 @@ until `SetLimit`.
 
 ## More
 
+**Groups.** A `Group` is a level of a tree, such as a server, a user, a
+client and a tunnel. A connection opened in a `Group` is limited by every
+level above it, counts in every level's traffic and connections, and each
+level can cap its connections:
+
+```go
+server := byterate.NewGroup(nil)
+user := byterate.NewGroup(server)
+tunnel := byterate.NewGroup(user)
+
+user.SetReadLimiter(byterate.NewRate(10 << 20)) // 10 MiB/s of reads
+user.SetWriteLimiter(byterate.NewRate(2 << 20)) // 2 MiB/s of writes
+user.SetMaxConns(100)
+
+c, err := tunnel.Open(conn) // byterate.ErrTooManyConns past a cap
+if err != nil {
+	return err
+}
+defer c.Close() // gives the slot back
+
+user.Conns()                     // connections of the user and below
+in, out := user.Traffic().Load() // bytes read and written below the user
+tunnel.SetParent(otherUser)      // move the tunnel, its connections with it
+```
+
+`OpenDatagram` and `OpenReadWriteCloser` do the same as `NewDatagramConn`
+and `NewDuplexReadWriteCloser`. `Acquire` and `Release` take and give back a
+slot alone, and `Reader` and `Writer` return the limiters of a group's reads
+and writes, for other wrappers or relays. A level's limiters can be any
+limiter, such as a `Budget` or a `Hierarchy`; `SetTraffic` gives a level a
+`NewSharedCounter` when many connections pass through it at once, such as
+the root.
+
 **Budgets.** A `Budget` counts the bytes used in a period and applies steps
 as they grow: past each step's `After`, its `Limit` slows the traffic down,
 or `Stop` ends it with `ErrBudgetExhausted`:
@@ -186,6 +219,15 @@ or a total that several budgets share, and `SetExpiry` stops all bytes after
 a time. `Reset` drops the usage of the period, so keep what is billed in a
 `Counter`.
 
+**Groups.** Every read and write is charged to the limits of the group and
+each ancestor at that moment, and counted in each one's `Traffic`. After
+`SetParent`, a moved group's connections count in the new ancestors, their
+slots too, even past a cap, which then refuses new connections until enough
+close; the bytes counted before stay with the old ancestors, and a wait in
+progress ends on them. `SetMaxConns` limits the connections of a level and
+everything below it. `Acquire` takes a slot at every level or none. A limiter
+or `Counter` given to several levels is charged once.
+
 **Switching.** After `Switch.Set`, new charges go to the new limiter, and a
 wait in progress on a `Rate` of the old one ends, is refunded there, and
 starts over on the new one. The wrappers and a `Hierarchy` refund to the
@@ -208,7 +250,9 @@ The wrappers use `Ready` to size each `Read` and `Write`.
 
 Charges are lock-free; a refund takes the `Rate`'s lock briefly. A throttled
 connection reuses one timer per direction and does not allocate per `Read` or
-`Write` for hierarchies of up to eight levels. `Wait` and `Ready` called
+`Write` for hierarchies of up to eight levels, nor for groups whose levels
+hold up to eight `Rate`s; a group's levels are rebuilt only after it or an
+ancestor changes. `Wait` and `Ready` called
 directly make a timer for each wait that needs one. Waits of up to 200 µs are
 accumulated as debt rather than slept. Callers waiting on a shared `Rate` are
 spread over several channels, so that many throttled connections do not

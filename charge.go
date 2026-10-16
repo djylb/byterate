@@ -32,6 +32,10 @@ func levelsOf(l Limiter) levels {
 			return levels{h: t.levels}
 		}
 		return levels{}
+	case *groupReader:
+		return levels{h: (*Group)(t).levels(false)}
+	case *groupWriter:
+		return levels{h: (*Group)(t).levels(true)}
 	}
 	return levels{one: level{other: l}}
 }
@@ -125,8 +129,8 @@ func (v *levels) ready(ctx context.Context, t *waitTimer, switchCh <-chan struct
 func (v *levels) readyOthers(ctx context.Context, t *waitTimer, size int64, whole bool) (int64, error) {
 	for i := range v.len() {
 		o := v.at(i).other
-		if o == nil {
-			continue
+		if o == nil || isCounterView(o) {
+			continue // a Counter's view is always ready
 		}
 		var n int64
 		var err error
@@ -200,9 +204,14 @@ func (v *levels) wait(ctx context.Context, t *waitTimer, switchCh <-chan struct{
 			v.reserve(size, nowNs(), receipt, &waits)
 		}
 	}
+	counted := false
 	for i := range n {
 		o := v.at(i).other
 		if o == nil {
+			continue
+		}
+		if isCounterView(o) {
+			counted = true // counted below, once every other level took the bytes
 			continue
 		}
 		charged := o
@@ -223,6 +232,11 @@ func (v *levels) wait(ctx context.Context, t *waitTimer, switchCh <-chan struct{
 			if ctxErr := ctx.Err(); ctxErr != nil && errors.Is(err, ctxErr) {
 				receipt.addOther(charged) // canceled, so it kept the charge
 				receipt.addBudget(budget)
+				if v.hasViews() {
+					// Counted as the kept charge is, for a refund to take off.
+					v.countViews(size)
+					receipt.counted = *v
+				}
 				return size, err
 			}
 			receipt.refund(size)
@@ -232,7 +246,48 @@ func (v *levels) wait(ctx context.Context, t *waitTimer, switchCh <-chan struct{
 		receipt.addOther(charged)
 		receipt.addBudget(budget)
 	}
+	if counted {
+		v.countViews(size)
+		receipt.counted = *v
+	}
 	return size, waits.sleep(t, ctx, switchCh)
+}
+
+// isCounterView reports whether l is a view of a Counter, which never limits.
+func isCounterView(l Limiter) bool {
+	switch l.(type) {
+	case *inboundCounter, *outboundCounter:
+		return true
+	}
+	return false
+}
+
+// hasViews reports whether a level of v is a view of a Counter.
+func (v *levels) hasViews() bool {
+	for i := range v.len() {
+		if o := v.at(i).other; o != nil && isCounterView(o) {
+			return true
+		}
+	}
+	return false
+}
+
+// countViews adds n bytes to the Counters whose views are levels of v.
+func (v *levels) countViews(n int64) {
+	for i := range v.len() {
+		if o := v.at(i).other; o != nil && isCounterView(o) {
+			_ = o.Charge(n)
+		}
+	}
+}
+
+// uncountViews takes n bytes off the Counters whose views are levels of v.
+func (v *levels) uncountViews(n int64) {
+	for i := range v.len() {
+		if o := v.at(i).other; o != nil && isCounterView(o) {
+			o.Refund(n)
+		}
+	}
 }
 
 // reserve charges size to the Rate levels at now, keeping each one's receipt
@@ -267,6 +322,7 @@ type writeCharge struct {
 	moreOthers  []Limiter
 	budget      [2]budgetReceipt
 	moreBudgets []budgetReceipt
+	counted     levels // whose Counter views counted the charge
 }
 
 // addBudget records the receipt of a Budget that took the charge.
@@ -358,6 +414,7 @@ func (c *writeCharge) refund(size int64) {
 	for i := range c.moreBudgets {
 		c.moreBudgets[i].refund(size)
 	}
+	c.counted.uncountViews(size)
 }
 
 // limiter returns the limiter d charges now: d's own, or the current one of

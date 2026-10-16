@@ -75,7 +75,7 @@ func addLevels(lv []level, l Limiter) []level {
 		// Only pointers known to compare are looked up: comparing other
 		// Limiters could panic on an incomparable dynamic type.
 		switch t.(type) {
-		case *Budget, *Switch, *inboundCounter, *outboundCounter:
+		case *Budget, *Switch, *inboundCounter, *outboundCounter, *groupReader, *groupWriter:
 			for _, x := range lv {
 				if x.other == t {
 					return lv
