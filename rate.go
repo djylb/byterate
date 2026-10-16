@@ -154,12 +154,15 @@ type Rate struct {
 }
 
 // NewRate returns a Rate limited to limitBps bytes per second with a full
-// burst available. A limitBps <= 0 means unlimited.
+// burst available. A limitBps <= 0 means unlimited; such a Rate takes no
+// more memory than its own until something is charged to it.
 func NewRate(limitBps int64) *Rate {
 	limitBps = max(limitBps, 0)
 	r := &Rate{debtRate: limitBps}
 	r.rate.Store(limitBps)
-	r.gen.Store(newGeneration(nowNs())) // a full burst, also for a limit set later
+	if limitBps > 0 {
+		r.gen.Store(newGeneration(nowNs())) // the full burst starts now
+	}
 	return r
 }
 
@@ -343,14 +346,15 @@ func (r *Rate) Disable() {
 	}
 }
 
-// Refund gives back n bytes charged by Wait that were not transferred, such
-// as the unwritten part of a short write. A refund never raises the available
-// burst above two seconds' worth of bytes. The bytes also come off the meter: a
-// refund of bytes metered in an earlier sampling window is taken off the
-// following windows. While r is unlimited, the refund still comes off the debt
-// left from the last limit, which SetLimit keeps as bytes. Bytes charged before
-// the last Enable or Reset, which cleared the debt and the meter, are refunded
-// all the same; the connection wrappers of this package leave them out.
+// Refund gives back n bytes charged by Wait or Charge that were not
+// transferred, such as the unwritten part of a short write. A refund never
+// raises the available burst above two seconds' worth of bytes. The bytes also
+// come off the meter: a refund of bytes metered in an earlier sampling window
+// is taken off the following windows. While r is unlimited, the refund still
+// comes off the debt left from the last limit, which SetLimit keeps as bytes.
+// Bytes charged before the last Enable or Reset, which cleared the debt and the
+// meter, are refunded all the same; the connection wrappers of this package
+// leave them out.
 //
 // This method takes no receipt: callers must match refunds to limited charges
 // when limits change, and avoid refunding charges that Enable or Reset cleared.
@@ -405,6 +409,25 @@ func (r *Rate) Wait(ctx context.Context, n int64) error {
 	if sleepNs(wait, g, ctx.Done()) == canceled {
 		return ctx.Err()
 	}
+	return nil
+}
+
+// Ready blocks until r has no debt worth a wait, or until ctx is done, and
+// returns how many of n bytes may pass at once: r's credit or, without
+// enough, a quantum of about 20 ms of traffic, at least 1 byte. It charges
+// nothing; Charge records the bytes that passed.
+func (r *Rate) Ready(ctx context.Context, n int64) (int64, error) {
+	if n <= 0 {
+		return n, nil
+	}
+	v := levels{one: level{rate: r}}
+	return v.ready(ctx, nil, nil, n, false)
+}
+
+// Charge records n transferred bytes without waiting, as debt that the next
+// Ready or Wait waits for. It returns nil.
+func (r *Rate) Charge(n int64) error {
+	r.reserveAt(n, nowNs())
 	return nil
 }
 

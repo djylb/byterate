@@ -50,7 +50,7 @@ func TestHierarchyMetersUnlimitedRates(t *testing.T) {
 	l := NewHierarchy(conn, global)
 	_ = l.Wait(bg, 64<<10)
 	for _, r := range []*Rate{global, conn} {
-		r.gen.Load().lastSampleNs.Store(nowNs() - int64(time.Second))
+		genOf(r).lastSampleNs.Store(nowNs() - int64(time.Second))
 		if got := r.Throughput(); got < 32<<10 {
 			t.Fatalf("Throughput() = %d B/s, want the charged 64 KiB over about a second", got)
 		}
@@ -318,5 +318,40 @@ func TestHierarchyRefundSkipsRestartedLevels(t *testing.T) {
 	}
 	if got := metered(user); got != 0 {
 		t.Fatalf("metered of the restarted level after the refund = %d, want 0", got)
+	}
+}
+
+// A level that refuses a charge refuses it for the Hierarchy: Wait gives the
+// bytes back to every level, while Charge keeps them and reports the refusal.
+func TestHierarchyRefusalRefundsEveryLevel(t *testing.T) {
+	r := NewRate(1 << 20)
+	b := NewBudget(100)
+	l := NewHierarchy(r, b)
+	if err := l.Wait(bg, 1000); !errors.Is(err, ErrBudgetExhausted) {
+		t.Fatalf("Wait(1000) on a 100 B Budget = %v, want ErrBudgetExhausted", err)
+	}
+	if got := metered(r); got != 0 || b.Left() != 100 {
+		t.Fatalf("after a refused Wait the Rate metered %d and the Budget has %d left; want 0 and 100", got, b.Left())
+	}
+	if n, err := l.Ready(bg, 1000); n != 100 || err != nil {
+		t.Fatalf("Ready(1000) = %d, %v; want the Budget's 100", n, err)
+	}
+	if err := l.Charge(1000); !errors.Is(err, ErrBudgetExhausted) || metered(r) != 1000 || b.Left() != -900 {
+		t.Fatalf("Charge(1000) = %v, metered %d, left %d; want ErrBudgetExhausted and the bytes kept", err, metered(r), b.Left())
+	}
+}
+
+// NewHierarchy takes any Limiter: it flattens a Hierarchy given as a level,
+// leaves out nil and repeated levels and collapses to a single one.
+func TestNewHierarchyFlattens(t *testing.T) {
+	r1, r2, b := NewRate(1), NewRate(2), NewBudget(1)
+	s := NewSwitch(nil)
+	inner := NewHierarchy(r1, b)
+	l := NewHierarchy(inner, r2, b, (*Budget)(nil), (*Switch)(nil), s, s, nil).(*Hierarchy)
+	if len(l.levels) != 4 || l.levels[0].rate != r1 || l.levels[1].other != b || l.levels[2].rate != r2 || l.levels[3].other != s {
+		t.Fatalf("levels = %+v, want r1, b, r2, s", l.levels)
+	}
+	if got := NewHierarchy(b, (*Rate)(nil)); got != Limiter(b) {
+		t.Fatalf("NewHierarchy(b, nil) = %v, want b", got)
 	}
 }

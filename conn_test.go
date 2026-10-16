@@ -115,6 +115,13 @@ func (l *plainLimiter) Wait(_ context.Context, size int64) error {
 	return nil
 }
 func (l *plainLimiter) Refund(size int64) { l.returned += size }
+func (l *plainLimiter) Ready(_ context.Context, n int64) (int64, error) {
+	return n, nil
+}
+func (l *plainLimiter) Charge(n int64) error {
+	l.got += n
+	return nil
+}
 
 type ioResult struct {
 	n   int
@@ -534,6 +541,10 @@ type gateLimiter struct {
 }
 
 func (l *gateLimiter) Refund(int64) {}
+func (l *gateLimiter) Ready(_ context.Context, n int64) (int64, error) {
+	return n, nil
+}
+func (l *gateLimiter) Charge(int64) error { return nil }
 func (l *gateLimiter) Wait(ctx context.Context, _ int64) error {
 	l.entered <- ctx
 	<-ctx.Done()
@@ -614,6 +625,10 @@ func TestConnWaitContextStaysEnded(t *testing.T) {
 type derivingLimiter struct{ entered chan struct{} }
 
 func (derivingLimiter) Refund(int64) {}
+func (derivingLimiter) Ready(_ context.Context, n int64) (int64, error) {
+	return n, nil
+}
+func (derivingLimiter) Charge(int64) error { return nil }
 func (l derivingLimiter) Wait(ctx context.Context, _ int64) error {
 	ctx, cancel := context.WithTimeout(ctx, time.Hour)
 	defer cancel()
@@ -748,7 +763,8 @@ func TestConnCloseRead(t *testing.T) {
 	}
 }
 
-// errLimiter is a Limiter whose Wait fails on its own, as an
+// errLimiter is a Limiter that refuses every charge before a transfer with
+// an error of its own, and reports it after taking a transfer's bytes, as an
 // adapter refusing a charge larger than its burst does.
 type errLimiter struct {
 	err           error
@@ -756,8 +772,14 @@ type errLimiter struct {
 }
 
 func (l *errLimiter) Refund(size int64) { l.returned += size }
-func (l *errLimiter) Wait(_ context.Context, size int64) error {
-	l.got += size
+func (l *errLimiter) Wait(context.Context, int64) error {
+	return l.err
+}
+func (l *errLimiter) Ready(_ context.Context, n int64) (int64, error) {
+	return n, nil
+}
+func (l *errLimiter) Charge(n int64) error {
+	l.got += n
 	return l.err
 }
 
@@ -771,11 +793,11 @@ func TestConnPassesLimiterError(t *testing.T) {
 	if n, err := conn.Write([]byte("hello")); n != 0 || !errors.Is(err, wantErr) {
 		t.Fatalf("Write() = %d, %v; want 0, %v", n, err, wantErr)
 	}
-	if l.got != 5 || l.returned != 5 {
-		t.Fatalf("limiter got/returned after failed Write() = %d/%d, want 5/5", l.got, l.returned)
+	if l.got != 0 || l.returned != 0 {
+		t.Fatalf("limiter got/returned after a refused Write() = %d/%d, want 0/0", l.got, l.returned)
 	}
-	if n, err := conn.Read(make([]byte, 8)); n != 3 || !errors.Is(err, wantErr) {
-		t.Fatalf("Read() = %d, %v; want 3, %v", n, err, wantErr)
+	if n, err := conn.Read(make([]byte, 8)); n != 3 || !errors.Is(err, wantErr) || l.got != 3 {
+		t.Fatalf("Read() = %d, %v with %d charged; want 3, %v and the 3 charged", n, err, l.got, wantErr)
 	}
 }
 

@@ -70,11 +70,11 @@ type direction struct {
 //
 // UDP, IP and Unix datagram sockets are never split: each Write is charged
 // and sent whole, and a Read may take a whole datagram. NewDatagramConn does
-// the same for other connections that carry one message per call. A Limiter
-// other than *Rate and *Hierarchy cannot grant part of a request: a Write
-// charges all of its bytes before sending them, and a Read charges what it
-// read after reading it, returning those bytes with an error that ends the
-// wait.
+// the same for other connections that carry one message per call. With a
+// Limiter other than a *Rate, the grant is what its Ready allows; one that
+// refuses bytes, such as an exhausted Budget, ends the Read or Write with its
+// error, a Read keeping the bytes it already read. Through a Switch, a wait
+// starts over on the new Limiter when Set replaces the old one.
 func NewConn(c net.Conn, l Limiter) net.Conn {
 	return NewDuplexConn(c, l, l)
 }
@@ -169,7 +169,7 @@ func (d *direction) lockWrite() error {
 
 func (d *direction) unlockWrite() { <-d.writing }
 
-// nilLimiter returns nil for a nil *Rate or *Hierarchy, which
+// nilLimiter returns nil for a nil *Rate, *Hierarchy, *Budget or *Switch, which
 // limit nothing, so that they do not hide the wrapped connection.
 func nilLimiter(l Limiter) Limiter {
 	switch v := l.(type) {
@@ -178,6 +178,14 @@ func nilLimiter(l Limiter) Limiter {
 			return nil
 		}
 	case *Hierarchy:
+		if v == nil {
+			return nil
+		}
+	case *Budget:
+		if v == nil {
+			return nil
+		}
+	case *Switch:
 		if v == nil {
 			return nil
 		}
@@ -304,24 +312,6 @@ func (s *rateConn) Close() error {
 	return s.conn.Close()
 }
 
-// sleep waits wait in d's timer until Disable on gen or g's end. It returns g's
-// cause if g ended the wait.
-func (d *direction) sleep(wait int64, gen *generation, g *waitGen) error {
-	if wait > coalesceWaitNs && d.timer.sleep(wait, gen, g.Done()) == canceled {
-		return g.cause()
-	}
-	return nil
-}
-
-// sleepSet waits for the levels in waits in d's timer until g's end. It
-// returns g's cause if g ended the wait.
-func (d *direction) sleepSet(waits *waitSet, g *waitGen) error {
-	if waits.n > 0 && !waits.sleep(&d.timer, g.Done()) {
-		return g.cause()
-	}
-	return nil
-}
-
 // Generation states. A generation ends once, by a deadline or by Close.
 const (
 	genOpen uint32 = iota
@@ -390,6 +380,15 @@ func (g *waitGen) end(state uint32) {
 	if !g.done.CompareAndSwap(nil, closedChan) {
 		close(g.done.Load().(chan struct{}))
 	}
+}
+
+// causeOf returns g's cause for an error that g's end produced, through a
+// wait on g as a context, and any other error as it is.
+func (g *waitGen) causeOf(err error) error {
+	if err != nil && g.ended() && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
+		return g.cause()
+	}
+	return err
 }
 
 func (g *waitGen) ended() bool { return g.state.Load() != genOpen }

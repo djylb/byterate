@@ -7,6 +7,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 	"unsafe"
 )
@@ -175,35 +176,6 @@ func TestRateCloneDetachesRuntimeState(t *testing.T) {
 	}
 }
 
-func TestMeterCloneDetachesMutableState(t *testing.T) {
-	original := NewMeter()
-	original.Add(3, 4)
-
-	cloned := original.Clone()
-	if cloned == nil {
-		t.Fatal("Clone() = nil, want detached meter copy")
-	}
-	if cloned == original {
-		t.Fatal("Clone() returned original pointer, want detached copy")
-	}
-	if cloned.inAcc.Load() != original.inAcc.Load() || cloned.outAcc.Load() != original.outAcc.Load() {
-		t.Fatalf("Clone() accumulators = %d/%d, want %d/%d",
-			cloned.inAcc.Load(),
-			cloned.outAcc.Load(),
-			original.inAcc.Load(),
-			original.outAcc.Load(),
-		)
-	}
-
-	cloned.Add(5, 6)
-	if got := original.inAcc.Load(); got != 3 {
-		t.Fatalf("original inAcc after clone mutation = %d, want 3", got)
-	}
-	if got := original.outAcc.Load(); got != 4 {
-		t.Fatalf("original outAcc after clone mutation = %d, want 4", got)
-	}
-}
-
 func TestRateLargeWaitDoesNotPoisonLimiter(t *testing.T) {
 	r := NewRate(10 << 30)
 	if wait := r.reserve(10 << 30); wait != 0 {
@@ -244,9 +216,9 @@ func TestZeroValueRateIsReady(t *testing.T) {
 	var r Rate
 	r.SetLimit(1000)
 	expectFullBurst(t, &r)
-	last := r.gen.Load().lastSampleNs.Load()
-	r.gen.Load().roll(last + int64(2*time.Second))
-	if got := r.gen.Load().nowBps.Load(); got != 1500 {
+	last := genOf(&r).lastSampleNs.Load()
+	genOf(&r).roll(last + int64(2*time.Second))
+	if got := genOf(&r).nowBps.Load(); got != 1500 {
 		t.Fatalf("nowBps after 3000 bytes over 2s = %d, want 1500", got)
 	}
 
@@ -260,7 +232,7 @@ func TestZeroValueRateIsReady(t *testing.T) {
 
 // metered returns the bytes r has metered in its current sampling window,
 // net of refunds.
-func metered(r *Rate) int64 { return r.gen.Load().bytesAcc.Load() }
+func metered(r *Rate) int64 { return genOf(r).bytesAcc.Load() }
 
 // TestRateSetLimitDebt checks that debt is kept as bytes across limit
 // changes, also through a time without a limit, and that Reset drops it.
@@ -383,13 +355,13 @@ func TestRateSetLimitRacesCharges(t *testing.T) {
 func TestRateThroughputReportsZeroWhenIdle(t *testing.T) {
 	r := NewRate(0)
 	r.reserve(500)
-	r.gen.Load().lastSampleNs.Store(nowNs() - int64(2*time.Second))
+	genOf(r).lastSampleNs.Store(nowNs() - int64(2*time.Second))
 	if got := r.Throughput(); got < 200 || got > 250 {
 		t.Fatalf("Throughput()=%d, want about 250", got)
 	}
 
 	// An idle window must read 0, not the earlier bytes spread over more time.
-	r.gen.Load().lastSampleNs.Store(nowNs() - int64(time.Second))
+	genOf(r).lastSampleNs.Store(nowNs() - int64(time.Second))
 	if got := r.Throughput(); got != 0 {
 		t.Fatalf("idle Throughput()=%d, want 0", got)
 	}
@@ -429,13 +401,20 @@ func TestRateWaitCancel(t *testing.T) {
 
 // TestRateStartsWithFullBurstForLaterLimit checks that an unlimited Rate
 // given a limit later starts with the full burst, also early in the process,
-// when the monotonic clock is still below the burst window.
+// when the monotonic clock is still below the burst window, and that an
+// unlimited Rate takes no generation until something is charged to it.
 func TestRateStartsWithFullBurstForLaterLimit(t *testing.T) {
-	for _, r := range []*Rate{NewRate(0), func() *Rate { var r Rate; r.Enable(); return &r }()} {
-		want := nowNs() - burstWindowNs
-		if got := r.gen.Load().tat.Load(); got > want || got < want-int64(time.Second) {
-			t.Fatalf("tat = %d, want about %d (a full burst)", got, want)
-		}
+	unlimited := NewRate(0)
+	if unlimited.gen.Load() != nil {
+		t.Fatal("NewRate(0) made a generation before any charge")
+	}
+	var enabled Rate
+	enabled.Enable()
+	want := nowNs() - burstWindowNs
+	if got := genOf(&enabled).tat.Load(); got > want || got < want-int64(time.Second) {
+		t.Fatalf("tat = %d, want about %d (a full burst)", got, want)
+	}
+	for _, r := range []*Rate{unlimited, &enabled} {
 		r.SetLimit(1000)
 		if wait := r.reserve(2000); wait > int64(time.Millisecond) {
 			t.Fatalf("first 2s of bytes waited %v, want the burst", time.Duration(wait))
@@ -449,11 +428,11 @@ func TestRateStartsWithFullBurstForLaterLimit(t *testing.T) {
 func TestRateMeterCarriesRefunds(t *testing.T) {
 	r := NewRate(0) // unlimited, still metered
 	last := nowNs() + int64(time.Hour)
-	r.gen.Load().lastSampleNs.Store(last) // only roll closes a window
+	genOf(r).lastSampleNs.Store(last) // only roll closes a window
 	roll := func() int64 {
 		last += sampleIntervalNs
-		r.gen.Load().roll(last)
-		return r.gen.Load().nowBps.Load()
+		genOf(r).roll(last)
+		return genOf(r).nowBps.Load()
 	}
 
 	_ = r.Wait(bg, 1000)
@@ -507,8 +486,8 @@ func TestRateCloneDuringEnableDisable(t *testing.T) {
 func TestRateThroughputWhileDisabled(t *testing.T) {
 	r := NewRate(0)
 	r.Disable()
-	r.gen.Load().bytesAcc.Add(1000) // a charge that passed the disabled check before Disable
-	r.gen.Load().lastSampleNs.Store(nowNs() - int64(time.Second))
+	genOf(r).bytesAcc.Add(1000) // a charge that passed the disabled check before Disable
+	genOf(r).lastSampleNs.Store(nowNs() - int64(time.Second))
 	if got := r.Throughput(); got != 0 {
 		t.Fatalf("Throughput() of a disabled Rate = %d, want 0", got)
 	}
@@ -518,11 +497,11 @@ func TestRateThroughputWhileDisabled(t *testing.T) {
 // window, a second long, and returns its throughput.
 func meterWindows(r *Rate) (roll func() int64) {
 	last := nowNs() + int64(time.Hour)
-	r.gen.Load().lastSampleNs.Store(last)
+	genOf(r).lastSampleNs.Store(last)
 	return func() int64 {
 		last += sampleIntervalNs
-		r.gen.Load().roll(last)
-		return r.gen.Load().nowBps.Load()
+		genOf(r).roll(last)
+		return genOf(r).nowBps.Load()
 	}
 }
 
@@ -588,6 +567,7 @@ func TestRateMeterChargeRefundRace(t *testing.T) {
 			for !stop.Load() {
 				r.reserve(1000)
 				r.Refund(1000)
+				runtime.Gosched() // js/wasm does not preempt this loop
 			}
 		})
 	}
@@ -695,5 +675,65 @@ func TestZeroValueEnableRacesFirstCharge(t *testing.T) {
 		if wait := r.reserve(1); wait < int64(9*time.Second) {
 			t.Fatalf("Enable racing with the first charge dropped its debt: wait %v", time.Duration(wait))
 		}
+	}
+}
+
+// Ready waits for the debt alone and grants the credit or a quantum; Charge
+// takes the bytes as debt without waiting, as a relay's hooks use them.
+func TestRateReadyAndCharge(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		r := NewRate(1000)
+		if n, err := r.Ready(bg, 1<<20); n != 2000 || err != nil {
+			t.Fatalf("Ready on a full burst = %d, %v; want the 2000 B burst", n, err)
+		}
+		start := time.Now()
+		if err := r.Charge(4000); err != nil || time.Since(start) != 0 {
+			t.Fatalf("Charge(4000) = %v after %v; want no wait", err, time.Since(start))
+		}
+		n, err := r.Ready(bg, 1<<20)
+		if n != 512 || err != nil || time.Since(start) != 2*time.Second {
+			t.Fatalf("Ready after 2s of debt = %d, %v after %v; want a 512 B quantum after 2s", n, err, time.Since(start))
+		}
+		// A relay's loop passes the limit, however large its buffer.
+		start = time.Now()
+		sent := int64(0)
+		for sent < 10000 {
+			n, _ := r.Ready(bg, 32<<10)
+			sent += n
+			_ = r.Charge(n)
+		}
+		if got := time.Since(start); got < 9*time.Second || got > 11*time.Second {
+			t.Fatalf("10000 B through Ready and Charge at 1000 B/s took %v, want about 10s", got)
+		}
+	})
+}
+
+// Ready ends at once with ctx's error when ctx ends during the wait, as a
+// relay that stops cancels the context of the hook it is blocked in.
+func TestReadyEndsWithContext(t *testing.T) {
+	for name, wrap := range map[string]func(*Rate) Limiter{
+		"Rate":      func(r *Rate) Limiter { return r },
+		"Hierarchy": func(r *Rate) Limiter { return NewHierarchy(r, NewBudget(1<<30)) },
+		"Switch":    func(r *Rate) Limiter { return NewSwitch(r) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				r := NewRate(1000)
+				r.reserve(12000) // 10s of debt past the burst
+				l := wrap(r)
+				ctx, cancel := context.WithCancel(bg)
+				done := make(chan error, 1)
+				go func() {
+					_, err := l.Ready(ctx, 1000)
+					done <- err
+				}()
+				time.Sleep(time.Second)
+				start := time.Now()
+				cancel()
+				if err := <-done; !errors.Is(err, context.Canceled) || time.Since(start) != 0 {
+					t.Fatalf("Ready after cancel = %v after %v, want context.Canceled at once", err, time.Since(start))
+				}
+			})
+		})
 	}
 }

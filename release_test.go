@@ -23,7 +23,7 @@ func TestWriteReceiptRefundsEveryLevel(t *testing.T) {
 					rates[i].Disable()
 				}
 			}
-			c := NewReadWriteCloser(&scriptedConn{writeN: 50}, NewHierarchy(rates...))
+			c := NewReadWriteCloser(&scriptedConn{writeN: 50}, NewHierarchy(limiters(rates...)...))
 			_, _ = c.Write(make([]byte, 200))
 			for i, r := range rates {
 				want := int64(50)
@@ -86,7 +86,7 @@ func TestHierarchyWriteReceipts(t *testing.T) {
 			rates = append(rates, NewRate(1000))
 		}
 		rates[2].Disable()
-		l := NewHierarchy(rates...)
+		l := NewHierarchy(limiters(rates...)...)
 		c := NewReadWriteCloser(&changingWriteConn{change: func() {
 			for _, r := range rates {
 				r.Reset(1000)
@@ -240,7 +240,7 @@ func TestResetRaceLandsInOneGeneration(t *testing.T) {
 					})
 					close(start)
 					wg.Wait()
-					if inNew := r.gen.Load().tat.Load() > nowNs(); inNew && elapsed != 3*time.Second {
+					if inNew := genOf(r).tat.Load() > nowNs(); inNew && elapsed != 3*time.Second {
 						t.Fatalf("charge in the new generation waited %v, want 3s", elapsed)
 					}
 				}
@@ -272,7 +272,7 @@ func TestSaturatedDebtInBubble(t *testing.T) {
 func TestConvertDebtAlwaysChangesTat(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		r := NewRate(1000)
-		g := r.gen.Load()
+		g := genOf(r)
 		before := nowNs() + 1
 		g.tat.Store(before)
 		r.SetLimit(400) // 1 ns at 1000 B/s is 2 ns at 400 B/s, less the 1 ns step
@@ -297,8 +297,8 @@ func TestDisableWakesEveryWaiter(t *testing.T) {
 		}
 		synctest.Wait()
 		used := 0
-		for i := range r.gen.Load().stop.Load().shards {
-			if r.gen.Load().stop.Load().shards[i].Load() != nil {
+		for i := range genOf(r).stop.Load().shards {
+			if genOf(r).stop.Load().shards[i].Load() != nil {
 				used++
 			}
 		}
@@ -307,7 +307,7 @@ func TestDisableWakesEveryWaiter(t *testing.T) {
 		}
 		// The first waiters took the channels of the small first set, which
 		// Disable must close too once a larger set has replaced it.
-		if set := r.gen.Load().stop.Load(); sharedStopShards() > initialStopShards && set.prev == nil {
+		if set := genOf(r).stop.Load(); sharedStopShards() > initialStopShards && set.prev == nil {
 			t.Fatalf("stop set of %d channels did not grow for 400 waiters", len(set.shards))
 		}
 		start := time.Now()
@@ -334,7 +334,7 @@ func TestPrivateRateKeepsSmallStopSet(t *testing.T) {
 			wg.Go(func() { _, _ = c.Read(make([]byte, 100)) })
 			synctest.Wait()
 		}
-		set := r.gen.Load().stop.Load()
+		set := genOf(r).stop.Load()
 		if set == nil || len(set.shards) != initialStopShards || set.made.Load() > 2 {
 			t.Fatalf("a connection's waits made a stop set of %d channels, %d of them used",
 				len(set.shards), set.made.Load())

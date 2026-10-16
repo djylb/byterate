@@ -80,7 +80,7 @@ func TestWaitTimerConcurrentWaits(t *testing.T) {
 				for j := range 20 {
 					wait := time.Duration(i+j+1) * time.Millisecond
 					start := time.Now()
-					if w.sleep(int64(wait), nil, done) != slept {
+					if w.sleep(int64(wait), nil, done, nil) != slept {
 						t.Error("sleep reported a cancellation")
 					}
 					if got := time.Since(start); got != wait {
@@ -91,7 +91,7 @@ func TestWaitTimerConcurrentWaits(t *testing.T) {
 		}
 		wg.Wait()
 		close(done)
-		if w.sleep(int64(time.Second), nil, done) != canceled {
+		if w.sleep(int64(time.Second), nil, done, nil) != canceled {
 			t.Fatal("sleep with done closed reported a full wait")
 		}
 	})

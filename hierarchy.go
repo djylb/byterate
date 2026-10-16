@@ -1,140 +1,140 @@
 package byterate
 
-import (
-	"context"
-	"slices"
-)
+import "context"
 
-// Hierarchy is a Limiter of nested Rates, such as a connection's within its
-// user's within a global one. It charges every Rate and waits until every one
-// allows the bytes, so the strictest sets the pace. Every enabled Rate also
-// meters the traffic, whether or not it has a limit, so each level reports
-// its own Throughput, and a limit set on any of them later applies to the
-// next charge. Disable on a Rate ends the wait it imposes, and the others
-// still apply; a disabled Rate is skipped until Enable.
+// Hierarchy is a Limiter of nested levels, such as a connection's Rate
+// within its user's Rate and Budget within a global Rate. It charges every
+// level and waits until every one allows the bytes, so the strictest sets the
+// pace. Every enabled Rate also meters the traffic, whether or not it has a
+// limit, so each level reports its own Throughput, and a limit set on any of
+// them later applies to the next charge. Disable on a Rate ends the wait it
+// imposes, and the others still apply; a disabled Rate is skipped until
+// Enable.
 //
-// Every Rate is charged when the bytes are, not when the strictest lets them
+// A level that refuses a charge, such as an exhausted Budget, refuses it for
+// the Hierarchy: Wait then gives the bytes back to every level that took
+// them. Charge, which records bytes already transferred, leaves them on every
+// level and returns the refusal.
+//
+// Every level is charged when the bytes are, not when the strictest lets them
 // pass, so a looser Rate counts bytes still waiting on a stricter one. Each
-// keeps its long-run limit, but when many waits on stricter Rates end
+// keeps its long-run limit, but when many waits on stricter levels end
 // together, a looser Rate they share can pass more than its burst at once:
 // up to the bytes of those waits.
 type Hierarchy struct {
-	first  *Rate
-	second *Rate
-	third  *Rate
-	extra  []*Rate
+	levels []level
 }
 
-// NewHierarchy combines rates into one Limiter. Nil rates are left out, and
-// so are repeats, so that a Rate given twice is charged once; unlimited ones
-// are kept, as they meter and can be limited later. It returns nil when no
-// Rate remains and that *Rate itself when one does.
+// NewHierarchy combines limiters into one Limiter, the levels of a Hierarchy
+// among them taking its place. Nil limiters, also nil pointers of this
+// package's types, are left out, and so are repeats of a *Rate, *Budget or
+// *Switch, so that a level given twice is charged once; unlimited Rates are
+// kept, as they meter and can be limited later. It returns nil when no level
+// remains and that level itself when one does.
 //
 // Pass nil for levels that should neither limit nor meter: an unlimited Rate
 // still costs a charge per call.
-func NewHierarchy(rates ...*Rate) Limiter {
-	b := hierarchyBuilder{}
-	for _, r := range rates {
-		b.add(r)
+func NewHierarchy(limiters ...Limiter) Limiter {
+	var lv []level
+	for _, l := range limiters {
+		lv = addLevels(lv, l)
 	}
-	return b.build()
+	switch len(lv) {
+	case 0:
+		return nil
+	case 1:
+		if lv[0].rate != nil {
+			return lv[0].rate
+		}
+		return lv[0].other
+	}
+	return &Hierarchy{levels: lv}
 }
 
-// Wait charges n bytes to every Rate and blocks until every one allows them,
-// or until ctx is done, when it returns ctx.Err() and keeps the charges.
+// addLevels appends the levels of l to lv, unless they are nil or already in
+// it.
+func addLevels(lv []level, l Limiter) []level {
+	switch t := nilLimiter(l).(type) {
+	case nil:
+	case *Hierarchy:
+		for _, inner := range t.levels {
+			if inner.rate != nil {
+				lv = addLevels(lv, inner.rate)
+			} else {
+				lv = addLevels(lv, inner.other)
+			}
+		}
+	case *Rate:
+		for _, x := range lv {
+			if x.rate == t {
+				return lv
+			}
+		}
+		lv = append(lv, level{rate: t})
+	default:
+		// Only pointers known to compare are looked up: comparing other
+		// Limiters could panic on an incomparable dynamic type.
+		switch t.(type) {
+		case *Budget, *Switch:
+			for _, x := range lv {
+				if x.other == t {
+					return lv
+				}
+			}
+		}
+		lv = append(lv, level{other: t})
+	}
+	return lv
+}
+
+// Wait charges n bytes to every level and blocks until every one allows
+// them, or until ctx is done, when it returns ctx.Err() and keeps the
+// charges. A level that refuses them refuses them for l, and every level
+// gets them back.
 func (l *Hierarchy) Wait(ctx context.Context, n int64) error {
-	var waits waitSet
-	l.reserve(n, &waits)
-	if waits.n > 0 && !waits.sleep(nil, ctx.Done()) {
-		return ctx.Err()
+	if l == nil || n <= 0 {
+		return nil
 	}
-	return nil
+	v := levels{h: l.levels}
+	var receipt writeCharge
+	_, err := v.wait(ctx, nil, nil, n, true, &receipt)
+	return err
 }
 
-// Refund gives back n bytes to every Rate.
+// Refund gives back n bytes to every level.
 func (l *Hierarchy) Refund(n int64) {
 	if l == nil || n <= 0 {
 		return
 	}
-	for i := range l.len() {
-		l.rate(i).Refund(n)
-	}
-}
-
-// reserve charges size to every Rate at one point in time, records in waits,
-// unless it is nil, the levels that must wait, and returns the longest wait.
-func (l *Hierarchy) reserve(size int64, waits *waitSet) int64 {
-	if l == nil || size <= 0 {
-		return 0
-	}
-	now := nowNs()
-	var longest int64
-	for i := range l.len() {
-		wait, g := l.rate(i).reserveAt(size, now)
-		waits.add(wait, now, g)
-		longest = max(longest, wait)
-	}
-	return longest
-}
-
-// len returns the number of l's Rates.
-func (l *Hierarchy) len() int {
-	if l.third == nil {
-		return 2
-	}
-	return 3 + len(l.extra)
-}
-
-// rate returns l's i-th Rate.
-func (l *Hierarchy) rate(i int) *Rate {
-	switch i {
-	case 0:
-		return l.first
-	case 1:
-		return l.second
-	case 2:
-		return l.third
-	}
-	return l.extra[i-3]
-}
-
-// allowance returns how much of size every Rate of l lets through at now in
-// one charge: all of it when every Rate's credit covers it, and otherwise
-// the least of what each Rate grants, its credit or its quantum.
-func (l *Hierarchy) allowance(size, now int64) int64 {
-	n := l.len()
-	i := 0
-	for ; i < n; i++ {
-		creditNs, limit := l.rate(i).credit(now)
-		if !covers(size, creditNs, limit) {
-			break
+	for _, lv := range l.levels {
+		if lv.rate != nil {
+			lv.rate.Refund(n)
+		} else {
+			lv.other.Refund(n)
 		}
 	}
-	if i == n {
-		return size
-	}
-	for i = 0; i < n; i++ {
-		size = min(size, l.rate(i).allowance(size, now))
-	}
-	return size
 }
 
-// quantum returns the least quantum of l's Rates, or maxI64 if none limits.
-func (l *Hierarchy) quantum() int64 {
-	q := maxI64
-	for i := range l.len() {
-		q = min(q, l.rate(i).quantum())
+// Ready blocks until every level is ready for a transfer, or until ctx is
+// done, and returns how many of n bytes it may take: the least that any level
+// grants, at least 1. It charges nothing.
+func (l *Hierarchy) Ready(ctx context.Context, n int64) (int64, error) {
+	if l == nil || n <= 0 {
+		return n, nil
 	}
-	return q
+	v := levels{h: l.levels}
+	return v.ready(ctx, nil, nil, n, false)
 }
 
-// debts records in waits the Rates of l whose debt at now is worth a wait.
-func (l *Hierarchy) debts(now int64, waits *waitSet) {
-	for i := range l.len() {
-		if end, g := l.rate(i).debtEnd(now); end != 0 {
-			waits.add(subSat(end, now), now, g)
-		}
+// Charge records n transferred bytes on every level without waiting, as debt
+// that the next Ready waits for. Every level keeps them; it returns the first
+// level's refusal, such as ErrBudgetExhausted.
+func (l *Hierarchy) Charge(n int64) error {
+	if l == nil || n <= 0 {
+		return nil
 	}
+	v := levels{h: l.levels}
+	return v.charge(n)
 }
 
 // levelWait is the wait one level of a hierarchical charge imposes: when it
@@ -144,17 +144,17 @@ type levelWait struct {
 	gen *generation
 }
 
-// waitSet holds the waits of the levels of a hierarchical charge that must
-// wait at all, so that Disable on one level ends the wait that level imposes
-// alone. Up to eight levels fit without allocating.
+// waitSet holds the waits of the Rate levels of a charge that must wait at
+// all, so that Disable on one level ends the wait that level imposes alone.
+// Up to eight levels fit without allocating.
 type waitSet struct {
 	fixed [8]levelWait
 	extra []levelWait
 	n     int
 }
 
-// add records a level's wait of wait from now, which Disable on g ends early. A
-// wait short enough to be coalesced into the debt is left out.
+// add records a level's wait of wait from now, which Disable on g ends early.
+// A wait short enough to be coalesced into the debt is left out.
 func (w *waitSet) add(wait, now int64, g *generation) {
 	if w == nil || wait <= coalesceWaitNs {
 		return
@@ -175,11 +175,15 @@ func (w *waitSet) at(i int) *levelWait {
 	return &w.extra[i-len(w.fixed)]
 }
 
-// sleep waits on t until every level in w allows the bytes, and reports
-// false if done ended the wait first. It sleeps until the level that ends
-// last, which covers the others; if Disable on that level ends its wait, the
-// others still apply.
-func (w *waitSet) sleep(t *waitTimer, done <-chan struct{}) bool {
+// sleep waits on t until every level in w allows the bytes. It sleeps until
+// the level that ends last, which covers the others; if Disable on that
+// level ends its wait, the others still apply. It returns ctx.Err() if ctx
+// ends the wait first, and errSwitched if switchCh closes first.
+func (w *waitSet) sleep(t *waitTimer, ctx context.Context, switchCh <-chan struct{}) error {
+	var done <-chan struct{}
+	if w.n > 0 {
+		done = ctx.Done()
+	}
 	for w.n > 0 {
 		last := 0
 		for i := 1; i < w.n; i++ {
@@ -190,59 +194,20 @@ func (w *waitSet) sleep(t *waitTimer, done <-chan struct{}) bool {
 		lw := *w.at(last)
 		wait := subSat(lw.end, nowNs())
 		if wait <= coalesceWaitNs {
-			return true
+			return nil
 		}
-		switch t.sleep(wait, lw.gen, done) {
+		switch t.sleep(wait, lw.gen, done, switchCh) {
 		case canceled:
-			return false
+			return ctx.Err()
+		case switched:
+			return errSwitched
 		case slept:
-			return true // the wait elapsed, and the others with it
+			return nil // the wait elapsed, and the others with it
 		case stopped:
 			// Disable ended this level's wait alone; the others still apply.
 			*w.at(last) = *w.at(w.n - 1)
 			w.n--
 		}
 	}
-	return true
-}
-
-type hierarchyBuilder struct {
-	first  *Rate
-	second *Rate
-	third  *Rate
-	extra  []*Rate
-	count  int
-}
-
-func (b *hierarchyBuilder) add(r *Rate) {
-	if r == nil || r == b.first || r == b.second || r == b.third || slices.Contains(b.extra, r) {
-		return
-	}
-	switch b.count {
-	case 0:
-		b.first = r
-	case 1:
-		b.second = r
-	case 2:
-		b.third = r
-	default:
-		b.extra = append(b.extra, r)
-	}
-	b.count++
-}
-
-func (b *hierarchyBuilder) build() Limiter {
-	switch b.count {
-	case 0:
-		return nil
-	case 1:
-		return b.first
-	default:
-		return &Hierarchy{
-			first:  b.first,
-			second: b.second,
-			third:  b.third,
-			extra:  b.extra,
-		}
-	}
+	return nil
 }

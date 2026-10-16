@@ -24,13 +24,12 @@ const (
 	maxQuantum = int64(64 << 10)
 )
 
-// epoch is the shared monotonic origin for Rate and Meter timestamps, so zero
-// values and clones need no per-instance clock base and wall-clock steps do
-// not affect sampling. It is set one second in the past so nowNs is never 0,
-// which Meter reserves for "no window started": on coarse clocks (Windows
-// InterruptTime) time.Since(time.Now()) stays 0 until the next tick. Inside
-// a testing/synctest bubble, whose clock starts in 2000, nowNs is negative;
-// arithmetic on it saturates rather than wraps.
+// epoch is the shared monotonic origin for the timestamps of Rates, Counters
+// and Budgets, so zero values and clones need no per-instance clock base and
+// wall-clock steps do not affect them. It is set one second in the past, so
+// that nowNs is positive outside a testing/synctest bubble. Inside one, whose
+// clock starts in 2000, nowNs is negative; arithmetic on it saturates rather
+// than wraps.
 var epoch = time.Now().Add(-time.Second) // Add keeps the monotonic reading
 
 // nowNs returns monotonic nanoseconds since epoch.
@@ -53,12 +52,13 @@ const (
 	slept    sleepResult = iota // the wait elapsed
 	stopped                     // Disable on the generation ended it
 	canceled                    // done was closed first
+	switched                    // a Switch the wait went through changed limiter
 )
 
 // sleepNs waits waitNs, returning early when Disable on g or done ends the
 // wait.
 func sleepNs(waitNs int64, g *generation, done <-chan struct{}) sleepResult {
-	return (*waitTimer)(nil).sleep(waitNs, g, done)
+	return (*waitTimer)(nil).sleep(waitNs, g, done, nil)
 }
 
 // waitTimer keeps the timer of a connection direction's last wait for the
@@ -70,18 +70,18 @@ type waitTimer struct {
 	t atomic.Pointer[time.Timer] // idle timer, nil while a wait holds it
 }
 
-// sleep waits waitNs in w's timer, returning early when Disable on g or done
-// ends the wait. A nil g has no Disable.
+// sleep waits waitNs in w's timer, returning early when Disable on g, done
+// or switched ends the wait. A nil g has no Disable.
 //
-// Without done, a wait of up to shortWaitNs sleeps without a timer and
-// without taking one of g's stop channels: only Disable could end it, and it
-// ends within 2 ms anyway. A wait with done always watches it, however
-// short, since a deadline or Close must end it.
-func (w *waitTimer) sleep(waitNs int64, g *generation, done <-chan struct{}) sleepResult {
+// Without done and switched, a wait of up to shortWaitNs sleeps without a
+// timer and without taking one of g's stop channels: only Disable could end
+// it, and it ends within 2 ms anyway. A wait with done always watches it,
+// however short, since a deadline or Close must end it.
+func (w *waitTimer) sleep(waitNs int64, g *generation, done, switchCh <-chan struct{}) sleepResult {
 	if waitNs <= 0 {
 		return slept
 	}
-	if done == nil && (g == nil || waitNs <= shortWaitNs) {
+	if done == nil && switchCh == nil && (g == nil || waitNs <= shortWaitNs) {
 		time.Sleep(time.Duration(waitNs))
 		return slept
 	}
@@ -92,6 +92,9 @@ func (w *waitTimer) sleep(waitNs int64, g *generation, done <-chan struct{}) sle
 	// two, and the stop channel is shared with other waiters.
 	if signaled(done) {
 		return canceled
+	}
+	if signaled(switchCh) {
+		return switched
 	}
 	stopCh := g.waitCh(w.key())
 	if signaled(stopCh) {
@@ -107,6 +110,8 @@ func (w *waitTimer) sleep(waitNs int64, g *generation, done <-chan struct{}) sle
 		return stopped
 	case <-done:
 		return canceled
+	case <-switchCh:
+		return switched
 	}
 }
 

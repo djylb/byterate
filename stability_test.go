@@ -226,7 +226,7 @@ func TestConcurrentDeadlineSettersStayConsistent(t *testing.T) {
 			// Create debt after the interleaving, since real time elapsed during
 			// it. Keep it above shortWaitNs so the wait watches the deadline
 			// even without the short-wait fix.
-			r.gen.Load().tat.Store(nowNs() + int64(5*time.Millisecond))
+			genOf(r).tat.Store(nowNs() + int64(5*time.Millisecond))
 			if n, err := c.Read(make([]byte, 1)); n != 1 || err != nil {
 				t.Fatalf("Read = %d, %v; limiter still uses the superseded deadline", n, err)
 			}
@@ -270,7 +270,7 @@ func TestShortWaitAllocatesNothing(t *testing.T) {
 		t.Skip("time.Sleep allocates on js")
 	}
 	r := NewRate(1 << 20)
-	g := r.gen.Load()
+	g := genOf(r)
 	short := func() {
 		// Spend the burst before each charge, so that each 1 KiB charge
 		// waits about 1 ms however late the previous sleep woke.
@@ -317,7 +317,7 @@ func TestShortWaitMakesNoStopChannels(t *testing.T) {
 			r := NewRate(1 << 20)
 			_ = r.Wait(bg, 2<<20) // spend the burst, so a 1 KiB charge waits about 1 ms
 			tc.get(r)
-			if set := r.gen.Load().stop.Load(); set != nil {
+			if set := genOf(r).stop.Load(); set != nil {
 				t.Fatalf("short wait made a stop set of %d channels", len(set.shards))
 			}
 		})

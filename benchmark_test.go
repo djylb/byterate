@@ -15,7 +15,7 @@ func BenchmarkConnWrite(b *testing.B) {
 			for i := range rates {
 				rates[i] = NewRate(benchLimit)
 			}
-			c := NewConn(&nopNetConn{}, NewHierarchy(rates...))
+			c := NewConn(&nopNetConn{}, NewHierarchy(limiters(rates...)...))
 			defer func() { _ = c.Close() }()
 			buf := make([]byte, 32<<10)
 			b.ReportAllocs()
@@ -33,7 +33,7 @@ func BenchmarkConnRead(b *testing.B) {
 			for i := range rates {
 				rates[i] = NewRate(benchLimit)
 			}
-			c := NewConn(&recordingConn{}, NewHierarchy(rates...))
+			c := NewConn(&recordingConn{}, NewHierarchy(limiters(rates...)...))
 			defer func() { _ = c.Close() }()
 			buf := make([]byte, 32<<10)
 			b.ReportAllocs()
@@ -132,23 +132,6 @@ func BenchmarkRateThroughput(b *testing.B) {
 	for b.Loop() {
 		_ = r.Throughput()
 	}
-}
-
-func BenchmarkMeterAdd(b *testing.B) {
-	b.Run("single", func(b *testing.B) {
-		m := NewMeter()
-		for b.Loop() {
-			m.Add(32<<10, 0)
-		}
-	})
-	b.Run("parallel", func(b *testing.B) {
-		m := NewMeter()
-		b.RunParallel(func(pb *testing.PB) {
-			for pb.Next() {
-				m.Add(32<<10, 0)
-			}
-		})
-	})
 }
 
 func BenchmarkNewConn(b *testing.B) {
