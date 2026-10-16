@@ -1,6 +1,10 @@
 package byterate
 
 import (
+	"os"
+	"os/exec"
+	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"testing/synctest"
@@ -33,25 +37,35 @@ func TestWaitsInAndOutOfSynctestBubbles(t *testing.T) {
 }
 
 // TestRateConnReusesWaitTimer throttles writes on a connection: the waits
-// after the first must reuse its timer, and so must not allocate.
+// after the first must reuse its timer, and so must not allocate, for a Rate
+// and for a hierarchy whose levels both wait.
 func TestRateConnReusesWaitTimer(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		r := NewRate(1 << 20)
-		c := NewRateConn(&nopNetConn{}, r)
-		r.Get(2 << 20) // the burst
-		buf := make([]byte, 16<<10)
-		_, _ = c.Write(buf) // makes the timer and the generation's Done channel
-		allocs := testing.AllocsPerRun(100, func() {
-			_, _ = c.Write(buf)
+	for _, hierarchical := range []bool{false, true} {
+		t.Run(map[bool]string{false: "rate", true: "hierarchical"}[hierarchical], func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				r, other := NewRate(1<<20), NewRate(1<<20)
+				r.Get(2 << 20) // the burst
+				other.Get(2 << 20)
+				var l Limiter = r
+				if hierarchical {
+					l = NewHierarchicalLimiter(r, other, NewRate(0))
+				}
+				c := NewRateConn(&nopNetConn{}, l)
+				buf := make([]byte, 16<<10)
+				_, _ = c.Write(buf) // makes the timer and the generation's Done channel
+				allocs := testing.AllocsPerRun(100, func() {
+					_, _ = c.Write(buf)
+				})
+				if allocs != 0 {
+					t.Fatalf("throttled Write allocated %v times, want 0", allocs)
+				}
+				_, _ = c.Read(buf)
+				if allocs := testing.AllocsPerRun(100, func() { _, _ = c.Read(buf) }); allocs != 0 {
+					t.Fatalf("throttled Read allocated %v times, want 0", allocs)
+				}
+			})
 		})
-		if allocs != 0 {
-			t.Fatalf("throttled Write allocated %v times, want 0", allocs)
-		}
-		_, _ = c.Read(buf)
-		if allocs := testing.AllocsPerRun(100, func() { _, _ = c.Read(buf) }); allocs != 0 {
-			t.Fatalf("throttled Read allocated %v times, want 0", allocs)
-		}
-	})
+	}
 }
 
 // TestWaitTimerConcurrentWaits waits on one waitTimer from several
@@ -81,4 +95,35 @@ func TestWaitTimerConcurrentWaits(t *testing.T) {
 			t.Fatal("sleep with done closed reported a full wait")
 		}
 	})
+}
+
+// TestWaitTimerDrainsFiredTimer keeps a timer that fired while its wait
+// ended another way. With asynchronous timer channels, which a program built
+// with Go 1.26 can still choose with GODEBUG asynctimerchan=1, the fired
+// value stays in the channel and would end the next wait at once, so the test
+// runs itself again with that setting where the toolchain has it.
+func TestWaitTimerDrainsFiredTimer(t *testing.T) {
+	if os.Getenv("BYTERATE_ASYNC_TIMER_CHILD") == "" && runtime.GOOS != "js" && runtime.GOOS != "wasip1" {
+		cmd := exec.Command(os.Args[0], "-test.run=^TestWaitTimerDrainsFiredTimer$", "-test.count=1")
+		cmd.Env = append(os.Environ(), "GODEBUG=asynctimerchan=1", "BYTERATE_ASYNC_TIMER_CHILD=1")
+		out, err := cmd.CombinedOutput()
+		switch {
+		case err == nil:
+		case strings.Contains(string(out), `removed GODEBUG "asynctimerchan"`):
+			t.Log("this toolchain has synchronous timer channels only")
+		default:
+			t.Fatalf("with asynchronous timer channels: %v\n%s", err, out)
+		}
+	}
+	var w waitTimer
+	fired := time.NewTimer(0)
+	time.Sleep(10 * time.Millisecond) // fires, as during a wait that Stop ended
+	w.put(fired)
+	next := w.take(time.Hour)
+	defer w.put(next)
+	select {
+	case <-next.C:
+		t.Fatal("the next wait saw the value of a timer that fired before")
+	case <-time.After(20 * time.Millisecond):
+	}
 }

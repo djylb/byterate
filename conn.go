@@ -155,7 +155,8 @@ func (s *rateConn) Write(b []byte) (n int, err error) {
 	}
 	n, err = s.conn.Write(b)
 	if limited && n < len(b) {
-		charge.refund(int64(len(b) - n))
+		// No more than the charge, even for a writer that reports n < 0.
+		charge.refund(int64(len(b) - max(n, 0)))
 	}
 	return
 }
@@ -212,12 +213,13 @@ func (s *rateConn) wait(d *direction, size int64) error {
 	switch l := d.rate.(type) {
 	case *Rate:
 		g := d.cancel.current() // before charging, as in chargeWrite
-		wait, stop := l.reserveAt(size, nowNs())
-		return d.sleep(wait, stop, g)
+		wait, gen := l.reserveAt(size, nowNs())
+		return d.sleep(wait, gen, g)
 	case *HierarchicalLimiter:
 		g := d.cancel.current()
-		wait, stop := l.reserve(size)
-		return d.sleep(wait, stop, g)
+		var waits waitSet
+		l.reserve(size, &waits)
+		return d.sleepSet(&waits, g)
 	}
 	switch {
 	case d.ctxRate != nil:
@@ -234,10 +236,19 @@ func (s *rateConn) wait(d *direction, size int64) error {
 	return nil
 }
 
-// sleep waits wait in d's timer until stop or g's end. It returns g's cause
-// if g ended the wait.
-func (d *direction) sleep(wait int64, stop <-chan struct{}, g *waitGen) error {
-	if wait > coalesceWaitNs && !d.timer.sleep(wait, stop, g.Done()) {
+// sleep waits wait in d's timer until Stop on gen or g's end. It returns g's
+// cause if g ended the wait.
+func (d *direction) sleep(wait int64, gen *generation, g *waitGen) error {
+	if wait > coalesceWaitNs && !d.timer.sleep(wait, gen.waitCh(d.timer.key()), g.Done()) {
+		return g.cause()
+	}
+	return nil
+}
+
+// sleepSet waits for the levels in waits in d's timer until g's end. It
+// returns g's cause if g ended the wait.
+func (d *direction) sleepSet(waits *waitSet, g *waitGen) error {
+	if waits.n > 0 && !waits.sleep(&d.timer, g.Done()) {
 		return g.cause()
 	}
 	return nil

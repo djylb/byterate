@@ -2,8 +2,10 @@ package byterate
 
 import (
 	"math/bits"
+	"math/rand/v2"
 	"sync/atomic"
 	"time"
+	"unsafe"
 )
 
 const (
@@ -19,7 +21,9 @@ const (
 // values and clones need no per-instance clock base and wall-clock steps do
 // not affect sampling. It is set one second in the past so nowNs is never 0,
 // which Meter reserves for "no window started": on coarse clocks (Windows
-// InterruptTime) time.Since(time.Now()) stays 0 until the next tick.
+// InterruptTime) time.Since(time.Now()) stays 0 until the next tick. Inside
+// a testing/synctest bubble, whose clock starts in 2000, nowNs is negative;
+// arithmetic on it saturates rather than wraps.
 var epoch = time.Now().Add(-time.Second) // Add keeps the monotonic reading
 
 // nowNs returns monotonic nanoseconds since epoch.
@@ -27,9 +31,13 @@ func nowNs() int64 {
 	return int64(time.Since(epoch))
 }
 
-// cacheLinePad separates fields written by different cores. 128 bytes covers
-// the 128-byte lines of Apple silicon and the adjacent-line prefetch of x86.
-type cacheLinePad [128]byte
+// cacheLineSize covers the 128-byte lines of Apple silicon and the
+// adjacent-line prefetch of x86. Objects whose size is a multiple of it are
+// aligned to it by the allocator.
+const cacheLineSize = 128
+
+// cacheLinePad separates fields written by different cores.
+type cacheLinePad [cacheLineSize]byte
 
 // sleepNs waits waitNs, returning early when stopCh or done is closed.
 // It reports false only when done was closed before the wait elapsed.
@@ -61,13 +69,14 @@ func (w *waitTimer) sleep(waitNs int64, stopCh, done <-chan struct{}) bool {
 	}
 	// A canceled operation needs no timer, including repeated writes after
 	// Close. Keep the check before taking one, but do not skip a live
-	// cancellation signal even for a sub-millisecond wait.
-	select {
-	case <-done:
+	// cancellation signal even for a sub-millisecond wait. A receive from one
+	// channel takes no lock while the channel is open, unlike a select of
+	// two, and the stop channel is shared with other waiters.
+	if signaled(done) {
 		return false
-	case <-stopCh:
+	}
+	if signaled(stopCh) {
 		return true
-	default:
 	}
 
 	t := w.take(time.Duration(waitNs))
@@ -82,13 +91,34 @@ func (w *waitTimer) sleep(waitNs int64, stopCh, done <-chan struct{}) bool {
 	}
 }
 
+// key spreads the waiters of a shared Rate over its generation's stop
+// channels while keeping a connection direction on one, so that a Rate of
+// its own makes no more channels than it has directions waiting. A nil w,
+// the waiter of a plain Get, takes one at random.
+func (w *waitTimer) key() uint32 {
+	if w == nil {
+		return rand.Uint32()
+	}
+	return uint32(uint64(uintptr(unsafe.Pointer(w))) * 0x9E3779B97F4A7C15 >> 32)
+}
+
+// signaled reports whether ch is closed.
+func signaled(ch <-chan struct{}) bool {
+	select {
+	case <-ch:
+		return true
+	default:
+		return false
+	}
+}
+
 // take returns a timer set to fire after d: w's idle one, or a new one if a
 // concurrent wait holds it.
 func (w *waitTimer) take(d time.Duration) *time.Timer {
 	if w != nil {
 		if t := w.t.Swap(nil); t != nil {
-			// Since Go 1.23 a receive after Reset never sees a value of the
-			// timer's earlier settings, so the channel needs no draining.
+			// put left the channel empty, so a receive sees this setting
+			// alone.
 			t.Reset(d)
 			return t
 		}
@@ -98,7 +128,15 @@ func (w *waitTimer) take(d time.Duration) *time.Timer {
 
 // put stops t and keeps it for w's next wait.
 func (w *waitTimer) put(t *time.Timer) {
-	t.Stop()
+	if !t.Stop() {
+		// A timer that fired keeps its value in the channel when the program
+		// runs with asynchronous timer channels (GODEBUG asynctimerchan=1),
+		// which would end the next wait at once.
+		select {
+		case <-t.C:
+		default:
+		}
+	}
 	if w != nil {
 		w.t.CompareAndSwap(nil, t)
 	}
@@ -152,6 +190,18 @@ func clampAdd(a, b int64) int64 {
 		return maxI64
 	}
 	return a + b
+}
+
+// subSat returns a-b, saturated to the int64 range.
+func subSat(a, b int64) int64 {
+	d := a - b
+	if (a < 0) != (b < 0) && (d < 0) != (a < 0) {
+		if a < 0 {
+			return minI64
+		}
+		return maxI64
+	}
+	return d
 }
 
 func clampSub(a, b int64) int64 {

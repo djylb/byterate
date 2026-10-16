@@ -4,10 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+	"unsafe"
 )
 
 func TestBytesToNsCeil(t *testing.T) {
@@ -259,9 +261,9 @@ func TestZeroValueRateLimitsAfterStart(t *testing.T) {
 	r.SetLimit(1000)
 	r.Start()
 	expectFullBurst(t, &r)
-	last := r.lastSampleNs.Load()
-	r.updateRateWithNow(last + int64(2*time.Second))
-	if got := r.nowBps.Load(); got != 1500 {
+	last := r.gen.Load().lastSampleNs.Load()
+	r.gen.Load().roll(last + int64(2*time.Second))
+	if got := r.gen.Load().nowBps.Load(); got != 1500 {
 		t.Fatalf("nowBps after 3000 bytes over 2s = %d, want 1500", got)
 	}
 
@@ -275,7 +277,7 @@ func TestZeroValueRateLimitsAfterStart(t *testing.T) {
 
 // metered returns the bytes r has metered in its current sampling window,
 // net of refunds.
-func metered(r *Rate) int64 { return r.bytesAcc.Load() }
+func metered(r *Rate) int64 { return r.gen.Load().bytesAcc.Load() }
 
 // TestRateSetLimitDebt checks that debt is kept as bytes across limit
 // changes, also through a time without a limit, and that ResetLimit drops it.
@@ -365,6 +367,9 @@ func TestRateSetLimitRacesCharges(t *testing.T) {
 			wg.Go(func() {
 				for !stop.Load() {
 					r.reserve(1 << 10)
+					// Lets the test go on where goroutines are not
+					// preempted, as on js/wasm.
+					runtime.Gosched()
 				}
 			})
 		}
@@ -395,7 +400,7 @@ func TestRateSetLimitRacesCharges(t *testing.T) {
 func TestRateMarshalJSONReportsZeroWhenIdle(t *testing.T) {
 	r := NewRate(0)
 	r.reserve(500)
-	r.lastSampleNs.Store(nowNs() - int64(2*time.Second))
+	r.gen.Load().lastSampleNs.Store(nowNs() - int64(2*time.Second))
 
 	nowRate := func() int64 {
 		b, err := r.MarshalJSON()
@@ -413,7 +418,7 @@ func TestRateMarshalJSONReportsZeroWhenIdle(t *testing.T) {
 	}
 
 	// An idle window must read 0, not the earlier bytes spread over more time.
-	r.lastSampleNs.Store(nowNs() - int64(time.Second))
+	r.gen.Load().lastSampleNs.Store(nowNs() - int64(time.Second))
 	if got := nowRate(); got != 0 {
 		t.Fatalf("idle MarshalJSON NowRate=%d, want 0", got)
 	}
@@ -456,7 +461,7 @@ func TestRateGetContextCancel(t *testing.T) {
 func TestRateStartsWithFullBurstForLaterLimit(t *testing.T) {
 	for _, r := range []*Rate{NewRate(0), func() *Rate { var r Rate; r.Start(); return &r }()} {
 		want := nowNs() - burstWindowNs
-		if got := r.tat.Load(); got > want || got < want-int64(time.Second) {
+		if got := r.gen.Load().tat.Load(); got > want || got < want-int64(time.Second) {
 			t.Fatalf("tat = %d, want about %d (a full burst)", got, want)
 		}
 		r.SetLimit(1000)
@@ -472,11 +477,11 @@ func TestRateStartsWithFullBurstForLaterLimit(t *testing.T) {
 func TestRateMeterCarriesRefunds(t *testing.T) {
 	r := NewRate(0) // unlimited, still metered
 	last := nowNs() + int64(time.Hour)
-	r.lastSampleNs.Store(last) // only roll closes a window
+	r.gen.Load().lastSampleNs.Store(last) // only roll closes a window
 	roll := func() int64 {
 		last += sampleIntervalNs
-		r.updateRateWithNow(last)
-		return r.nowBps.Load()
+		r.gen.Load().roll(last)
+		return r.gen.Load().nowBps.Load()
 	}
 
 	r.Get(1000)
@@ -529,8 +534,8 @@ func TestRateCloneDuringStartStop(t *testing.T) {
 func TestRateNowWhileStopped(t *testing.T) {
 	r := NewRate(0)
 	r.Stop()
-	r.bytesAcc.Add(1000) // a charge that passed the enabled check before Stop
-	r.lastSampleNs.Store(nowNs() - int64(time.Second))
+	r.gen.Load().bytesAcc.Add(1000) // a charge that passed the enabled check before Stop
+	r.gen.Load().lastSampleNs.Store(nowNs() - int64(time.Second))
 	if got := r.Now(); got != 0 {
 		t.Fatalf("Now() of a stopped Rate = %d, want 0", got)
 	}
@@ -540,11 +545,11 @@ func TestRateNowWhileStopped(t *testing.T) {
 // window, a second long, and returns its throughput.
 func meterWindows(r *Rate) (roll func() int64) {
 	last := nowNs() + int64(time.Hour)
-	r.lastSampleNs.Store(last)
+	r.gen.Load().lastSampleNs.Store(last)
 	return func() int64 {
 		last += sampleIntervalNs
-		r.updateRateWithNow(last)
-		return r.nowBps.Load()
+		r.gen.Load().roll(last)
+		return r.gen.Load().nowBps.Load()
 	}
 }
 
@@ -644,5 +649,21 @@ func TestRateMeterCarriesRefundPastNettedWindow(t *testing.T) {
 	r.reserve(50_000)
 	if got := roll(); got != 0 {
 		t.Fatalf("next window = %d B/s, want 0 with the rest of A's refund", got)
+	}
+}
+
+// TestLayoutFillsCacheLines checks the sizes that keep a Rate's fields off
+// other data's cache lines: a Rate fills one line, and a generation two,
+// with the counters every charge writes alone on the second.
+func TestLayoutFillsCacheLines(t *testing.T) {
+	if got := unsafe.Sizeof(Rate{}); got != cacheLineSize {
+		t.Errorf("Rate is %d bytes, want %d", got, cacheLineSize)
+	}
+	var g generation
+	if got := unsafe.Sizeof(g); got != 2*cacheLineSize {
+		t.Errorf("generation is %d bytes, want %d", got, 2*cacheLineSize)
+	}
+	if got := unsafe.Offsetof(g.tat); got != cacheLineSize {
+		t.Errorf("generation.tat at offset %d, want %d", got, cacheLineSize)
 	}
 }

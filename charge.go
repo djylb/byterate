@@ -6,7 +6,7 @@ package byterate
 // since the charge voids it.
 type rateCharge struct {
 	rate *Rate
-	gen  *stopSignal
+	gen  *generation
 	debt bool
 }
 
@@ -19,19 +19,18 @@ type writeCharge struct {
 }
 
 // reserve charges size to r at now and fills in c. It takes no lock: the
-// charge reports the generation its debt landed in. The meter of a charge
-// racing with Start may count it on either side, so a charge of the meter
-// alone leaves no receipt if the generation changed during it.
-func (c *rateCharge) reserve(r *Rate, size, now int64) (int64, <-chan struct{}) {
+// charge reports the generation it was metered and charged in, whose Stop
+// ends the wait it returns.
+func (c *rateCharge) reserve(r *Rate, size, now int64) (int64, *generation) {
 	if r == nil {
 		return 0, nil
 	}
-	wait, gen, metered, debt := r.reserveCore(size, now)
-	if debt || metered && gen != nil && r.stop.Load() == gen {
-		c.rate, c.gen, c.debt = r, gen, debt
+	wait, g, metered, debt := r.reserveCore(size, now)
+	if metered {
+		c.rate, c.gen, c.debt = r, g, debt
 	}
 	r.notifyReserved(wait)
-	return wait, gen.stopCh()
+	return wait, g
 }
 
 func (c *rateCharge) refund(size int64) {
@@ -41,13 +40,9 @@ func (c *rateCharge) refund(size int64) {
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if !r.enabled.Load() || r.stop.Load() != c.gen {
-		return
-	}
-	if c.debt {
-		r.refund(size)
-	} else {
-		r.bytesAcc.Add(-size)
+	// Stop, or a Start that retired the generation, cleared the charge.
+	if r.enabled.Load() && r.gen.Load() == c.gen {
+		r.refund(c.gen, size, c.debt)
 	}
 }
 
@@ -67,20 +62,18 @@ func (c *writeCharge) refund(size int64) {
 func (s *rateConn) chargeWrite(size int64, receipt *writeCharge) error {
 	d := &s.write
 	// Capture the deadline generation before charging, just as Read does.
-	var g *waitGen
-	var wait int64
-	var stop <-chan struct{}
 	switch l := d.rate.(type) {
 	case *Rate:
-		g = d.cancel.current()
-		wait, stop = receipt.fixed[0].reserve(l, size, nowNs())
+		g := d.cancel.current()
+		wait, gen := receipt.fixed[0].reserve(l, size, nowNs())
+		return d.sleep(wait, gen, g)
 	case *HierarchicalLimiter:
-		g = d.cancel.current()
+		g := d.cancel.current()
 		now := nowNs()
+		var waits waitSet
 		charge := func(c *rateCharge, r *Rate) {
-			if delay, signal := c.reserve(r, size, now); delay > wait {
-				wait, stop = delay, signal
-			}
+			wait, gen := c.reserve(r, size, now)
+			waits.add(wait, now, gen)
 		}
 		charge(&receipt.fixed[0], l.first)
 		charge(&receipt.fixed[1], l.second)
@@ -98,9 +91,9 @@ func (s *rateConn) chargeWrite(size int64, receipt *writeCharge) error {
 				}
 			}
 		}
+		return d.sleepSet(&waits, g)
 	default:
 		receipt.custom = l
 		return s.wait(d, size)
 	}
-	return d.sleep(wait, stop, g)
 }

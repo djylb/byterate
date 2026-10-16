@@ -49,13 +49,18 @@ jobs:
         with:
           go-version-file: go.mod
           cache: false
-      - name: Vet and compile tests
+      - name: Vet and compile tests, run them where the runner can
         env:
           TARGET: ${{ matrix.target }}
         run: |
           export GOOS="${TARGET%/*}" GOARCH="${TARGET#*/}"
           go vet ./...
           go test -c -o /dev/null .
+          # The runner executes 32-bit x86 binaries, and js/wasm with Node.
+          case "$TARGET" in
+            linux/386) go test ./... ;;
+            js/wasm) go test -exec="$(go env GOROOT)/lib/wasm/go_js_wasm_exec" ./... ;;
+          esac
 
   gofmt:
     runs-on: ubuntu-latest

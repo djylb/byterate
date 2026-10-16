@@ -5,6 +5,7 @@ import (
 	"errors"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -49,7 +50,7 @@ func TestHierarchicalLimiterMetersUnlimitedRates(t *testing.T) {
 	l := NewHierarchicalLimiter(conn, global)
 	l.Get(64 << 10)
 	for _, r := range []*Rate{global, conn} {
-		r.lastSampleNs.Store(nowNs() - int64(time.Second))
+		r.gen.Load().lastSampleNs.Store(nowNs() - int64(time.Second))
 		if got := r.Now(); got < 32<<10 {
 			t.Fatalf("Now() = %d B/s, want the charged 64 KiB over about a second", got)
 		}
@@ -63,7 +64,7 @@ func TestHierarchicalLimiterAppliesLaterLimit(t *testing.T) {
 	l := NewHierarchicalLimiter(later, NewRate(0)).(*HierarchicalLimiter)
 	later.SetLimit(1000)
 	// Two seconds' burst is free; the third second of bytes must wait.
-	if wait, _ := l.reserve(3000); wait < int64(900*time.Millisecond) {
+	if wait := l.reserve(3000, nil); wait < int64(900*time.Millisecond) {
 		t.Fatalf("wait = %v, want about a second", time.Duration(wait))
 	}
 }
@@ -96,30 +97,46 @@ func TestHierarchicalLimiterRefundsAllChildrenOnShortWrite(t *testing.T) {
 	}
 }
 
-func TestHierarchicalLimiterWakeOnPrimaryRateStop(t *testing.T) {
-	first := NewRate(1)
-	first.Start()
-	second := NewRate(1)
-	second.Start()
-
-	limiter := NewHierarchicalLimiter(first, second)
-	done := make(chan struct{})
-	start := time.Now()
-	go func() {
-		limiter.Get(10)
-		close(done)
-	}()
-
-	time.Sleep(20 * time.Millisecond)
-	first.Stop()
-
-	select {
-	case <-done:
-		if elapsed := time.Since(start); elapsed > 250*time.Millisecond {
-			t.Fatalf("HierarchicalLimiter.Get() returned after %s, want fast wake on stop", elapsed)
-		}
-	case <-time.After(500 * time.Millisecond):
-		t.Fatal("HierarchicalLimiter.Get() did not wake after primary rate stop")
+// TestHierarchicalStopEndsOnlyThatLevelsWait restarts the strictest level of
+// a hierarchy while a caller waits: the wait that level imposed ends, but
+// the other level's still applies, in every way of charging a hierarchy.
+func TestHierarchicalStopEndsOnlyThatLevelsWait(t *testing.T) {
+	cases := map[string]func(l Limiter) error{
+		"Get": func(l Limiter) error { l.Get(1000); return nil },
+		"GetContext": func(l Limiter) error {
+			return l.(ContextLimiter).GetContext(context.Background(), 1000)
+		},
+		"Read": func(l Limiter) error {
+			_, err := NewRateConn(&nopNetConn{}, l).Read(make([]byte, 1000))
+			return err
+		},
+		"Write": func(l Limiter) error {
+			_, err := NewRateConn(&nopNetConn{}, l).Write(make([]byte, 1000))
+			return err
+		},
+	}
+	for name, charge := range cases {
+		t.Run(name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				global, user := NewRate(1000), NewRate(1000)
+				global.reserve(2000 + 5000) // the burst and 5s of debt
+				user.reserve(2000 + 10000)  // the burst and 10s of debt
+				l := NewHierarchicalLimiter(global, user)
+				start := time.Now()
+				done := make(chan time.Duration, 1)
+				go func() {
+					if err := charge(l); err != nil {
+						t.Error(err)
+					}
+					done <- time.Since(start)
+				}()
+				time.Sleep(time.Second)
+				user.ResetLimit(1000)
+				if got := <-done; got != 6*time.Second {
+					t.Fatalf("waited %v after the user level was restarted, want the global level's 6s", got)
+				}
+			})
+		})
 	}
 }
 
@@ -234,8 +251,8 @@ func TestStopBetweenChargeAndWait(t *testing.T) {
 					once.Do(func() { strict.ResetLimit(0) })
 				}
 			}
-			testHookReserved.Store(&hook)
-			defer testHookReserved.Store(nil)
+			testHooks.reserved.Store(&hook)
+			defer testHooks.reserved.Store(nil)
 
 			done := make(chan struct{})
 			go func() {
@@ -268,7 +285,7 @@ func TestHierarchicalLimiterChargesRepeatedRateOnce(t *testing.T) {
 	}
 	other := NewRate(0)
 	l := NewHierarchicalLimiter(r, other, r, other, r).(*HierarchicalLimiter)
-	if wait, _ := l.reserve(2000); wait != 0 {
+	if wait := l.reserve(2000, nil); wait != 0 {
 		t.Fatalf("reserve(2000) within the burst wait=%s, want 0", time.Duration(wait))
 	}
 	for _, rate := range []*Rate{r, other} {

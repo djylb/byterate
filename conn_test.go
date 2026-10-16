@@ -72,6 +72,21 @@ func TestRateConnWriteRefundsShortWrite(t *testing.T) {
 	}
 }
 
+// negativeWriteConn reports a negative count, as a broken writer may.
+type negativeWriteConn struct{ scriptedConn }
+
+func (*negativeWriteConn) Write([]byte) (int, error) { return -1, errors.New("broken writer") }
+
+// A writer reporting n < 0 must not get more than the charge refunded.
+func TestRateConnNegativeWriteRefundsTheChargeOnly(t *testing.T) {
+	r := NewRate(1000)
+	conn := NewRateReadWriteCloser(&negativeWriteConn{}, r)
+	_, _ = conn.Write(make([]byte, 1000))
+	if got := metered(r); got != 0 {
+		t.Fatalf("metered after a write reporting -1 = %d, want 0", got)
+	}
+}
+
 func TestRateConnNilConnectionReturnsError(t *testing.T) {
 	conn := NewRateReadWriteCloser(nil, NewRate(1024))
 	if _, err := conn.Read(make([]byte, 1)); !errors.Is(err, ErrNilConn) {

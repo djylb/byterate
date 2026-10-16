@@ -118,8 +118,8 @@ func TestHierarchyRestartBeforeLevelCharge(t *testing.T) {
 				first.Stop()
 			}
 		}
-		testHookReserved.Store(&hook)
-		defer testHookReserved.Store(nil)
+		testHooks.reserved.Store(&hook)
+		defer testHooks.reserved.Store(nil)
 		c := NewRateReadWriteCloser(&scriptedConn{writeErr: errors.New("failed")}, NewHierarchicalLimiter(first, second))
 		_, _ = c.Write(make([]byte, 4))
 		if got := metered(second); got != 0 {
@@ -137,8 +137,8 @@ func restartOnCharge(t *testing.T, r *Rate) {
 			once.Do(func() { r.ResetLimit(r.Limit()) })
 		}
 	}
-	testHookCharging.Store(&hook)
-	t.Cleanup(func() { testHookCharging.Store(nil) })
+	testHooks.charging.Store(&hook)
+	t.Cleanup(func() { testHooks.charging.Store(nil) })
 }
 
 // TestChargeAfterConcurrentRestart charges a Rate that is restarted between
@@ -190,6 +190,14 @@ func TestChargeAfterConcurrentRestart(t *testing.T) {
 				if got := time.Since(start); got != 2*time.Second {
 					t.Fatalf("4000 B at 1000 B/s after a restart restoring a 2000 B burst waited %v, want 2s", got)
 				}
+				// The new generation meters the charge once, and its refund.
+				wantMeter := int64(4000)
+				if name == "FailedWrite" {
+					wantMeter = 0
+				}
+				if got := metered(r); got != wantMeter {
+					t.Fatalf("meter after the charge = %d, want %d", got, wantMeter)
+				}
 				want := int64(0) // the refund restores the burst
 				if name != "FailedWrite" {
 					want = int64(2 * time.Second) // the 2000 B on top of the 4000
@@ -202,40 +210,107 @@ func TestChargeAfterConcurrentRestart(t *testing.T) {
 	}
 }
 
-// TestChargeWaitsForResettingStart charges a Rate whose Start has stored a
-// new generation but not yet reset tat: the charge must wait for the reset
-// and land after it, in the new generation. It runs on the real clock, as a
-// goroutine blocked on a mutex is not durably blocked in a synctest bubble.
-func TestChargeWaitsForResettingStart(t *testing.T) {
-	r := NewRate(1000)
-	r.reserve(10000) // 10s of debt in the old generation
-	r.mu.Lock()      // a Start in progress
-	gen := &stopSignal{ch: make(chan struct{})}
-	r.stop.Store(gen)
-	type result struct {
-		wait int64
-		stop <-chan struct{}
+// TestRestartRaceLandsInOneGeneration races a charge that must wait with a
+// restart on a clock that does not move, as within one tick of a coarse
+// clock, where a new generation starts with the same debt the old one had.
+// The charge must land in one generation and act in that one alone: if its
+// debt is in the new generation, it must wait there.
+func TestRestartRaceLandsInOneGeneration(t *testing.T) {
+	for _, refunded := range []bool{false, true} {
+		t.Run(map[bool]string{false: "fresh", true: "refunded"}[refunded], func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				for range 20000 {
+					r := NewRate(1000)
+					if refunded {
+						r.reserve(1000)
+						r.ReturnBucket(1000) // tat back at the burst floor
+					}
+					var elapsed time.Duration
+					var wg sync.WaitGroup
+					start := make(chan struct{})
+					wg.Go(func() {
+						<-start
+						s := time.Now()
+						r.Get(5000) // 3s after the 2s burst
+						elapsed = time.Since(s)
+					})
+					wg.Go(func() {
+						<-start
+						r.Stop()
+						r.Start()
+					})
+					close(start)
+					wg.Wait()
+					if inNew := r.gen.Load().tat.Load() > nowNs(); inNew && elapsed != 3*time.Second {
+						t.Fatalf("charge in the new generation waited %v, want 3s", elapsed)
+					}
+				}
+			})
+		})
 	}
-	done := make(chan result, 1)
-	go func() {
-		wait, stop := r.reserveAt(4000, nowNs())
-		done <- result{wait, stop}
-	}()
-	time.Sleep(20 * time.Millisecond)
-	select {
-	case <-done:
-		r.mu.Unlock()
-		t.Fatal("charge returned while Start was resetting tat")
-	default:
-	}
-	r.tat.Store(nowNs() - burstWindowNs)
-	gen.ready.Store(true)
-	r.mu.Unlock()
-	got := <-done
-	if wait := time.Duration(got.wait); wait > 3*time.Second || wait < time.Second {
-		t.Fatalf("charge after the reset waits %v, want about 2s", wait)
-	}
-	if got.stop != gen.ch {
-		t.Fatal("charge after the reset waits on another generation's channel")
-	}
+}
+
+// TestSaturatedDebtInBubble saturates a Rate's debt inside a synctest bubble,
+// whose clock is below the package epoch: waits must stay long, not wrap.
+func TestSaturatedDebtInBubble(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		r := NewRate(1000)
+		r.reserve(maxI64)
+		r.reserve(maxI64)
+		if wait := r.reserve(1000); wait < int64(time.Hour) {
+			t.Fatalf("wait after saturating the debt = %v, want it saturated too", time.Duration(wait))
+		}
+		r.SetLimit(500) // converts the saturated debt
+		if wait := r.reserve(1000); wait < int64(time.Hour) {
+			t.Fatalf("wait after converting a saturated debt = %v, want it saturated too", time.Duration(wait))
+		}
+	})
+}
+
+// TestConvertDebtAlwaysChangesTat lowers the limit of a Rate with 1 ns of
+// debt, which the conversion leaves at 1 ns: tat must still change, so that
+// a charge that loaded it before fails its CAS and retries at the new limit.
+func TestConvertDebtAlwaysChangesTat(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		r := NewRate(1000)
+		g := r.gen.Load()
+		before := nowNs() + 1
+		g.tat.Store(before)
+		r.SetLimit(400) // 1 ns at 1000 B/s is 2 ns at 400 B/s, less the 1 ns step
+		if g.tat.Load() == before {
+			t.Fatal("SetLimit left tat unchanged")
+		}
+	})
+}
+
+// TestStopWakesEveryWaiter stops a Rate that many connections and callers of
+// Get wait on, spread over the channels of its generation: every one must
+// wake at once.
+func TestStopWakesEveryWaiter(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		r := NewRate(1000)
+		r.reserve(2000) // spend the burst
+		var wg sync.WaitGroup
+		for range 200 {
+			c := NewRateConn(&nopNetConn{}, r)
+			wg.Go(func() { _, _ = c.Write(make([]byte, 1000)) })
+			wg.Go(func() { r.Get(1000) })
+		}
+		synctest.Wait()
+		used := 0
+		for i := range r.gen.Load().stop.Load().shards {
+			if r.gen.Load().stop.Load().shards[i].Load() != nil {
+				used++
+			}
+		}
+		if used < 2 {
+			t.Fatalf("400 waiters share %d channel(s)", used)
+		}
+		start := time.Now()
+		r.Stop()
+		wg.Wait()
+		if elapsed := time.Since(start); elapsed != 0 {
+			t.Fatalf("Stop woke the waiters after %v, want at once", elapsed)
+		}
+	})
 }

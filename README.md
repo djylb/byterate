@@ -40,7 +40,7 @@ duplex := byterate.NewDuplexRateConn(c, byterate.NewRate(8<<20), byterate.NewRat
 
 - Limits are in bytes per second; a limit `<= 0` means unlimited.
 - After an idle period a `Rate` lets two seconds' worth of bytes through
-  without waiting.
+  without waiting. Its meter counts up to 2^63-1 bytes in a sampling window.
 - `NewRate` returns a started `Rate`. The zero value is unlimited until
   `ResetLimit`, or `SetLimit` followed by `Start`.
 - `SetLimit` applies from the next charge and keeps debt as bytes: what is
@@ -54,13 +54,15 @@ duplex := byterate.NewDuplexRateConn(c, byterate.NewRate(8<<20), byterate.NewRat
   Waits of at most 200 µs are accumulated as debt without sleeping. A plain
   `Get` sleep of at most 2 ms finishes normally even if `Stop` is called;
   cancelable `GetContext` waits watch cancellation even below 2 ms.
-- `NewHierarchicalLimiter` charges every started `Rate` and waits for the
-  longest delay. Nil rates and repeats are left out, so a `Rate` given twice
-  is charged once, and it returns nil when none remain, or the `Rate` itself
-  when one does. Unlimited rates are kept, so they meter the traffic and a
-  limit set on them later applies to existing connections. Pass nil for
-  levels that should neither limit nor meter: wrapping a connection costs a
-  charge per call and hides `*net.TCPConn`'s zero-copy `ReadFrom`/`WriteTo`.
+- `NewHierarchicalLimiter` charges every started `Rate` and waits until every
+  one allows the bytes. `Stop` on one `Rate` ends the wait that `Rate`
+  imposes, and the others still apply. Nil rates and repeats are left out,
+  so a `Rate` given twice is charged once, and it returns nil when none
+  remain, or the `Rate` itself when one does. Unlimited rates are kept, so
+  they meter the traffic and a limit set on them later applies to existing
+  connections. Pass nil for levels that should neither limit nor meter:
+  wrapping a connection costs a charge per call and hides `*net.TCPConn`'s
+  zero-copy `ReadFrom`/`WriteTo`.
 - `NewRateConn` and `NewRateReadWriteCloser` charge reads after the data
   arrives and writes before sending, refunding short writes. When the limiter
   implements `ContextLimiter` (`*Rate` and `*HierarchicalLimiter` do), `Close`
@@ -69,11 +71,11 @@ duplex := byterate.NewDuplexRateConn(c, byterate.NewRate(8<<20), byterate.NewRat
   and a `Write` refunds its charge. A nil limiter, including a nil `*Rate` or
   `*HierarchicalLimiter`, returns the connection unchanged.
 - `NewRateConn` keeps the `net.Conn` addresses and deadlines, and its
-  `RawConn` method returns the wrapped connection, so helpers such as
-  `netx.RawConnOf` can unwrap it. `CloseRead` and `CloseWrite` are passed on
-  when the wrapped connection has them, so relays such as `netx.Relay` can
-  half-close through the wrapper; when they succeed, they also end a wait in
-  that direction's limiter with `net.ErrClosed`, as `Close` does for both.
+  `RawConn` method returns the wrapped connection, so wrapper-aware helpers
+  can unwrap it. `CloseRead` and `CloseWrite` are passed on when the wrapped
+  connection has them, so relays can half-close through the wrapper; when
+  they succeed, they also end a wait in that direction's limiter with
+  `net.ErrClosed`, as `Close` does for both.
 - With a `ContextLimiter`, the read and write deadlines of `NewRateConn` also
   bound the wait in the limiter, and a deadline set in the past ends a wait in
   progress, as `net/http` does to abort a read. A `Write` whose deadline
@@ -89,41 +91,45 @@ duplex := byterate.NewDuplexRateConn(c, byterate.NewRate(8<<20), byterate.NewRat
   earlier window, such as a write canceled by `Close`, is taken off the next
   windows. The connection wrappers drop the refund of a charge made before
   its `Rate` was last started, as `Start` cleared that charge from the debt
-  and the meter. Each write records whether each level actually charged debt:
-  refunding a write charged while unlimited only adjusts its meter, even if
-  a limit was enabled before the write failed. Direct `Get`/`ReturnBucket`
-  calls carry no receipt: callers must coordinate refunds with limit changes
-  and restarts themselves. `NewRateConn` charges both directions of a connection to one
-  limiter; `NewDuplexRateConn` and `NewDuplexRateReadWriteCloser` take one per
-  direction, so uploads and downloads are limited and metered apart.
+  and the meter. Each write records whether each level actually charged
+  debt: refunding a write charged while unlimited only adjusts its meter,
+  even if a limit was enabled before the write failed. Direct `Get` and
+  `ReturnBucket` calls carry no receipt: callers must coordinate refunds with
+  limit changes and restarts themselves. `NewRateConn` charges both
+  directions of a connection to one limiter; `NewDuplexRateConn` and
+  `NewDuplexRateReadWriteCloser` take one per direction, so uploads and
+  downloads are limited and metered apart.
 
 ## Concurrency
 
 `Get`, `Now`, `Meter.Add` and the charges of connection reads and writes are
 lock-free. `ReturnBucket`, and the refund of a short or failed write, take
 the `Rate`'s lock briefly, so that a refund sees the same limit and start as
-the debt it changes. A charge waits in, and a write's refund receipt records,
-the generation of each `Rate` whose debt it landed on, which `Start` replaces
-when it clears the `Rate`: a charge racing with a restart waits and is
-refunded in the generation it was charged to, and only the meter may count
-it on either side of the restart. A charge that finds a `Start` resetting the
-`Rate` waits for it on the `Rate`'s lock. Up
-to eight hierarchy levels keep these receipts on the stack; larger
-hierarchies allocate one slice per write. Apart from that, charges allocate
-only when a wait needs a timer: a `Get` waiting longer than 2 ms, or a
-`GetContext` with a cancelable context, waiting longer than 200 µs, so that a
-deadline or `Close` ends even a short wait. The connection wrappers reuse one
-timer per direction for the waits of a `*Rate` or `*HierarchicalLimiter`, so a
-throttled connection does not allocate per wait. An already-canceled wait
-returns without allocating a timer.
-A hierarchical charge reads the clock once for all levels. Padding separates
-neighboring instances' hot counters; a `Rate` is about 340 bytes and a `Meter`
-about 300. Wrapping a connection takes at most three allocations, about 240
-bytes. Setting its deadlines allocates only for
-the first deadline and after one has expired, and moving a deadline later, as
-servers do before every read, leaves the runtime timer alone. A pending
-deadline does not keep a connection that was never closed from being garbage
-collected.
+the debt it changes. A `Rate` keeps its debt and meter in a generation that
+`Start` replaces, rather than clears, when it restarts the `Rate`: a charge
+lands in one generation, waits on that generation's `Stop`, and a write's
+refund receipt refers to it, so a charge racing with a restart counts in
+exactly one generation. The callers waiting on a `Rate` spread over several
+channels that `Stop` closes, so that the connections throttled by a shared
+`Rate` do not queue for one channel's lock.
+
+Up to eight hierarchy levels keep these receipts and their waits on the
+stack; larger hierarchies allocate for them on every write. Apart from that,
+charges allocate only when a wait needs a timer: a `Get` waiting longer than
+2 ms, or a `GetContext` with a cancelable context, waiting longer than
+200 µs, so that a deadline or `Close` ends even a short wait. The connection
+wrappers reuse one timer per direction for the waits of a `*Rate` or
+`*HierarchicalLimiter`, so a throttled connection does not allocate per
+wait. An already-canceled wait returns without allocating a timer. A
+hierarchical charge reads the clock once for all levels. A `Rate` takes
+about 380 bytes in two allocations, laid out so that the fields every charge
+reads or writes share no cache line with other data; once callers wait on
+it, it also holds up to eight channels per processor. A `Meter` takes about
+300 bytes. Wrapping a connection takes at most three allocations,
+about 240 bytes. Setting its deadlines allocates only for the first deadline
+and after one has expired, and moving a deadline later, as servers do before
+every read, leaves the runtime timer alone. A pending deadline does not keep
+a connection that was never closed from being garbage collected.
 
 Tests can use `testing/synctest`: inside a bubble, a `Rate` or `Meter` runs on
 the bubble's clock. Create it inside the bubble that uses it, since its

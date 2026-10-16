@@ -225,7 +225,7 @@ func TestConcurrentDeadlineSettersStayConsistent(t *testing.T) {
 			// Create debt after the interleaving, since real time elapsed during
 			// it. Keep it above shortWaitNs so the wait watches the deadline
 			// even without the short-wait fix.
-			r.tat.Store(nowNs() + int64(5*time.Millisecond))
+			r.gen.Load().tat.Store(nowNs() + int64(5*time.Millisecond))
 			if n, err := c.Read(make([]byte, 1)); n != 1 || err != nil {
 				t.Fatalf("Read = %d, %v; limiter still uses the superseded deadline", n, err)
 			}
@@ -260,11 +260,13 @@ func TestDeadlineSettersOfOtherDirectionDoNotWait(t *testing.T) {
 }
 
 // A plain Get has nothing but Stop to watch, so a short wait keeps sleeping
-// without a timer, as documented in the README.
+// without a timer, as documented in the README. It allocates no more than
+// time.Sleep does, which is nothing on most platforms but not on js/wasm.
 func TestShortGetAllocatesNothing(t *testing.T) {
 	r := NewRate(1 << 20)
 	r.Get(2 << 20) // spend the burst, so each 1 KiB charge waits about 1 ms
-	if allocs := testing.AllocsPerRun(20, func() { r.Get(1 << 10) }); allocs != 0 {
-		t.Fatalf("short Get allocated %v times, want 0", allocs)
+	sleep := testing.AllocsPerRun(20, func() { time.Sleep(time.Millisecond) })
+	if allocs := testing.AllocsPerRun(20, func() { r.Get(1 << 10) }); allocs > sleep {
+		t.Fatalf("short Get allocated %v times, want no more than time.Sleep's %v", allocs, sleep)
 	}
 }
