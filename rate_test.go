@@ -2,7 +2,6 @@ package byterate
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"runtime"
 	"sync"
@@ -98,7 +97,7 @@ func TestClampHelpers(t *testing.T) {
 	}
 }
 
-func TestRateLifecycleAndJSON(t *testing.T) {
+func TestRateLifecycle(t *testing.T) {
 	r := NewRate(1024)
 	if r == nil {
 		t.Fatal("NewRate returned nil")
@@ -107,63 +106,44 @@ func TestRateLifecycleAndJSON(t *testing.T) {
 		t.Fatalf("Limit()=%d, want 1024", got)
 	}
 
-	r.Stop()
-	r.Get(1024)
-	if got := r.Now(); got != 0 {
-		t.Fatalf("Now() after Stop/Get=%d, want 0", got)
+	r.Disable()
+	_ = r.Wait(bg, 1024)
+	if got := r.Throughput(); got != 0 {
+		t.Fatalf("Throughput() after Disable/Wait=%d, want 0", got)
 	}
 
-	r.Start()
+	r.Enable()
 	r.SetLimit(2048)
 	if got := r.Limit(); got != 2048 {
 		t.Fatalf("Limit() after SetLimit=%d, want 2048", got)
 	}
 
-	r.ResetLimit(0)
+	r.Reset(0)
 	if got := r.Limit(); got != 0 {
-		t.Fatalf("Limit() after ResetLimit(0)=%d, want 0", got)
-	}
-
-	b, err := r.MarshalJSON()
-	if err != nil {
-		t.Fatalf("MarshalJSON error: %v", err)
-	}
-	var out map[string]int64
-	if err := json.Unmarshal(b, &out); err != nil {
-		t.Fatalf("json.Unmarshal error: %v", err)
-	}
-	if out["Limit"] != 0 {
-		t.Fatalf("MarshalJSON Limit=%d, want 0", out["Limit"])
+		t.Fatalf("Limit() after Reset(0)=%d, want 0", got)
 	}
 }
 
 func TestNilRateSafety(t *testing.T) {
 	var r *Rate
 	r.SetLimit(1)
-	r.ResetLimit(1)
-	r.Start()
-	r.Stop()
-	r.Get(1)
-	r.ReturnBucket(1)
+	r.Reset(1)
+	r.Enable()
+	r.Disable()
+	_ = r.Wait(bg, 1)
+	r.Refund(1)
 
 	if got := r.Limit(); got != 0 {
 		t.Fatalf("nil Limit()=%d, want 0", got)
 	}
-	if got := r.Now(); got != 0 {
-		t.Fatalf("nil Now()=%d, want 0", got)
-	}
-	b, err := r.MarshalJSON()
-	if err != nil {
-		t.Fatalf("nil MarshalJSON error: %v", err)
-	}
-	if string(b) != "null" {
-		t.Fatalf("nil MarshalJSON=%s, want null", string(b))
+	if got := r.Throughput(); got != 0 {
+		t.Fatalf("nil Throughput()=%d, want 0", got)
 	}
 }
 
 func TestRateCloneDetachesRuntimeState(t *testing.T) {
 	original := NewRate(2048)
-	original.Get(64)
+	_ = original.Wait(bg, 64)
 
 	cloned := original.Clone()
 	if cloned == nil {
@@ -179,18 +159,18 @@ func TestRateCloneDetachesRuntimeState(t *testing.T) {
 		t.Fatal("Clone() should not reuse the original stop channel")
 	}
 
-	cloned.ResetLimit(0)
+	cloned.Reset(0)
 	if got := original.Limit(); got != 2048 {
 		t.Fatalf("original limit after clone mutation = %d, want 2048", got)
 	}
 
-	original.Stop()
+	original.Disable()
 	if cloned.stopCh() == nil {
-		t.Fatal("clone stop channel = nil after original Stop(), want independent channel")
+		t.Fatal("clone stop channel = nil after original Disable(), want independent channel")
 	}
 	select {
 	case <-cloned.stopCh():
-		t.Fatal("clone stop channel closed when original stopped")
+		t.Fatal("clone stop channel closed when original disabled")
 	default:
 	}
 }
@@ -224,7 +204,7 @@ func TestMeterCloneDetachesMutableState(t *testing.T) {
 	}
 }
 
-func TestRateLargeGetDoesNotPoisonLimiter(t *testing.T) {
+func TestRateLargeWaitDoesNotPoisonLimiter(t *testing.T) {
 	r := NewRate(10 << 30)
 	if wait := r.reserve(10 << 30); wait != 0 {
 		t.Fatalf("reserve(10GiB) at 10GiB/s with full burst wait=%s, want 0", time.Duration(wait))
@@ -253,13 +233,16 @@ func expectFullBurst(t *testing.T, r *Rate) {
 	}
 }
 
-func TestZeroValueRateLimitsAfterStart(t *testing.T) {
-	var r Rate
-	if wait := r.reserve(1 << 20); wait != 0 {
-		t.Fatalf("zero Rate before Start wait=%s, want 0", time.Duration(wait))
+// The zero value is an enabled, unlimited Rate: it meters at once, and a
+// limit set on it applies with a full burst, without Enable.
+func TestZeroValueRateIsReady(t *testing.T) {
+	var unlimited Rate
+	if wait := unlimited.reserve(1 << 20); wait != 0 || metered(&unlimited) != 1<<20 {
+		t.Fatalf("zero Rate reserve(1 MiB) wait=%s metered=%d, want 0 and 1 MiB", time.Duration(wait), metered(&unlimited))
 	}
+
+	var r Rate
 	r.SetLimit(1000)
-	r.Start()
 	expectFullBurst(t, &r)
 	last := r.gen.Load().lastSampleNs.Load()
 	r.gen.Load().roll(last + int64(2*time.Second))
@@ -268,7 +251,7 @@ func TestZeroValueRateLimitsAfterStart(t *testing.T) {
 	}
 
 	cloned := (&Rate{}).Clone()
-	cloned.ResetLimit(1000)
+	cloned.SetLimit(1000)
 	cloned.reserve(2000)
 	if wait := cloned.reserve(1000); wait < int64(900*time.Millisecond) || wait > int64(time.Second) {
 		t.Fatalf("clone of zero Rate reserve(1000) after burst wait=%s, want about 1s", time.Duration(wait))
@@ -280,7 +263,7 @@ func TestZeroValueRateLimitsAfterStart(t *testing.T) {
 func metered(r *Rate) int64 { return r.gen.Load().bytesAcc.Load() }
 
 // TestRateSetLimitDebt checks that debt is kept as bytes across limit
-// changes, also through a time without a limit, and that ResetLimit drops it.
+// changes, also through a time without a limit, and that Reset drops it.
 func TestRateSetLimitDebt(t *testing.T) {
 	inDebt := func() *Rate {
 		r := NewRate(1000)
@@ -307,7 +290,7 @@ func TestRateSetLimitDebt(t *testing.T) {
 	expectWait(r, 4*time.Second, 6*time.Second) // 10000 bytes at 2000 B/s
 
 	r = inDebt()
-	r.ResetLimit(1000)
+	r.Reset(1000)
 	expectFullBurst(t, r)
 }
 
@@ -336,7 +319,7 @@ func TestRateRefundAfterLoweredLimit(t *testing.T) {
 		r.reserve(1_000_000) // 10s of queued writes
 	}
 	r.SetLimit(100_000)
-	r.ReturnBucket(1_000_000) // one write is canceled
+	r.Refund(1_000_000) // one write is canceled
 	if wait := r.reserve(1); wait < int64(85*time.Second) {
 		t.Fatalf("reserve(1) after the refund wait=%s, want the other writes' 90s", time.Duration(wait))
 	}
@@ -350,7 +333,7 @@ func TestRateRefundAfterRaisedLimit(t *testing.T) {
 	r.reserve(2048)    // spend the burst
 	r.reserve(1 << 20) // a 1 MiB write waiting about 17 minutes
 	r.SetLimit(1 << 30)
-	r.ReturnBucket(1 << 20)
+	r.Refund(1 << 20)
 	if wait := r.reserve(1); wait > int64(time.Millisecond) {
 		t.Fatalf("reserve(1) after the refund wait=%s, want about 0", time.Duration(wait))
 	}
@@ -397,39 +380,27 @@ func TestRateSetLimitRacesCharges(t *testing.T) {
 	}
 }
 
-func TestRateMarshalJSONReportsZeroWhenIdle(t *testing.T) {
+func TestRateThroughputReportsZeroWhenIdle(t *testing.T) {
 	r := NewRate(0)
 	r.reserve(500)
 	r.gen.Load().lastSampleNs.Store(nowNs() - int64(2*time.Second))
-
-	nowRate := func() int64 {
-		b, err := r.MarshalJSON()
-		if err != nil {
-			t.Fatalf("MarshalJSON error: %v", err)
-		}
-		var out map[string]int64
-		if err := json.Unmarshal(b, &out); err != nil {
-			t.Fatalf("json.Unmarshal error: %v", err)
-		}
-		return out["NowRate"]
-	}
-	if got := nowRate(); got < 200 || got > 250 {
-		t.Fatalf("MarshalJSON NowRate=%d, want about 250", got)
+	if got := r.Throughput(); got < 200 || got > 250 {
+		t.Fatalf("Throughput()=%d, want about 250", got)
 	}
 
 	// An idle window must read 0, not the earlier bytes spread over more time.
 	r.gen.Load().lastSampleNs.Store(nowNs() - int64(time.Second))
-	if got := nowRate(); got != 0 {
-		t.Fatalf("idle MarshalJSON NowRate=%d, want 0", got)
+	if got := r.Throughput(); got != 0 {
+		t.Fatalf("idle Throughput()=%d, want 0", got)
 	}
 }
 
-func TestRateGetContextCancel(t *testing.T) {
+func TestRateWaitCancel(t *testing.T) {
 	r := NewRate(1024)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
-		done <- r.GetContext(ctx, 64<<10)
+		done <- r.Wait(ctx, 64<<10)
 	}()
 
 	time.Sleep(20 * time.Millisecond)
@@ -438,20 +409,21 @@ func TestRateGetContextCancel(t *testing.T) {
 	select {
 	case err := <-done:
 		if !errors.Is(err, context.Canceled) {
-			t.Fatalf("GetContext() error = %v, want %v", err, context.Canceled)
+			t.Fatalf("Wait() error = %v, want %v", err, context.Canceled)
 		}
 	case <-time.After(500 * time.Millisecond):
-		r.Stop()
-		t.Fatal("GetContext() did not return promptly after cancel")
+		r.Disable()
+		t.Fatal("Wait() did not return promptly after cancel")
 	}
 	if got := metered(r); got != 64<<10 {
-		t.Fatalf("metered after canceled GetContext = %d, want charge kept", got)
+		t.Fatalf("metered after canceled Wait = %d, want charge kept", got)
 	}
 
-	// No wait needed: a done context does not turn an allowed charge into an error.
-	r.ResetLimit(1024)
-	if err := r.GetContext(ctx, 1); err != nil {
-		t.Fatalf("GetContext() within burst error = %v, want nil", err)
+	// No wait needed: a done context does not turn an allowed charge into an
+	// error.
+	r.Reset(1024)
+	if err := r.Wait(ctx, 1); err != nil {
+		t.Fatalf("Wait() within burst error = %v, want nil", err)
 	}
 }
 
@@ -459,7 +431,7 @@ func TestRateGetContextCancel(t *testing.T) {
 // given a limit later starts with the full burst, also early in the process,
 // when the monotonic clock is still below the burst window.
 func TestRateStartsWithFullBurstForLaterLimit(t *testing.T) {
-	for _, r := range []*Rate{NewRate(0), func() *Rate { var r Rate; r.Start(); return &r }()} {
+	for _, r := range []*Rate{NewRate(0), func() *Rate { var r Rate; r.Enable(); return &r }()} {
 		want := nowNs() - burstWindowNs
 		if got := r.gen.Load().tat.Load(); got > want || got < want-int64(time.Second) {
 			t.Fatalf("tat = %d, want about %d (a full burst)", got, want)
@@ -484,16 +456,16 @@ func TestRateMeterCarriesRefunds(t *testing.T) {
 		return r.gen.Load().nowBps.Load()
 	}
 
-	r.Get(1000)
+	_ = r.Wait(bg, 1000)
 	if got := roll(); got != 1000 {
 		t.Fatalf("window 1 = %d B/s, want 1000", got)
 	}
-	r.ReturnBucket(1000) // the 1000 bytes were never sent
-	r.Get(600)
+	r.Refund(1000) // the 1000 bytes were never sent
+	_ = r.Wait(bg, 600)
 	if got := roll(); got != 0 {
 		t.Fatalf("window 2 = %d B/s, want 0", got)
 	}
-	r.Get(1000)
+	_ = r.Wait(bg, 1000)
 	if got := roll(); got != 600 {
 		t.Fatalf("window 3 = %d B/s, want 600 after the remaining 400-byte refund", got)
 	}
@@ -502,9 +474,9 @@ func TestRateMeterCarriesRefunds(t *testing.T) {
 	}
 }
 
-// TestRateCloneDuringStartStop clones a Rate that is being stopped and
-// started: every clone must be either stopped or able to wait.
-func TestRateCloneDuringStartStop(t *testing.T) {
+// TestRateCloneDuringEnableDisable clones a Rate that is being disabled and
+// enabled: every clone must be either disabled or able to wait.
+func TestRateCloneDuringEnableDisable(t *testing.T) {
 	r := NewRate(1000)
 	stop := make(chan struct{})
 	done := make(chan struct{})
@@ -516,28 +488,29 @@ func TestRateCloneDuringStartStop(t *testing.T) {
 				return
 			default:
 			}
-			r.Stop()
-			r.Start()
+			r.Disable()
+			r.Enable()
+			runtime.Gosched() // js/wasm does not preempt this loop
 		}
 	}()
 	defer func() { close(stop); <-done }()
 	for range 100000 {
 		c := r.Clone()
-		if c.enabled.Load() && isClosed(c.stopCh()) {
+		if !c.disabled.Load() && isClosed(c.stopCh()) {
 			t.Fatal("Clone() is enabled with a closed stop channel, so it would never wait")
 		}
 	}
 }
 
-// TestRateNowWhileStopped checks that a charge that raced with Stop is not
-// reported as throughput while the Rate is stopped.
-func TestRateNowWhileStopped(t *testing.T) {
+// TestRateThroughputWhileDisabled checks that a charge that raced with
+// Disable is not reported as throughput while the Rate is disabled.
+func TestRateThroughputWhileDisabled(t *testing.T) {
 	r := NewRate(0)
-	r.Stop()
-	r.gen.Load().bytesAcc.Add(1000) // a charge that passed the enabled check before Stop
+	r.Disable()
+	r.gen.Load().bytesAcc.Add(1000) // a charge that passed the disabled check before Disable
 	r.gen.Load().lastSampleNs.Store(nowNs() - int64(time.Second))
-	if got := r.Now(); got != 0 {
-		t.Fatalf("Now() of a stopped Rate = %d, want 0", got)
+	if got := r.Throughput(); got != 0 {
+		t.Fatalf("Throughput() of a disabled Rate = %d, want 0", got)
 	}
 }
 
@@ -553,15 +526,15 @@ func meterWindows(r *Rate) (roll func() int64) {
 	}
 }
 
-// TestRateChargeRefundDropsChargesBeforeReset refunds, after ResetLimit, a
-// charge made before it, as a write that ResetLimit woke and that then
+// TestRateChargeRefundDropsChargesBeforeReset refunds, after Reset, a
+// charge made before it, as a write that Reset woke and that then
 // failed does: the cleared meter must not go below 0, and the refund must
 // not credit the debt charged since.
 func TestRateChargeRefundDropsChargesBeforeReset(t *testing.T) {
 	r := NewRate(1000)
 	var charge rateCharge
 	charge.reserve(r, 1<<20, nowNs())
-	r.ResetLimit(1000)
+	r.Reset(1000)
 	r.reserve(2000)  // spend the new burst
 	r.reserve(10000) // 10s of debt since the reset
 	charge.refund(1 << 20)
@@ -572,7 +545,7 @@ func TestRateChargeRefundDropsChargesBeforeReset(t *testing.T) {
 		t.Fatalf("reserve(1) after the stale refund wait=%s, want the 10s of debt kept", time.Duration(wait))
 	}
 
-	// A refund of a charge made since the last Start is applied.
+	// A refund of a charge made since the last Enable is applied.
 	charge.reserve(r, 1000, nowNs())
 	charge.refund(1000)
 	if got := metered(r); got != 12001 {
@@ -581,8 +554,8 @@ func TestRateChargeRefundDropsChargesBeforeReset(t *testing.T) {
 }
 
 // TestRateMeterCarriesRefundAcrossIdleWindows refunds a write that waited
-// through idle windows closed by Now before Close canceled it: the refund
-// must still come off the following windows.
+// through idle windows closed by Throughput before Close canceled it: the
+// refund must still come off the following windows.
 func TestRateMeterCarriesRefundAcrossIdleWindows(t *testing.T) {
 	r := NewRate(0)
 	roll := meterWindows(r)
@@ -590,7 +563,7 @@ func TestRateMeterCarriesRefundAcrossIdleWindows(t *testing.T) {
 	roll()
 	roll() // idle
 	roll() // idle
-	r.ReturnBucket(64 << 10)
+	r.Refund(64 << 10)
 	r.reserve(10 << 10)
 	if got := roll(); got != 0 {
 		t.Fatalf("window with the refund = %d B/s, want 0", got)
@@ -614,7 +587,7 @@ func TestRateMeterChargeRefundRace(t *testing.T) {
 		wg.Go(func() {
 			for !stop.Load() {
 				r.reserve(1000)
-				r.ReturnBucket(1000)
+				r.Refund(1000)
 			}
 		})
 	}
@@ -638,11 +611,11 @@ func TestRateMeterCarriesRefundPastNettedWindow(t *testing.T) {
 	roll := meterWindows(r)
 	r.reserve(100_000) // write B
 	roll()
-	r.reserve(100_000)      // write A
-	r.ReturnBucket(100_000) // B is canceled
+	r.reserve(100_000) // write A
+	r.Refund(100_000)  // B is canceled
 	roll()
 	r.reserve(50_000)
-	r.ReturnBucket(100_000) // A is canceled
+	r.Refund(100_000) // A is canceled
 	if got := roll(); got != 0 {
 		t.Fatalf("window with A's refund = %d B/s, want 0", got)
 	}
@@ -665,5 +638,62 @@ func TestLayoutFillsCacheLines(t *testing.T) {
 	}
 	if got := unsafe.Offsetof(g.tat); got != cacheLineSize {
 		t.Errorf("generation.tat at offset %d, want %d", got, cacheLineSize)
+	}
+}
+
+// A zero value makes its first generation on the first charge: Disable racing
+// with those charges must still wake every caller that went on to wait, and
+// Enable must bring the limit back.
+func TestZeroValueDisableRacesFirstCharge(t *testing.T) {
+	for range 200 {
+		var r Rate
+		r.SetLimit(1000)
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		for range 4 {
+			wg.Go(func() {
+				<-start
+				_ = r.Wait(bg, 10000) // 10s of debt unless Disable wakes it
+			})
+		}
+		close(start)
+		runtime.Gosched()
+		r.Disable()
+		done := make(chan struct{})
+		go func() { wg.Wait(); close(done) }()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("Disable left a caller of a zero Rate waiting")
+		}
+		r.Enable()
+		r.reserve(2000)
+		if wait := r.reserve(1000); wait < int64(900*time.Millisecond) {
+			t.Fatalf("reserve(1000) after Enable wait=%s, want the limit back", time.Duration(wait))
+		}
+	}
+}
+
+// Enable on an enabled zero value racing with its first charge must keep the
+// generation that charge made, and with it the charge's debt.
+func TestZeroValueEnableRacesFirstCharge(t *testing.T) {
+	for range 50000 {
+		var r Rate
+		r.SetLimit(1000)
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		wg.Go(func() {
+			<-start
+			r.reserve(12000) // 10s of debt past the 2000 B burst
+		})
+		wg.Go(func() {
+			<-start
+			r.Enable()
+		})
+		close(start)
+		wg.Wait()
+		if wait := r.reserve(1); wait < int64(9*time.Second) {
+			t.Fatalf("Enable racing with the first charge dropped its debt: wait %v", time.Duration(wait))
+		}
 	}
 }

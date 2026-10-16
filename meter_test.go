@@ -5,13 +5,13 @@ import (
 	"time"
 )
 
-func TestMeterSnapshotReportsRecentRates(t *testing.T) {
+func TestMeterThroughputReportsRecentRates(t *testing.T) {
 	meter := NewMeter()
 	meter.Add(300, 500)
 	time.Sleep(1100 * time.Millisecond)
-	inBps, outBps, totalBps := meter.Snapshot()
+	inBps, outBps, totalBps := meter.Throughput()
 	if inBps <= 0 || outBps <= 0 || totalBps != inBps+outBps {
-		t.Fatalf("Snapshot() = %d/%d/%d, want positive rates with total sum", inBps, outBps, totalBps)
+		t.Fatalf("Throughput() = %d/%d/%d, want positive rates with total sum", inBps, outBps, totalBps)
 	}
 }
 
@@ -19,16 +19,16 @@ func TestMeterLargeWindowDoesNotOverflow(t *testing.T) {
 	m := NewMeter()
 	m.Add(10<<30, 9<<30)
 	m.roll(m.lastSampleNs.Load() + int64(1100*time.Millisecond))
-	inBps, outBps, totalBps := m.Snapshot()
+	inBps, outBps, totalBps := m.Throughput()
 	if inBps != 9_761_289_309 || outBps != 8_785_160_378 || totalBps != inBps+outBps {
-		t.Fatalf("Snapshot() = %d/%d/%d, want 9761289309/8785160378/sum", inBps, outBps, totalBps)
+		t.Fatalf("Throughput() = %d/%d/%d, want 9761289309/8785160378/sum", inBps, outBps, totalBps)
 	}
 
 	m.Reset()
 	m.Add(-500, 0)
 	m.roll(m.lastSampleNs.Load() + int64(time.Second))
-	if inBps, _, _ := m.Snapshot(); inBps != 0 {
-		t.Fatalf("Snapshot() in after negative Add = %d, want 0", inBps)
+	if inBps, _, _ := m.Throughput(); inBps != 0 {
+		t.Fatalf("Throughput() in after negative Add = %d, want 0", inBps)
 	}
 }
 
@@ -40,9 +40,9 @@ func TestZeroValueMeterStartsWindowOnFirstUse(t *testing.T) {
 		t.Fatalf("lastSampleNs after first Add = %d, want a monotonic timestamp in [1s, %d]", last, nowNs())
 	}
 	m.roll(last + int64(time.Second))
-	inBps, outBps, totalBps := m.Snapshot()
+	inBps, outBps, totalBps := m.Throughput()
 	if inBps != 100 || outBps != 50 || totalBps != 150 {
-		t.Fatalf("Snapshot() = %d/%d/%d, want 100/50/150", inBps, outBps, totalBps)
+		t.Fatalf("Throughput() = %d/%d/%d, want 100/50/150", inBps, outBps, totalBps)
 	}
 }
 

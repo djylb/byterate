@@ -5,12 +5,12 @@ import (
 	"time"
 )
 
-func TestRateStopUnblocksBlockedGet(t *testing.T) {
+func TestRateDisableUnblocksBlockedWait(t *testing.T) {
 	r := NewRate(1)
 	done := make(chan struct{})
 
 	go func() {
-		r.Get(10)
+		_ = r.Wait(bg, 10)
 		close(done)
 	}()
 
@@ -18,15 +18,15 @@ func TestRateStopUnblocksBlockedGet(t *testing.T) {
 
 	select {
 	case <-done:
-		t.Fatal("Get() returned before Stop() despite a long rate-limited wait")
+		t.Fatal("Wait() returned before Disable() despite a long rate-limited wait")
 	default:
 	}
 
-	r.Stop()
+	r.Disable()
 
 	select {
 	case <-done:
 	case <-time.After(200 * time.Millisecond):
-		t.Fatal("Get() did not unblock promptly after Stop()")
+		t.Fatal("Wait() did not unblock promptly after Disable()")
 	}
 }

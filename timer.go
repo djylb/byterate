@@ -15,6 +15,13 @@ const (
 	sampleIntervalNs = int64(time.Second)
 	coalesceWaitNs   = int64(200 * time.Microsecond)
 	shortWaitNs      = int64(2 * time.Millisecond)
+
+	// A stream wrapper without credit lets about quantumNs of traffic through
+	// per charge, at least minQuantum and at most maxQuantum bytes, so that a
+	// large Read or Write neither bursts nor holds a shared limit for long.
+	quantumNs  = int64(20 * time.Millisecond)
+	minQuantum = int64(512)
+	maxQuantum = int64(64 << 10)
 )
 
 // epoch is the shared monotonic origin for Rate and Meter timestamps, so zero
@@ -39,14 +46,19 @@ const cacheLineSize = 128
 // cacheLinePad separates fields written by different cores.
 type cacheLinePad [cacheLineSize]byte
 
-// sleepNs waits waitNs, returning early when stopCh or done is closed.
-// It reports false only when done was closed before the wait elapsed.
-//
-// Without done, a wait of up to shortWaitNs sleeps without a timer: only
-// Stop could end it, and it ends within 2 ms anyway. A wait with done always
-// watches it, however short, since a deadline or Close must end it.
-func sleepNs(waitNs int64, stopCh, done <-chan struct{}) bool {
-	return (*waitTimer)(nil).sleep(waitNs, stopCh, done)
+// sleepResult says how a wait ended.
+type sleepResult uint8
+
+const (
+	slept    sleepResult = iota // the wait elapsed
+	stopped                     // Disable on the generation ended it
+	canceled                    // done was closed first
+)
+
+// sleepNs waits waitNs, returning early when Disable on g or done ends the
+// wait.
+func sleepNs(waitNs int64, g *generation, done <-chan struct{}) sleepResult {
+	return (*waitTimer)(nil).sleep(waitNs, g, done)
 }
 
 // waitTimer keeps the timer of a connection direction's last wait for the
@@ -58,14 +70,20 @@ type waitTimer struct {
 	t atomic.Pointer[time.Timer] // idle timer, nil while a wait holds it
 }
 
-// sleep is sleepNs with w's timer.
-func (w *waitTimer) sleep(waitNs int64, stopCh, done <-chan struct{}) bool {
+// sleep waits waitNs in w's timer, returning early when Disable on g or done
+// ends the wait. A nil g has no Disable.
+//
+// Without done, a wait of up to shortWaitNs sleeps without a timer and
+// without taking one of g's stop channels: only Disable could end it, and it
+// ends within 2 ms anyway. A wait with done always watches it, however
+// short, since a deadline or Close must end it.
+func (w *waitTimer) sleep(waitNs int64, g *generation, done <-chan struct{}) sleepResult {
 	if waitNs <= 0 {
-		return true
+		return slept
 	}
-	if done == nil && (stopCh == nil || waitNs <= shortWaitNs) {
+	if done == nil && (g == nil || waitNs <= shortWaitNs) {
 		time.Sleep(time.Duration(waitNs))
-		return true
+		return slept
 	}
 	// A canceled operation needs no timer, including repeated writes after
 	// Close. Keep the check before taking one, but do not skip a live
@@ -73,28 +91,29 @@ func (w *waitTimer) sleep(waitNs int64, stopCh, done <-chan struct{}) bool {
 	// channel takes no lock while the channel is open, unlike a select of
 	// two, and the stop channel is shared with other waiters.
 	if signaled(done) {
-		return false
+		return canceled
 	}
+	stopCh := g.waitCh(w.key())
 	if signaled(stopCh) {
-		return true
+		return stopped
 	}
 
 	t := w.take(time.Duration(waitNs))
 	defer w.put(t)
 	select {
 	case <-t.C:
-		return true
+		return slept
 	case <-stopCh:
-		return true
+		return stopped
 	case <-done:
-		return false
+		return canceled
 	}
 }
 
 // key spreads the waiters of a shared Rate over its generation's stop
 // channels while keeping a connection direction on one, so that a Rate of
 // its own makes no more channels than it has directions waiting. A nil w,
-// the waiter of a plain Get, takes one at random.
+// the waiter of a plain Wait, takes one at random.
 func (w *waitTimer) key() uint32 {
 	if w == nil {
 		return rand.Uint32()

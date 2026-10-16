@@ -22,81 +22,154 @@ var (
 
 type rateConn struct {
 	conn        io.ReadWriteCloser
+	datagram    bool // every Read and Write carries one whole message
 	read, write direction
 }
 
 // direction holds the limiter charged for one direction of a rateConn and
 // the signal that ends a wait in it.
 type direction struct {
-	rate    Limiter
-	ctxRate ContextLimiter // rate, if it supports cancellation
-	cancel  waitCancel     // used only with ctxRate
-	timer   waitTimer      // reused by the waits of *Rate and *HierarchicalLimiter
+	rate   Limiter
+	cancel waitCancel // ended by Close and the deadlines
+	timer  waitTimer  // reused by the waits of *Rate and *Hierarchy
+	// writing holds a token while a Write sends its grants, so that the
+	// grants of concurrent Writes do not interleave, as the writes of a
+	// *net.TCPConn do not. Made for the writes of a limited stream alone.
+	writing chan struct{}
 }
 
-// NewRateReadWriteCloser wraps rwc so that its traffic in both directions is
-// charged to rate. Read charges the bytes received before returning them;
-// Write charges len(b) before writing and refunds any unwritten part. If rate
-// is a ContextLimiter, Close also ends a wait in progress, which then returns
-// net.ErrClosed; any other error from GetContext is returned as it is, and a
-// Write refunds its charge. CloseRead and CloseWrite are passed on to rwc when
-// it has them, so relays can half-close through the wrapper. A nil rate,
-// including a nil *Rate or *HierarchicalLimiter, returns rwc unchanged.
-// Methods return ErrNilConn if rwc is nil.
-func NewRateReadWriteCloser(rwc io.ReadWriteCloser, rate Limiter) io.ReadWriteCloser {
-	return NewDuplexRateReadWriteCloser(rwc, rate, rate)
+// NewConn wraps c so that its traffic in both directions is charged to l and
+// limited by it. The result is a net.Conn that reports c's addresses, sets
+// c's deadlines and returns c from its RawConn method, which wrapper-aware
+// helpers use to unwrap it. A nil l, including a nil *Rate or *Hierarchy,
+// returns c unchanged.
+//
+// Data passes in grants of what the limit lets through at once: its credit,
+// up to two seconds of traffic after an idle period, or without credit a
+// quantum of about 20 ms of traffic, no more than the credit at its cap. A
+// Write sends its bytes a grant at a time, each charged before it goes out,
+// so a large Write neither bursts past the credit nor holds a shared limit
+// while other connections wait; concurrent Writes do not interleave. A Read
+// first waits until the limit has no debt, then reads at most a grant and
+// charges what arrived, so a reader in debt leaves the data with the sender
+// and one blocked waiting for data holds no share of the limit. Readers
+// waiting for the debt of one shared limit read together when it is repaid,
+// up to a grant each.
+//
+// Close ends a wait with net.ErrClosed, and CloseRead and CloseWrite do the
+// same for their side; they are passed on to c when it has them, so relays
+// can half-close through the wrapper, and return an error matching
+// errors.ErrUnsupported when it has not. Deadlines set through the result
+// bound the waits too; one set on c before wrapping it does not. A wait that
+// a deadline ends returns os.ErrDeadlineExceeded, a net.Error whose Timeout
+// method reports true. A Write that is ended or fails part way returns the
+// bytes it sent and refunds the rest, and one that c reports short without
+// an error returns io.ErrShortWrite. A Read ended in its wait returns no
+// bytes. Moving a deadline later does not end a wait. Any other error from
+// l's Wait is returned as it is.
+//
+// UDP, IP and Unix datagram sockets are never split: each Write is charged
+// and sent whole, and a Read may take a whole datagram. NewDatagramConn does
+// the same for other connections that carry one message per call. A Limiter
+// other than *Rate and *Hierarchy cannot grant part of a request: a Write
+// charges all of its bytes before sending them, and a Read charges what it
+// read after reading it, returning those bytes with an error that ends the
+// wait.
+func NewConn(c net.Conn, l Limiter) net.Conn {
+	return NewDuplexConn(c, l, l)
 }
 
-// NewDuplexRateReadWriteCloser is NewRateReadWriteCloser with separate
-// limiters for reads and writes, so that each direction is limited and
-// metered on its own. A nil limiter leaves its direction unlimited; with both
-// nil, rwc is returned unchanged.
-func NewDuplexRateReadWriteCloser(rwc io.ReadWriteCloser, read, write Limiter) io.ReadWriteCloser {
+// NewDuplexConn is NewConn with separate limiters for reads and writes, so
+// that each direction is limited and metered on its own. A nil limiter leaves
+// its direction alone; with both nil, c is returned unchanged.
+func NewDuplexConn(c net.Conn, read, write Limiter) net.Conn {
+	return newRateNetConn(c, read, write, isDatagramConn(c))
+}
+
+// NewDatagramConn is NewDuplexConn for a connection whose every Read and
+// Write carries one whole message, such as a message-oriented tunnel, which
+// must not be split: each Write is charged and sent whole, and a Read may
+// take a whole message. NewConn and NewDuplexConn treat UDP, IP and Unix
+// datagram sockets so by themselves.
+func NewDatagramConn(c net.Conn, read, write Limiter) net.Conn {
+	return newRateNetConn(c, read, write, true)
+}
+
+// NewReadWriteCloser is NewConn for an io.ReadWriteCloser, which has no
+// addresses or deadlines. Its methods return ErrNilConn if rwc is nil.
+func NewReadWriteCloser(rwc io.ReadWriteCloser, l Limiter) io.ReadWriteCloser {
+	return NewDuplexReadWriteCloser(rwc, l, l)
+}
+
+// NewDuplexReadWriteCloser is NewDuplexConn for an io.ReadWriteCloser.
+func NewDuplexReadWriteCloser(rwc io.ReadWriteCloser, read, write Limiter) io.ReadWriteCloser {
 	read, write = nilLimiter(read), nilLimiter(write)
 	if read == nil && write == nil {
 		return rwc
 	}
 	c := &rateConn{}
-	c.init(rwc, read, write)
+	c.init(rwc, read, write, isDatagramConn(rwc))
 	return c
 }
 
-// NewRateConn is NewRateReadWriteCloser for a net.Conn. The result reports
-// c's addresses, sets c's deadlines and returns c from its RawConn method,
-// which wrapper-aware helpers use to unwrap it.
-//
-// If rate is a ContextLimiter, deadlines also bound the time a Read or Write
-// spends waiting in the limiter. A Write whose deadline passes during the wait
-// refunds its charge and returns 0 and os.ErrDeadlineExceeded, a net.Error
-// whose Timeout method reports true. A Read has already received its bytes
-// when it waits, so it keeps the charge and returns them together with
-// os.ErrDeadlineExceeded, as it returns them with net.ErrClosed when Close
-// ends the wait. Moving a deadline later does not end a wait.
-func NewRateConn(c net.Conn, rate Limiter) net.Conn {
-	return NewDuplexRateConn(c, rate, rate)
-}
-
-// NewDuplexRateConn is NewRateConn with separate limiters for reads and
-// writes, as NewDuplexRateReadWriteCloser.
-func NewDuplexRateConn(c net.Conn, read, write Limiter) net.Conn {
+func newRateNetConn(c net.Conn, read, write Limiter, datagram bool) net.Conn {
 	read, write = nilLimiter(read), nilLimiter(write)
 	if read == nil && write == nil {
 		return c
 	}
 	nc := &rateNetConn{conn: c}
-	nc.init(c, read, write)
+	nc.init(c, read, write, datagram)
 	return nc
+}
+
+// isDatagramConn reports whether c is a socket whose every Read and Write
+// carries one datagram.
+func isDatagramConn(c any) bool {
+	switch v := c.(type) {
+	case *net.UDPConn, *net.IPConn:
+		return true
+	case *net.UnixConn:
+		if v == nil {
+			return false
+		}
+		addr := v.LocalAddr()
+		return addr == nil || addr.Network() != "unix"
+	}
+	return false
 }
 
 // init sets the wrapped connection and the limiters, which the constructors
 // have passed through nilLimiter.
-func (s *rateConn) init(rwc io.ReadWriteCloser, read, write Limiter) {
+func (s *rateConn) init(rwc io.ReadWriteCloser, read, write Limiter, datagram bool) {
 	s.conn = rwc
+	s.datagram = datagram
 	s.read.init(read)
 	s.write.init(write)
+	if write != nil && !datagram {
+		s.write.writing = make(chan struct{}, 1)
+	}
 }
 
-// nilLimiter returns nil for a nil *Rate or *HierarchicalLimiter, which
+// lockWrite waits for d's turn to write, or until Close or the deadline
+// ends d's waits, which also ends the wait of the Write holding the turn.
+func (d *direction) lockWrite() error {
+	select {
+	case d.writing <- struct{}{}:
+		return nil
+	default:
+	}
+	g := d.cancel.current()
+	select {
+	case d.writing <- struct{}{}:
+		return nil
+	case <-g.Done():
+		return g.cause()
+	}
+}
+
+func (d *direction) unlockWrite() { <-d.writing }
+
+// nilLimiter returns nil for a nil *Rate or *Hierarchy, which
 // limit nothing, so that they do not hide the wrapped connection.
 func nilLimiter(l Limiter) Limiter {
 	switch v := l.(type) {
@@ -104,7 +177,7 @@ func nilLimiter(l Limiter) Limiter {
 		if v == nil {
 			return nil
 		}
-	case *HierarchicalLimiter:
+	case *Hierarchy:
 		if v == nil {
 			return nil
 		}
@@ -113,58 +186,83 @@ func nilLimiter(l Limiter) Limiter {
 }
 
 func (d *direction) setDeadline(t time.Time) {
-	if d.ctxRate != nil {
+	if d.rate != nil {
 		d.cancel.setDeadline(t)
 	}
 }
 
 func (d *direction) init(rate Limiter) {
 	d.rate = rate
-	d.ctxRate, _ = rate.(ContextLimiter)
-	if d.ctxRate != nil {
+	if rate != nil {
 		d.cancel.init()
 	}
 }
 
-func (s *rateConn) Read(b []byte) (n int, err error) {
+func (s *rateConn) Read(b []byte) (int, error) {
 	if s == nil || s.conn == nil {
 		return 0, ErrNilConn
 	}
-	n, err = s.conn.Read(b)
+	d := &s.read
+	if d.rate == nil || len(b) == 0 {
+		return s.conn.Read(b)
+	}
+	size, err := d.awaitRead(int64(len(b)), s.datagram)
+	if err != nil {
+		return 0, err
+	}
+	n, err := s.conn.Read(b[:size])
 	if n > 0 {
 		// The bytes were received, so the charge stands even if Close or a
-		// deadline cut the wait short.
-		if werr := s.wait(&s.read, int64(n)); werr != nil && err == nil {
+		// deadline cuts a wait short.
+		if werr := d.chargeRead(int64(n)); werr != nil && err == nil {
 			err = werr
 		}
 	}
-	return
+	return n, err
 }
 
 func (s *rateConn) Write(b []byte) (n int, err error) {
 	if s == nil || s.conn == nil {
 		return 0, ErrNilConn
 	}
-	limited := len(b) > 0 && s.write.rate != nil
-	var charge writeCharge
-	if limited {
-		if err = s.chargeWrite(int64(len(b)), &charge); err != nil {
-			charge.refund(int64(len(b)))
+	d := &s.write
+	if d.rate == nil || len(b) == 0 {
+		return s.conn.Write(b)
+	}
+	if d.writing != nil {
+		if err := d.lockWrite(); err != nil {
 			return 0, err
 		}
+		defer d.unlockWrite()
 	}
-	n, err = s.conn.Write(b)
-	if limited && n < len(b) {
-		// No more than the charge, even for a writer that reports n < 0.
-		charge.refund(int64(len(b) - max(n, 0)))
+	for n < len(b) {
+		var charge writeCharge
+		size, err := d.grantWrite(int64(len(b)-n), s.datagram, &charge)
+		if err != nil {
+			charge.refund(size)
+			return n, err
+		}
+		m, err := s.conn.Write(b[n : n+int(size)])
+		// No more than the charge, even for a writer that reports n < 0
+		// or more than it was given.
+		m = min(max(m, 0), int(size))
+		if int64(m) < size {
+			charge.refund(size - int64(m))
+		}
+		n += m
+		if err != nil {
+			return n, err
+		}
+		if int64(m) < size {
+			return n, io.ErrShortWrite
+		}
 	}
-	return
+	return n, nil
 }
 
 // CloseRead shuts down the reading side of the wrapped connection, as
 // *net.TCPConn does, or returns an error matching errors.ErrUnsupported when
-// it cannot. On success it also ends a read's limiter wait with net.ErrClosed,
-// retaining any bytes already read and their charge.
+// it cannot. On success it also ends a read's limiter wait with net.ErrClosed.
 func (s *rateConn) CloseRead() error {
 	if s == nil || s.conn == nil {
 		return ErrNilConn
@@ -206,40 +304,10 @@ func (s *rateConn) Close() error {
 	return s.conn.Close()
 }
 
-// wait charges size to d's limiter, if any. It returns net.ErrClosed if Close
-// ended the wait, os.ErrDeadlineExceeded if d's deadline did, and any other
-// error from the limiter as it is.
-func (s *rateConn) wait(d *direction, size int64) error {
-	switch l := d.rate.(type) {
-	case *Rate:
-		g := d.cancel.current() // before charging, as in chargeWrite
-		wait, gen := l.reserveAt(size, nowNs())
-		return d.sleep(wait, gen, g)
-	case *HierarchicalLimiter:
-		g := d.cancel.current()
-		var waits waitSet
-		l.reserve(size, &waits)
-		return d.sleepSet(&waits, g)
-	}
-	switch {
-	case d.ctxRate != nil:
-		g := d.cancel.current() // the whole wait uses one generation
-		if err := d.ctxRate.GetContext(g, size); err != nil {
-			if g.ended() {
-				return g.cause()
-			}
-			return err
-		}
-	case d.rate != nil:
-		d.rate.Get(size)
-	}
-	return nil
-}
-
-// sleep waits wait in d's timer until Stop on gen or g's end. It returns g's
+// sleep waits wait in d's timer until Disable on gen or g's end. It returns g's
 // cause if g ended the wait.
 func (d *direction) sleep(wait int64, gen *generation, g *waitGen) error {
-	if wait > coalesceWaitNs && !d.timer.sleep(wait, gen.waitCh(d.timer.key()), g.Done()) {
+	if wait > coalesceWaitNs && d.timer.sleep(wait, gen, g.Done()) == canceled {
 		return g.cause()
 	}
 	return nil
@@ -261,10 +329,10 @@ const (
 	genClosed
 )
 
-// waitGen is one generation of a direction's wait signal and the context a
-// wait passes to GetContext. Its Done channel is made on first use, since
-// most waits need none, and never changes; Err is non-nil once it is closed,
-// as context.Context requires.
+// waitGen is one generation of a direction's wait signal and the context a wait
+// passes to its Limiter's Wait. Its Done channel is made on first use, since
+// most waits need none, and never changes; Err is non-nil once it is closed, as
+// context.Context requires.
 type waitGen struct {
 	done  atomic.Value // chan struct{}, set by Done or end
 	state atomic.Uint32
@@ -366,6 +434,14 @@ func newDeadlineTimer(g *waitGen, at time.Time, d time.Duration) *deadlineTimer 
 	return dt
 }
 
+// stop disarms dt for good.
+func (dt *deadlineTimer) stop() {
+	dt.mu.Lock()
+	defer dt.mu.Unlock()
+	dt.at, dt.firesAt = time.Time{}, time.Time{}
+	dt.t.Stop()
+}
+
 func (dt *deadlineTimer) fire() {
 	dt.mu.Lock()
 	defer dt.mu.Unlock()
@@ -454,10 +530,7 @@ func (w *waitCancel) close() {
 	}
 	w.closed = true
 	if dt := w.timer; dt != nil {
-		dt.mu.Lock()
-		dt.at, dt.firesAt = time.Time{}, time.Time{}
-		dt.t.Stop()
-		dt.mu.Unlock()
+		dt.stop()
 	}
 	if g.ended() {
 		// Waits on g keep their deadline error; later ones see the close.

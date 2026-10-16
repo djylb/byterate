@@ -55,10 +55,10 @@ func (m *Meter) Add(in, out int64) {
 	m.roll(nowNs())
 }
 
-// Snapshot returns the inbound, outbound and total throughput in bytes per
+// Throughput returns the inbound, outbound and total throughput in bytes per
 // second over the last sampling window of at least one second, closing the
 // current window if it is due.
-func (m *Meter) Snapshot() (inBps, outBps, totalBps int64) {
+func (m *Meter) Throughput() (inBps, outBps, totalBps int64) {
 	if m == nil {
 		return 0, 0, 0
 	}

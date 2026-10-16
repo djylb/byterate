@@ -20,10 +20,10 @@ func TestWriteReceiptRefundsEveryLevel(t *testing.T) {
 				case 1:
 					rates[i].SetLimit(0)
 				case 2:
-					rates[i].Stop()
+					rates[i].Disable()
 				}
 			}
-			c := NewRateReadWriteCloser(&scriptedConn{writeN: 50}, NewHierarchicalLimiter(rates...))
+			c := NewReadWriteCloser(&scriptedConn{writeN: 50}, NewHierarchy(rates...))
 			_, _ = c.Write(make([]byte, 200))
 			for i, r := range rates {
 				want := int64(50)
@@ -57,14 +57,14 @@ func TestUnlimitedWriteRefundPreservesOtherDebt(t *testing.T) {
 				r := NewRate(0)
 				if temporary {
 					r.SetLimit(1000)
-					r.Get(2000)
+					_ = r.Wait(bg, 2000)
 					r.reserve(10000)
 					r.SetLimit(0)
 				}
-				c := NewRateReadWriteCloser(&changingWriteConn{change: func() {
+				c := NewReadWriteCloser(&changingWriteConn{change: func() {
 					r.SetLimit(1000)
 					if !temporary {
-						r.Get(2000)
+						_ = r.Wait(bg, 2000)
 						r.reserve(10000)
 					}
 				}}, r)
@@ -77,20 +77,20 @@ func TestUnlimitedWriteRefundPreservesOtherDebt(t *testing.T) {
 	}
 }
 
-func TestHierarchicalWriteReceipts(t *testing.T) {
+func TestHierarchyWriteReceipts(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		// Exercise limited, unlimited and stopped levels, including receipts
+		// Exercise limited, unlimited and disabled levels, including receipts
 		// beyond the inline storage.
 		rates := []*Rate{NewRate(0), NewRate(1000), NewRate(0), NewRate(1000), NewRate(1000)}
 		for range 5 {
 			rates = append(rates, NewRate(1000))
 		}
-		rates[2].Stop()
-		l := NewHierarchicalLimiter(rates...)
-		c := NewRateReadWriteCloser(&changingWriteConn{change: func() {
+		rates[2].Disable()
+		l := NewHierarchy(rates...)
+		c := NewReadWriteCloser(&changingWriteConn{change: func() {
 			for _, r := range rates {
-				r.ResetLimit(1000)
-				r.Get(2000)
+				r.Reset(1000)
+				_ = r.Wait(bg, 2000)
 				r.reserve(10000)
 			}
 		}}, l)
@@ -106,21 +106,21 @@ func TestHierarchicalWriteReceipts(t *testing.T) {
 	})
 }
 
-func TestHierarchyRestartBeforeLevelCharge(t *testing.T) {
+func TestHierarchyResetBeforeLevelCharge(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		first, second := NewRate(1), NewRate(1000)
-		first.Get(2)
+		_ = first.Wait(bg, 2)
 		hook := func(r *Rate) {
 			if r == first {
 				// The second level restarts after the write begins but before
 				// it is charged. Its later charge must still be refundable.
-				second.ResetLimit(1000)
-				first.Stop()
+				second.Reset(1000)
+				first.Disable()
 			}
 		}
 		testHooks.reserved.Store(&hook)
 		defer testHooks.reserved.Store(nil)
-		c := NewRateReadWriteCloser(&scriptedConn{writeErr: errors.New("failed")}, NewHierarchicalLimiter(first, second))
+		c := NewReadWriteCloser(&scriptedConn{writeErr: errors.New("failed")}, NewHierarchy(first, second))
 		_, _ = c.Write(make([]byte, 4))
 		if got := metered(second); got != 0 {
 			t.Fatalf("refund of new-generation charge lost: meter=%d", got)
@@ -129,93 +129,92 @@ func TestHierarchyRestartBeforeLevelCharge(t *testing.T) {
 }
 
 // restartOnCharge restarts r once from inside its next charge, after the
-// charger has read r's generation, as a ResetLimit on another goroutine can.
+// charger has read r's generation, as a Reset on another goroutine can.
 func restartOnCharge(t *testing.T, r *Rate) {
 	var once sync.Once
 	hook := func(c *Rate) {
 		if c == r {
-			once.Do(func() { r.ResetLimit(r.Limit()) })
+			once.Do(func() { r.Reset(r.Limit()) })
 		}
 	}
 	testHooks.charging.Store(&hook)
 	t.Cleanup(func() { testHooks.charging.Store(nil) })
 }
 
-// TestChargeAfterConcurrentRestart charges a Rate that is restarted between
+// TestChargeAfterConcurrentReset charges a Rate that is restarted between
 // the charger reading its generation and charging it: the charge lands in
 // the new generation, so it must wait there, and a write's refund must
 // reach it.
-func TestChargeAfterConcurrentRestart(t *testing.T) {
-	type charger func(r *Rate) error
+func TestChargeAfterConcurrentReset(t *testing.T) {
 	failed := errors.New("write failed")
-	cases := map[string]charger{
-		"Get": func(r *Rate) error { r.Get(4000); return nil },
-		"GetContext": func(r *Rate) error {
-			return r.GetContext(context.Background(), 4000)
-		},
-		"Hierarchical": func(r *Rate) error {
-			NewHierarchicalLimiter2(NewRate(0), r).Get(4000)
-			return nil
-		},
-		"Read": func(r *Rate) error {
-			_, err := NewRateConn(&nopNetConn{}, r).Read(make([]byte, 4000))
+	// The charges of 4000 B at 1000 B/s that wait for all of it take 2s on
+	// the 2000 B burst the restart restores and leave 2s of debt. A Read
+	// takes a quantum, 512 B, as debt without waiting. A failed Write fails
+	// after its first grant, whose refund restores the burst. The Writes
+	// span sampling windows, so only the others' meters show the charge.
+	cases := map[string]struct {
+		charge  func(r *Rate) error
+		elapsed time.Duration
+		meter   int64 // -1: not checked
+		after   time.Duration
+	}{
+		"Wait": {func(r *Rate) error {
+			return r.Wait(context.Background(), 4000)
+		}, 2 * time.Second, 4000, 2 * time.Second},
+		"Hierarchical": {func(r *Rate) error {
+			return NewHierarchy(NewRate(0), r).Wait(bg, 4000)
+		}, 2 * time.Second, 4000, 2 * time.Second},
+		"Read": {func(r *Rate) error {
+			_, err := NewConn(&nopNetConn{}, r).Read(make([]byte, 4000))
 			return err
-		},
-		"Write": func(r *Rate) error {
-			_, err := NewRateConn(&nopNetConn{}, r).Write(make([]byte, 4000))
+		}, 0, 512, 512 * time.Millisecond},
+		"Write": {func(r *Rate) error {
+			_, err := NewConn(&nopNetConn{}, r).Write(make([]byte, 4000))
 			return err
-		},
-		"HierarchicalWrite": func(r *Rate) error {
-			_, err := NewRateConn(&nopNetConn{}, NewHierarchicalLimiter2(NewRate(0), r)).Write(make([]byte, 4000))
+		}, 2 * time.Second, -1, 2 * time.Second},
+		"HierarchicalWrite": {func(r *Rate) error {
+			_, err := NewConn(&nopNetConn{}, NewHierarchy(NewRate(0), r)).Write(make([]byte, 4000))
 			return err
-		},
-		"FailedWrite": func(r *Rate) error {
-			_, err := NewRateReadWriteCloser(&scriptedConn{writeErr: failed}, r).Write(make([]byte, 4000))
+		}, 2 * time.Second, -1, 2 * time.Second},
+		"FailedWrite": {func(r *Rate) error {
+			_, err := NewReadWriteCloser(&scriptedConn{writeErr: failed}, r).Write(make([]byte, 4000))
 			if !errors.Is(err, failed) {
 				return err
 			}
 			return nil
-		},
+		}, 0, 0, 0},
 	}
-	for name, charge := range cases {
+	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
 				r := NewRate(1000)
-				r.Get(2000) // the burst, which the restart restores
+				_ = r.Wait(bg, 2000) // the burst, which the restart restores
 				restartOnCharge(t, r)
 				start := time.Now()
-				if err := charge(r); err != nil {
+				if err := tc.charge(r); err != nil {
 					t.Fatal(err)
 				}
-				if got := time.Since(start); got != 2*time.Second {
-					t.Fatalf("4000 B at 1000 B/s after a restart restoring a 2000 B burst waited %v, want 2s", got)
+				if got := time.Since(start); got != tc.elapsed {
+					t.Fatalf("charge after a restart restoring a 2000 B burst took %v, want %v", got, tc.elapsed)
 				}
 				// The new generation meters the charge once, and its refund.
-				wantMeter := int64(4000)
-				if name == "FailedWrite" {
-					wantMeter = 0
+				if got := metered(r); tc.meter >= 0 && got != tc.meter {
+					t.Fatalf("meter after the charge = %d, want %d", got, tc.meter)
 				}
-				if got := metered(r); got != wantMeter {
-					t.Fatalf("meter after the charge = %d, want %d", got, wantMeter)
-				}
-				want := int64(0) // the refund restores the burst
-				if name != "FailedWrite" {
-					want = int64(2 * time.Second) // the 2000 B on top of the 4000
-				}
-				if wait := r.reserve(2000); wait != want {
-					t.Fatalf("reserve(2000) afterwards waits %v, want %v", time.Duration(wait), time.Duration(want))
+				if wait := r.reserve(2000); wait != int64(tc.after) {
+					t.Fatalf("reserve(2000) afterwards waits %v, want %v", time.Duration(wait), tc.after)
 				}
 			})
 		})
 	}
 }
 
-// TestRestartRaceLandsInOneGeneration races a charge that must wait with a
+// TestResetRaceLandsInOneGeneration races a charge that must wait with a
 // restart on a clock that does not move, as within one tick of a coarse
 // clock, where a new generation starts with the same debt the old one had.
 // The charge must land in one generation and act in that one alone: if its
 // debt is in the new generation, it must wait there.
-func TestRestartRaceLandsInOneGeneration(t *testing.T) {
+func TestResetRaceLandsInOneGeneration(t *testing.T) {
 	for _, refunded := range []bool{false, true} {
 		t.Run(map[bool]string{false: "fresh", true: "refunded"}[refunded], func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
@@ -223,7 +222,7 @@ func TestRestartRaceLandsInOneGeneration(t *testing.T) {
 					r := NewRate(1000)
 					if refunded {
 						r.reserve(1000)
-						r.ReturnBucket(1000) // tat back at the burst floor
+						r.Refund(1000) // tat back at the burst floor
 					}
 					var elapsed time.Duration
 					var wg sync.WaitGroup
@@ -231,13 +230,13 @@ func TestRestartRaceLandsInOneGeneration(t *testing.T) {
 					wg.Go(func() {
 						<-start
 						s := time.Now()
-						r.Get(5000) // 3s after the 2s burst
+						_ = r.Wait(bg, 5000) // 3s after the 2s burst
 						elapsed = time.Since(s)
 					})
 					wg.Go(func() {
 						<-start
-						r.Stop()
-						r.Start()
+						r.Disable()
+						r.Enable()
 					})
 					close(start)
 					wg.Wait()
@@ -283,18 +282,18 @@ func TestConvertDebtAlwaysChangesTat(t *testing.T) {
 	})
 }
 
-// TestStopWakesEveryWaiter stops a Rate that many connections and callers of
-// Get wait on, spread over the channels of its generation: every one must
-// wake at once.
-func TestStopWakesEveryWaiter(t *testing.T) {
+// TestDisableWakesEveryWaiter disables a Rate that many connections and
+// callers of Wait wait on, spread over the channels of its generation: every
+// one must wake at once.
+func TestDisableWakesEveryWaiter(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		r := NewRate(1000)
 		r.reserve(2000) // spend the burst
 		var wg sync.WaitGroup
 		for range 200 {
-			c := NewRateConn(&nopNetConn{}, r)
+			c := NewConn(&nopNetConn{}, r)
 			wg.Go(func() { _, _ = c.Write(make([]byte, 1000)) })
-			wg.Go(func() { r.Get(1000) })
+			wg.Go(func() { _ = r.Wait(bg, 1000) })
 		}
 		synctest.Wait()
 		used := 0
@@ -306,11 +305,41 @@ func TestStopWakesEveryWaiter(t *testing.T) {
 		if used < 2 {
 			t.Fatalf("400 waiters share %d channel(s)", used)
 		}
+		// The first waiters took the channels of the small first set, which
+		// Disable must close too once a larger set has replaced it.
+		if set := r.gen.Load().stop.Load(); sharedStopShards() > initialStopShards && set.prev == nil {
+			t.Fatalf("stop set of %d channels did not grow for 400 waiters", len(set.shards))
+		}
 		start := time.Now()
-		r.Stop()
+		r.Disable()
 		wg.Wait()
 		if elapsed := time.Since(start); elapsed != 0 {
-			t.Fatalf("Stop woke the waiters after %v, want at once", elapsed)
+			t.Fatalf("Disable woke the waiters after %v, want at once", elapsed)
 		}
+	})
+}
+
+// TestPrivateRateKeepsSmallStopSet throttles both directions of a connection
+// with a Rate of its own, as one per connection is used in a hierarchy: its
+// waits must keep to the small first stop set, a channel per direction,
+// instead of growing it to the size of a shared Rate's.
+func TestPrivateRateKeepsSmallStopSet(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		r := NewRate(1000)
+		r.reserve(2000) // spend the burst
+		c := NewConn(&nopNetConn{}, r)
+		var wg sync.WaitGroup
+		for range 50 {
+			wg.Go(func() { _, _ = c.Write(make([]byte, 100)) })
+			wg.Go(func() { _, _ = c.Read(make([]byte, 100)) })
+			synctest.Wait()
+		}
+		set := r.gen.Load().stop.Load()
+		if set == nil || len(set.shards) != initialStopShards || set.made.Load() > 2 {
+			t.Fatalf("a connection's waits made a stop set of %d channels, %d of them used",
+				len(set.shards), set.made.Load())
+		}
+		r.Disable()
+		wg.Wait()
 	})
 }

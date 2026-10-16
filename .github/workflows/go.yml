@@ -27,7 +27,12 @@ jobs:
           go-version: ${{ matrix.go == 'stable' && 'stable' || '' }}
           cache: false
       - run: go vet ./...
-      - run: go test -race ./...
+      - run: go test -race -shuffle=on ./...
+      - name: Test 32-bit Windows
+        if: matrix.os == 'windows-latest'
+        env:
+          GOARCH: '386'
+        run: go test -shuffle=on ./...
 
   cross:
     name: vet (${{ matrix.target }})
@@ -58,8 +63,8 @@ jobs:
           go test -c -o /dev/null .
           # The runner executes 32-bit x86 binaries, and js/wasm with Node.
           case "$TARGET" in
-            linux/386) go test ./... ;;
-            js/wasm) go test -exec="$(go env GOROOT)/lib/wasm/go_js_wasm_exec" ./... ;;
+            linux/386) go test -shuffle=on ./... ;;
+            js/wasm) go test -shuffle=on -exec="$(go env GOROOT)/lib/wasm/go_js_wasm_exec" ./... ;;
           esac
 
   gofmt:

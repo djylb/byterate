@@ -18,39 +18,39 @@ import (
 func TestWaitsInAndOutOfSynctestBubbles(t *testing.T) {
 	waitOutside := func() {
 		r := NewRate(1000)
-		r.Get(2000) // the burst
-		r.Get(10)   // waits 10ms
+		_ = r.Wait(bg, 2000) // the burst
+		_ = r.Wait(bg, 10)   // waits 10ms
 	}
 	waitOutside()
 	for range 3 {
 		synctest.Test(t, func(t *testing.T) {
 			r := NewRate(1000)
-			r.Get(2000)
+			_ = r.Wait(bg, 2000)
 			start := time.Now()
-			r.Get(1500)
+			_ = r.Wait(bg, 1500)
 			if elapsed := time.Since(start); elapsed < 1500*time.Millisecond {
-				t.Fatalf("Get(1500) at 1000 B/s returned after %v of bubble time, want 1.5s", elapsed)
+				t.Fatalf("Wait(1500) at 1000 B/s returned after %v of bubble time, want 1.5s", elapsed)
 			}
 		})
 	}
 	waitOutside()
 }
 
-// TestRateConnReusesWaitTimer throttles writes on a connection: the waits
+// TestConnReusesWaitTimer throttles writes on a connection: the waits
 // after the first must reuse its timer, and so must not allocate, for a Rate
 // and for a hierarchy whose levels both wait.
-func TestRateConnReusesWaitTimer(t *testing.T) {
+func TestConnReusesWaitTimer(t *testing.T) {
 	for _, hierarchical := range []bool{false, true} {
 		t.Run(map[bool]string{false: "rate", true: "hierarchical"}[hierarchical], func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
 				r, other := NewRate(1<<20), NewRate(1<<20)
-				r.Get(2 << 20) // the burst
-				other.Get(2 << 20)
+				_ = r.Wait(bg, 2<<20) // the burst
+				_ = other.Wait(bg, 2<<20)
 				var l Limiter = r
 				if hierarchical {
-					l = NewHierarchicalLimiter(r, other, NewRate(0))
+					l = NewHierarchy(r, other, NewRate(0))
 				}
-				c := NewRateConn(&nopNetConn{}, l)
+				c := NewConn(&nopNetConn{}, l)
 				buf := make([]byte, 16<<10)
 				_, _ = c.Write(buf) // makes the timer and the generation's Done channel
 				allocs := testing.AllocsPerRun(100, func() {
@@ -80,7 +80,7 @@ func TestWaitTimerConcurrentWaits(t *testing.T) {
 				for j := range 20 {
 					wait := time.Duration(i+j+1) * time.Millisecond
 					start := time.Now()
-					if !w.sleep(int64(wait), nil, done) {
+					if w.sleep(int64(wait), nil, done) != slept {
 						t.Error("sleep reported a cancellation")
 					}
 					if got := time.Since(start); got != wait {
@@ -91,7 +91,7 @@ func TestWaitTimerConcurrentWaits(t *testing.T) {
 		}
 		wg.Wait()
 		close(done)
-		if w.sleep(int64(time.Second), nil, done) {
+		if w.sleep(int64(time.Second), nil, done) != canceled {
 			t.Fatal("sleep with done closed reported a full wait")
 		}
 	})
@@ -117,7 +117,7 @@ func TestWaitTimerDrainsFiredTimer(t *testing.T) {
 	}
 	var w waitTimer
 	fired := time.NewTimer(0)
-	time.Sleep(10 * time.Millisecond) // fires, as during a wait that Stop ended
+	time.Sleep(10 * time.Millisecond) // fires, as during a wait that Disable ended
 	w.put(fired)
 	next := w.take(time.Hour)
 	defer w.put(next)

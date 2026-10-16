@@ -8,14 +8,14 @@ import (
 	"time"
 )
 
-func BenchmarkRateConnWrite(b *testing.B) {
+func BenchmarkConnWrite(b *testing.B) {
 	for _, levels := range []int{1, 3, 5} {
 		b.Run(fmt.Sprint(levels), func(b *testing.B) {
 			rates := make([]*Rate, levels)
 			for i := range rates {
 				rates[i] = NewRate(benchLimit)
 			}
-			c := NewRateConn(&nopNetConn{}, NewHierarchicalLimiter(rates...))
+			c := NewConn(&nopNetConn{}, NewHierarchy(rates...))
 			defer func() { _ = c.Close() }()
 			buf := make([]byte, 32<<10)
 			b.ReportAllocs()
@@ -26,13 +26,31 @@ func BenchmarkRateConnWrite(b *testing.B) {
 	}
 }
 
-func BenchmarkCanceledGetContext(b *testing.B) {
+func BenchmarkConnRead(b *testing.B) {
+	for _, levels := range []int{1, 3, 5} {
+		b.Run(fmt.Sprint(levels), func(b *testing.B) {
+			rates := make([]*Rate, levels)
+			for i := range rates {
+				rates[i] = NewRate(benchLimit)
+			}
+			c := NewConn(&recordingConn{}, NewHierarchy(rates...))
+			defer func() { _ = c.Close() }()
+			buf := make([]byte, 32<<10)
+			b.ReportAllocs()
+			for b.Loop() {
+				_, _ = c.Read(buf)
+			}
+		})
+	}
+}
+
+func BenchmarkCanceledWait(b *testing.B) {
 	r := NewRate(1)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	b.ReportAllocs()
 	for b.Loop() {
-		_ = r.GetContext(ctx, 3)
+		_ = r.Wait(ctx, 3)
 	}
 }
 
@@ -40,19 +58,19 @@ func BenchmarkRateRefund(b *testing.B) {
 	r := NewRate(benchLimit)
 	b.ReportAllocs()
 	for b.Loop() {
-		r.Get(32 << 10)
-		r.ReturnBucket(32 << 10)
+		_ = r.Wait(bg, 32<<10)
+		r.Refund(32 << 10)
 	}
 }
 
 // BenchmarkRateRefundShared charges and refunds one Rate from every
-// goroutine, the worst case for the lock ReturnBucket takes.
+// goroutine, the worst case for the lock Refund takes.
 func BenchmarkRateRefundShared(b *testing.B) {
 	r := NewRate(benchLimit)
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
-			r.Get(32 << 10)
-			r.ReturnBucket(32 << 10)
+			_ = r.Wait(bg, 32<<10)
+			r.Refund(32 << 10)
 		}
 	})
 }
@@ -60,7 +78,7 @@ func BenchmarkRateRefundShared(b *testing.B) {
 // benchLimit is a limit that never makes a 32 KiB charge wait.
 const benchLimit = 1 << 50
 
-func BenchmarkRateGet(b *testing.B) {
+func BenchmarkRateWait(b *testing.B) {
 	for _, limit := range []int64{0, benchLimit} {
 		name := "unlimited"
 		if limit > 0 {
@@ -69,30 +87,30 @@ func BenchmarkRateGet(b *testing.B) {
 		b.Run(name, func(b *testing.B) {
 			r := NewRate(limit)
 			for b.Loop() {
-				r.Get(32 << 10)
+				_ = r.Wait(bg, 32<<10)
 			}
 		})
 	}
 }
 
-// BenchmarkRateGetShared charges one Rate from every goroutine, as a global
+// BenchmarkRateWaitShared charges one Rate from every goroutine, as a global
 // limit does.
-func BenchmarkRateGetShared(b *testing.B) {
+func BenchmarkRateWaitShared(b *testing.B) {
 	r := NewRate(benchLimit)
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
-			r.Get(32 << 10)
+			_ = r.Wait(bg, 32<<10)
 		}
 	})
 }
 
-// BenchmarkHierarchicalGet charges a connection Rate, one of four user Rates
+// BenchmarkHierarchyWait charges a connection Rate, one of four user Rates
 // and a global Rate.
-func BenchmarkHierarchicalGet(b *testing.B) {
+func BenchmarkHierarchyWait(b *testing.B) {
 	b.Run("single", func(b *testing.B) {
-		l := NewHierarchicalLimiter(NewRate(benchLimit), NewRate(benchLimit), NewRate(benchLimit))
+		l := NewHierarchy(NewRate(benchLimit), NewRate(benchLimit), NewRate(benchLimit))
 		for b.Loop() {
-			l.Get(32 << 10)
+			_ = l.Wait(bg, 32<<10)
 		}
 	})
 	b.Run("parallel", func(b *testing.B) {
@@ -101,18 +119,18 @@ func BenchmarkHierarchicalGet(b *testing.B) {
 		var next atomic.Int64
 		b.RunParallel(func(pb *testing.PB) {
 			user := users[next.Add(1)%int64(len(users))]
-			l := NewHierarchicalLimiter(NewRate(benchLimit), user, global)
+			l := NewHierarchy(NewRate(benchLimit), user, global)
 			for pb.Next() {
-				l.Get(32 << 10)
+				_ = l.Wait(bg, 32<<10)
 			}
 		})
 	})
 }
 
-func BenchmarkRateNow(b *testing.B) {
+func BenchmarkRateThroughput(b *testing.B) {
 	r := NewRate(benchLimit)
 	for b.Loop() {
-		_ = r.Now()
+		_ = r.Throughput()
 	}
 }
 
@@ -133,28 +151,28 @@ func BenchmarkMeterAdd(b *testing.B) {
 	})
 }
 
-func BenchmarkNewRateConn(b *testing.B) {
+func BenchmarkNewConn(b *testing.B) {
 	c, r := &nopNetConn{}, NewRate(benchLimit)
 	b.ReportAllocs()
 	for b.Loop() {
-		_ = NewRateConn(c, r)
+		_ = NewConn(c, r)
 	}
 }
 
-// BenchmarkRateConnSetDeadline sets a deadline before every operation, as
+// BenchmarkConnSetDeadline sets a deadline before every operation, as
 // servers with idle timeouts do.
-func BenchmarkRateConnSetDeadline(b *testing.B) {
-	c := NewRateConn(&nopNetConn{}, NewRate(benchLimit))
+func BenchmarkConnSetDeadline(b *testing.B) {
+	c := NewConn(&nopNetConn{}, NewRate(benchLimit))
 	b.ReportAllocs()
 	for b.Loop() {
 		_ = c.SetReadDeadline(time.Now().Add(time.Minute))
 	}
 }
 
-// BenchmarkRateConnWriteShared writes small packets on one connection per
+// BenchmarkConnWriteShared writes small packets on one connection per
 // goroutine, each charged to its own Rate, one of four user Rates and a
 // global Rate, as a proxy does.
-func BenchmarkRateConnWriteShared(b *testing.B) {
+func BenchmarkConnWriteShared(b *testing.B) {
 	for _, limit := range []int64{0, benchLimit} {
 		name := "unlimited"
 		if limit > 0 {
@@ -167,7 +185,7 @@ func BenchmarkRateConnWriteShared(b *testing.B) {
 			b.ReportAllocs()
 			b.RunParallel(func(pb *testing.PB) {
 				user := users[next.Add(1)%int64(len(users))]
-				c := NewRateConn(&nopNetConn{}, NewHierarchicalLimiter(NewRate(limit), user, global))
+				c := NewConn(&nopNetConn{}, NewHierarchy(NewRate(limit), user, global))
 				defer func() { _ = c.Close() }()
 				buf := make([]byte, 1500)
 				for pb.Next() {
