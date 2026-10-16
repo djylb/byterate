@@ -1,6 +1,7 @@
 package byterate
 
 import (
+	"context"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -96,6 +97,88 @@ func (c *Counter) ChargeIn(n int64) error {
 // ChargeOut adds n outbound bytes and returns nil, as ChargeIn does.
 func (c *Counter) ChargeOut(n int64) error {
 	c.Add(0, n)
+	return nil
+}
+
+// Total returns the inbound and outbound bytes since c began, which Swap does
+// not change: the running totals to persist, or to report as snapshots that
+// the receiver takes differences of. Refunds through c's views take bytes
+// off, so a total can also go down. Restore takes persisted totals back.
+func (c *Counter) Total() (in, out int64) {
+	if c == nil {
+		return 0, 0
+	}
+	return c.totals()
+}
+
+// Restore adds in and out to c's totals as bytes counted before, such as the
+// persisted totals of a counter that resumes after a restart: Total includes
+// them, but neither Swap nor Throughput reports them as new traffic.
+func (c *Counter) Restore(in, out int64) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.in.Add(in)
+	c.out.Add(out)
+	c.swappedIn += in
+	c.swappedOut += out
+	c.windowIn += in
+	c.windowOut += out
+}
+
+// Inbound returns a Limiter that never limits and counts the bytes charged to
+// it as c's inbound bytes, refunds taken off. Put it in a Hierarchy with the
+// limiters of the reads it counts, such as the read Limiter of NewDuplexConn,
+// so that c counts what the reads take, also through a Switch.
+func (c *Counter) Inbound() Limiter { return (*inboundCounter)(c) }
+
+// Outbound returns a Limiter that counts the bytes charged to it as c's
+// outbound bytes, as Inbound does for inbound ones.
+func (c *Counter) Outbound() Limiter { return (*outboundCounter)(c) }
+
+// inboundCounter and outboundCounter are the Limiter views of a Counter.
+type (
+	inboundCounter  Counter
+	outboundCounter Counter
+)
+
+func (c *inboundCounter) Wait(_ context.Context, n int64) error {
+	return c.Charge(n)
+}
+
+func (c *inboundCounter) Refund(n int64) {
+	if n > 0 {
+		(*Counter)(c).Add(-n, 0)
+	}
+}
+
+func (c *inboundCounter) Ready(_ context.Context, n int64) (int64, error) { return n, nil }
+
+func (c *inboundCounter) Charge(n int64) error {
+	if n > 0 {
+		(*Counter)(c).Add(n, 0)
+	}
+	return nil
+}
+
+func (c *outboundCounter) Wait(_ context.Context, n int64) error {
+	return c.Charge(n)
+}
+
+func (c *outboundCounter) Refund(n int64) {
+	if n > 0 {
+		(*Counter)(c).Add(0, -n)
+	}
+}
+
+func (c *outboundCounter) Ready(_ context.Context, n int64) (int64, error) { return n, nil }
+
+func (c *outboundCounter) Charge(n int64) error {
+	if n > 0 {
+		(*Counter)(c).Add(0, n)
+	}
 	return nil
 }
 

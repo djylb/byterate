@@ -44,23 +44,31 @@ until `SetLimit`.
 ## More
 
 **Budgets.** A `Budget` caps the total bytes. Once it is spent, reads and
-writes fail with `ErrBudgetExhausted`:
+writes fail with `ErrBudgetExhausted`, or, with a fallback, go on at the
+fallback's pace:
 
 ```go
 budget := byterate.NewBudget(10 << 30) // 10 GiB
 budget.OnLow(100<<20, func(left int64) { /* ask for more */ })
-budget.Grant(1<<30, time.Now().Add(time.Minute)) // 1 GiB more; it all lapses in a minute
+budget.Grant(1<<30, time.Now().Add(time.Minute)) // 1 GiB more, all lapsing in 1 min
+budget.SetFallback(byterate.NewRate(64 << 10))   // once spent, slow down to 64 KiB/s
 
 c := byterate.NewConn(conn, byterate.NewHierarchy(user, budget, global))
 ```
 
 **Counting.** A `Counter` adds up the bytes transferred and measures their
 throughput. `Swap` takes the totals since the last `Swap`, so that each byte
-is reported once:
+is reported once, and `Total` the running totals, to persist or report as
+snapshots; `Restore` takes persisted totals back after a restart. Its
+`Inbound` and `Outbound` views are limiters that never limit, so a
+connection can count exactly what its reads and writes take:
 
 ```go
-var traffic byterate.Counter // one per connection; NewSharedCounter for many goroutines
-traffic.Add(readBytes, writtenBytes)
+var traffic byterate.Counter // per connection; NewSharedCounter for many goroutines
+c := byterate.NewDuplexConn(conn,
+	byterate.NewHierarchy(user, traffic.Inbound()),
+	byterate.NewHierarchy(user, traffic.Outbound()))
+
 in, out := traffic.Swap()
 inBps, outBps := traffic.Throughput()
 ```
@@ -143,12 +151,20 @@ first and refuses them for the whole `Hierarchy`: the other levels neither
 take them nor make the caller wait. `Charge`, which records bytes already
 transferred, keeps them on every level and returns the refusal.
 
-**Budgets.** A `Budget` never blocks. A `Write` sends what is left of it and
-then fails; a `Read` that overdraws it returns the bytes it read with
-`ErrBudgetExhausted`. `Grant` adds bytes and sets when the whole budget lapses,
-and `OnLow` reports each time a charge takes it below a mark, so once until a
-`Grant` or `Refund` lifts it back. When to grant, and what to do with bytes
-left at a lapse, is up to the caller.
+**Budgets.** Without a fallback, a `Budget` never blocks: a `Write` sends what
+is left of it and then fails, and a `Read` that overdraws it returns the bytes
+it read with `ErrBudgetExhausted`. With a fallback, a spent `Budget` passes the
+bytes on to it, which sets their pace; the fallback is charged for them in
+addition to the `Budget`. Either way the `Budget` keeps taking the bytes it
+lets through, so `Left` goes below zero by the bytes used beyond it, and a
+later `Grant` pays them back first; a `Counter` beside it counts all of them.
+The choice between ending and slowing down the traffic does not change what
+is counted.
+
+`Grant` adds bytes and sets when the whole budget lapses, and `OnLow` reports
+each time a charge takes it below a mark, so once until a `Grant` or `Refund`
+lifts it back. When to grant, and what to do with bytes left at a lapse, is
+up to the caller.
 
 **Switching.** After `Switch.Set`, new charges go to the new limiter, and a
 wait in progress on a `Rate` of the old one ends, is refunded there, and
@@ -181,7 +197,7 @@ contend on one.
 `Counter.Add` is an atomic add per direction and does not read the clock; a
 shared `Counter` spreads the adds of many goroutines over counters per
 processor. An unlimited `Rate` takes memory for its meter once something is
-charged to it, so for levels that only count bytes, such as one per tunnel,
+charged to it, so for levels that only count bytes, such as one per connection,
 prefer a `Counter`.
 
 Wrapping a connection hides the zero-copy `ReadFrom` and `WriteTo` of

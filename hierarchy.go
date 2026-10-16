@@ -27,10 +27,10 @@ type Hierarchy struct {
 
 // NewHierarchy combines limiters into one Limiter, the levels of a Hierarchy
 // among them taking its place. Nil limiters, also nil pointers of this
-// package's types, are left out, and so are repeats of a *Rate, *Budget or
-// *Switch, so that a level given twice is charged once; unlimited Rates are
-// kept, as they meter and can be limited later. It returns nil when no level
-// remains and that level itself when one does.
+// package's types, are left out, and so are repeats of a *Rate, *Budget,
+// *Switch or Counter view, so that a level given twice is charged once;
+// unlimited Rates are kept, as they meter and can be limited later. It
+// returns nil when no level remains and that level itself when one does.
 //
 // Pass nil for levels that should neither limit nor meter: an unlimited Rate
 // still costs a charge per call.
@@ -75,7 +75,7 @@ func addLevels(lv []level, l Limiter) []level {
 		// Only pointers known to compare are looked up: comparing other
 		// Limiters could panic on an incomparable dynamic type.
 		switch t.(type) {
-		case *Budget, *Switch:
+		case *Budget, *Switch, *inboundCounter, *outboundCounter:
 			for _, x := range lv {
 				if x.other == t {
 					return lv

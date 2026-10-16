@@ -1,7 +1,9 @@
 package byterate
 
 import (
+	"context"
 	"errors"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -165,5 +167,164 @@ func TestBudgetOnLowAfterRacingGrant(t *testing.T) {
 		if reports.Load() != before+1 {
 			t.Fatalf("crossing after a racing Grant reported %d times, want once", reports.Load()-before)
 		}
+	}
+}
+
+// With a fallback, a spent Budget slows the traffic down to the fallback's
+// pace instead of ending it, and keeps counting the bytes beyond it.
+func TestBudgetFallbackSlowsDown(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		b := NewBudget(1000)
+		slow := NewRate(1000)
+		b.SetFallback(slow)
+		inner := &dataConn{}
+		conn := NewConn(inner, NewHierarchy(NewRate(1<<20), b))
+		start := time.Now()
+		if n, err := conn.Write(make([]byte, 10000)); n != 10000 || err != nil {
+			t.Fatalf("Write(10000) past a 1000 B Budget with a fallback = %d, %v", n, err)
+		}
+		// The Budget's 1000 B at once, then the fallback's 2000 B burst and
+		// 7000 B at 1000 B/s.
+		if got := time.Since(start); got < 6900*time.Millisecond || got > 7100*time.Millisecond {
+			t.Fatalf("Write took %v, want about 7s at the fallback's pace", got)
+		}
+		if b.Left() != -9000 {
+			t.Fatalf("Left() = %d, want -9000: the bytes used beyond the Budget", b.Left())
+		}
+
+		// Relay hooks slow down the same way.
+		rb := NewBudget(0)
+		rb.SetFallback(NewRate(1000))
+		start = time.Now()
+		for sent := int64(0); sent < 5000; {
+			n, err := rb.Ready(bg, 5000-sent)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := rb.Charge(n); err != nil {
+				t.Fatal(err)
+			}
+			sent += n
+		}
+		// The 2000 B burst at once, then the debt of each grant but the
+		// last: 2560 B at 1000 B/s.
+		if got := time.Since(start); got != 2560*time.Millisecond {
+			t.Fatalf("5000 B through a spent Budget's hooks took %v, want 2.56s", got)
+		}
+
+		// Without a fallback it refuses again.
+		b.SetFallback(nil)
+		if _, err := conn.Write(make([]byte, 10)); !errors.Is(err, ErrBudgetExhausted) {
+			t.Fatalf("Write after SetFallback(nil) = %v, want ErrBudgetExhausted", err)
+		}
+	})
+}
+
+// A refund of bytes that went beyond the Budget reaches its fallback too.
+func TestBudgetFallbackRefund(t *testing.T) {
+	b := NewBudget(100)
+	fallback := NewRate(1 << 20)
+	b.SetFallback(fallback)
+	if err := b.Wait(bg, 300); err != nil {
+		t.Fatal(err)
+	}
+	if b.Left() != -200 || metered(fallback) != 200 {
+		t.Fatalf("after Wait(300) of 100: left %d, fallback metered %d; want -200, 200", b.Left(), metered(fallback))
+	}
+	b.Refund(300)
+	if b.Left() != 100 || metered(fallback) != 0 {
+		t.Fatalf("after Refund(300): left %d, fallback metered %d; want 100, 0", b.Left(), metered(fallback))
+	}
+	defer func() {
+		if recover() == nil {
+			t.Fatal("SetFallback(b) on b did not panic")
+		}
+	}()
+	b.SetFallback(b)
+}
+
+// hookLimiter is a Limiter whose Wait runs a hook and then takes or refuses
+// the bytes, keeping count of what it took and got back.
+type hookLimiter struct {
+	hook        func()
+	refuse      bool
+	taken, back int64
+}
+
+func (l *hookLimiter) Wait(_ context.Context, n int64) error {
+	if l.hook != nil {
+		l.hook()
+	}
+	if l.refuse {
+		return errors.New("refused")
+	}
+	l.taken += n
+	return nil
+}
+func (l *hookLimiter) Refund(n int64)                                  { l.back += n }
+func (l *hookLimiter) Ready(_ context.Context, n int64) (int64, error) { return n, nil }
+func (l *hookLimiter) Charge(n int64) error                            { l.taken += n; return nil }
+
+// A fallback that refuses leaves the Budget as it was, so a refund racing
+// with the refusal cannot hand the fallback back bytes it never took.
+func TestBudgetFallbackRefusalLeavesBudget(t *testing.T) {
+	b := NewBudget(100)
+	fb := &hookLimiter{}
+	b.SetFallback(fb)
+	if err := b.Wait(bg, 150); err != nil { // 50 beyond, to the fallback
+		t.Fatal(err)
+	}
+	fb.refuse = true
+	fb.hook = func() { b.Refund(150) } // the first charge is undone meanwhile
+	if err := b.Wait(bg, 100); err == nil {
+		t.Fatal("Wait through a refusing fallback succeeded")
+	}
+	if b.Left() != 100 || fb.taken-fb.back != 0 {
+		t.Fatalf("left %d, fallback holds %d; want 100 and 0", b.Left(), fb.taken-fb.back)
+	}
+}
+
+// Refunds never give a fallback back more than it took, whatever happens
+// between a charge and its refund.
+func TestBudgetFallbackNeverOverRefunded(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		b := NewBudget(0)
+		b.Grant(1000, time.Now().Add(time.Minute))
+		fb := &hookLimiter{}
+		b.SetFallback(fb)
+		_ = b.Wait(bg, 500) // within the Budget: nothing to the fallback
+		time.Sleep(time.Minute)
+		b.Refund(500) // after the lapse
+		if fb.back != 0 {
+			t.Fatalf("a refund after a lapse gave the fallback %d it never took", fb.back)
+		}
+
+		other := &hookLimiter{}
+		b2 := NewBudget(0)
+		b2.SetFallback(fb)
+		_ = b2.Wait(bg, 300) // all to the first fallback
+		b2.SetFallback(other)
+		b2.Refund(300)
+		if other.back != 0 {
+			t.Fatalf("a refund after SetFallback gave the new fallback %d it never took", other.back)
+		}
+	})
+}
+
+// A spent Budget slowing writes down through a Rate does not allocate per
+// Write.
+func TestBudgetFallbackAllocatesNothing(t *testing.T) {
+	if runtime.GOOS == "js" {
+		t.Skip("time.Sleep allocates on js")
+	}
+	b := NewBudget(0)
+	slow := NewRate(1 << 20)
+	slow.reserve(2 << 20) // spend the burst, so that each Write below waits
+	b.SetFallback(slow)
+	conn := NewConn(&nopNetConn{}, NewHierarchy(NewRate(1<<30), b))
+	buf := make([]byte, 8<<10) // about 8 ms at the fallback's pace
+	_, _ = conn.Write(buf)
+	if allocs := testing.AllocsPerRun(20, func() { _, _ = conn.Write(buf) }); allocs != 0 {
+		t.Fatalf("a Write slowed by a fallback allocated %v times, want 0", allocs)
 	}
 }

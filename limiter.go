@@ -2,8 +2,9 @@ package byterate
 
 import "context"
 
-// Limiter charges and refunds byte budgets. *Rate, *Hierarchy, *Budget and
-// *Switch implement it, and the connection wrappers take any implementation.
+// Limiter charges and refunds byte budgets. *Rate, *Hierarchy, *Budget,
+// *Switch and the views of a Counter implement it, and the connection
+// wrappers take any implementation.
 // Most code combines those and never implements Limiter itself.
 //
 // A transfer is charged one of two ways. Wait charges the bytes before they

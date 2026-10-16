@@ -125,3 +125,33 @@ func ExampleRate_Ready() {
 	fmt.Println(sent)
 	// Output: 102400
 }
+
+// Slow a connection down, instead of ending it, once its Budget is spent;
+// the Budget still counts the bytes used beyond it.
+func ExampleBudget_SetFallback() {
+	client, server := net.Pipe()
+	defer func() { _ = server.Close() }()
+	go func() { _, _ = io.Copy(io.Discard, server) }()
+	budget := byterate.NewBudget(1000)
+	budget.SetFallback(byterate.NewRate(1 << 20)) // the pace once it is spent
+	conn := byterate.NewConn(client, budget)
+	defer func() { _ = conn.Close() }()
+
+	n, err := conn.Write(make([]byte, 4000))
+	fmt.Println(n, err, budget.Left())
+	// Output: 4000 <nil> -3000
+}
+
+// Count exactly what a connection's reads and writes take.
+func ExampleCounter_Inbound() {
+	client, server := net.Pipe()
+	defer func() { _ = server.Close() }()
+	go func() { _, _ = server.Write([]byte("hello")) }()
+	var traffic byterate.Counter
+	conn := byterate.NewDuplexConn(client, traffic.Inbound(), traffic.Outbound())
+	defer func() { _ = conn.Close() }()
+
+	_, _ = io.ReadFull(conn, make([]byte, 5))
+	fmt.Println(traffic.Total())
+	// Output: 5 0
+}

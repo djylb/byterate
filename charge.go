@@ -130,9 +130,12 @@ func (v *levels) readyOthers(ctx context.Context, t *waitTimer, size int64, whol
 		}
 		var n int64
 		var err error
-		if s, ok := o.(*Switch); ok {
-			n, err = s.ready(ctx, t, size)
-		} else {
+		switch l := o.(type) {
+		case *Switch:
+			n, err = l.ready(ctx, t, size)
+		case *Budget:
+			n, err = l.ready(ctx, t, size)
+		default:
 			n, err = o.Ready(ctx, size)
 		}
 		if err != nil {
@@ -204,10 +207,13 @@ func (v *levels) wait(ctx context.Context, t *waitTimer, switchCh <-chan struct{
 		}
 		charged := o
 		var err error
-		if s, ok := o.(*Switch); ok {
+		switch l := o.(type) {
+		case *Switch:
 			// The Limiter it charged, which a refund must reach after a Set.
-			charged, err = s.wait(ctx, t, size)
-		} else {
+			charged, err = l.wait(ctx, t, size)
+		case *Budget:
+			err = l.wait(ctx, t, size)
+		default:
 			err = o.Wait(ctx, size)
 		}
 		if err != nil {

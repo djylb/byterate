@@ -169,8 +169,9 @@ func (d *direction) lockWrite() error {
 
 func (d *direction) unlockWrite() { <-d.writing }
 
-// nilLimiter returns nil for a nil *Rate, *Hierarchy, *Budget or *Switch, which
-// limit nothing, so that they do not hide the wrapped connection.
+// nilLimiter returns nil for a nil Limiter of this package, such as a nil
+// *Rate, *Budget or Counter view, which limit nothing, so that they do not
+// hide the wrapped connection.
 func nilLimiter(l Limiter) Limiter {
 	switch v := l.(type) {
 	case *Rate:
@@ -186,6 +187,14 @@ func nilLimiter(l Limiter) Limiter {
 			return nil
 		}
 	case *Switch:
+		if v == nil {
+			return nil
+		}
+	case *inboundCounter:
+		if v == nil {
+			return nil
+		}
+	case *outboundCounter:
 		if v == nil {
 			return nil
 		}
