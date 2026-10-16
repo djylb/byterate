@@ -81,7 +81,7 @@ func TestNestedSwitchRefundsWhereItCharged(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		r := NewRate(1000)
 		r.reserve(2000) // spend the burst, so that the grant waits
-		a, b := NewBudget(10000), NewBudget(10000)
+		a, b := NewBudget(), NewBudget()
 		s := NewSwitch(a)
 		failed := errors.New("write failed")
 		conn := NewReadWriteCloser(&scriptedConn{writeErr: failed}, NewHierarchy(r, s))
@@ -95,8 +95,8 @@ func TestNestedSwitchRefundsWhereItCharged(t *testing.T) {
 		if err := <-done; !errors.Is(err, failed) {
 			t.Fatalf("Write() = %v, want %v", err, failed)
 		}
-		if a.Left() != 10000 || b.Left() != 10000 {
-			t.Fatalf("budgets left a/b = %d/%d, want the failed write refunded to a: 10000/10000", a.Left(), b.Left())
+		if a.Used() != 0 || b.Used() != 0 {
+			t.Fatalf("budgets used a/b = %d/%d, want the failed write refunded to a: 0/0", a.Used(), b.Used())
 		}
 	})
 }

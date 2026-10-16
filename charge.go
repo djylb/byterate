@@ -206,19 +206,23 @@ func (v *levels) wait(ctx context.Context, t *waitTimer, switchCh <-chan struct{
 			continue
 		}
 		charged := o
+		var budget budgetReceipt
 		var err error
 		switch l := o.(type) {
 		case *Switch:
 			// The Limiter it charged, which a refund must reach after a Set.
 			charged, err = l.wait(ctx, t, size)
 		case *Budget:
-			err = l.wait(ctx, t, size)
+			// The step it charged, which a refund must reach.
+			charged = nil
+			budget, err = l.wait(ctx, t, size)
 		default:
 			err = o.Wait(ctx, size)
 		}
 		if err != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil && errors.Is(err, ctxErr) {
 				receipt.addOther(charged) // canceled, so it kept the charge
+				receipt.addBudget(budget)
 				return size, err
 			}
 			receipt.refund(size)
@@ -226,6 +230,7 @@ func (v *levels) wait(ctx context.Context, t *waitTimer, switchCh <-chan struct{
 			return 0, err
 		}
 		receipt.addOther(charged)
+		receipt.addBudget(budget)
 	}
 	return size, waits.sleep(t, ctx, switchCh)
 }
@@ -256,10 +261,26 @@ type rateCharge struct {
 // ones on the stack, and the other Limiters charged. A larger hierarchy
 // needs a receipt for each additional level as well.
 type writeCharge struct {
-	fixed      [8]rateCharge
-	extra      []rateCharge
-	other      [2]Limiter
-	moreOthers []Limiter
+	fixed       [8]rateCharge
+	extra       []rateCharge
+	other       [2]Limiter
+	moreOthers  []Limiter
+	budget      [2]budgetReceipt
+	moreBudgets []budgetReceipt
+}
+
+// addBudget records the receipt of a Budget that took the charge.
+func (c *writeCharge) addBudget(r budgetReceipt) {
+	if r.b == nil {
+		return
+	}
+	for i := range c.budget {
+		if c.budget[i].b == nil {
+			c.budget[i] = r
+			return
+		}
+	}
+	c.moreBudgets = append(c.moreBudgets, r)
 }
 
 // addOther records that l, a Limiter other than a Rate, took the charge.
@@ -330,6 +351,12 @@ func (c *writeCharge) refund(size int64) {
 	}
 	for _, l := range c.moreOthers {
 		l.Refund(size)
+	}
+	for i := range c.budget {
+		c.budget[i].refund(size)
+	}
+	for i := range c.moreBudgets {
+		c.moreBudgets[i].refund(size)
 	}
 }
 

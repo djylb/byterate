@@ -1,183 +1,255 @@
 package byterate
 
 import (
+	"cmp"
 	"context"
 	"errors"
+	"slices"
 	"sync/atomic"
 	"time"
 )
 
-// ErrBudgetExhausted is returned by a Budget that has no bytes left or whose
-// grant has lapsed, unless a fallback Limiter takes over.
+// ErrBudgetExhausted is returned for bytes that a Budget stops: once its
+// usage reaches a step with Stop, or once its expiry has passed.
 var ErrBudgetExhausted = errors.New("byterate: budget exhausted")
 
-// Budget is a Limiter of a total number of bytes rather than a rate: each
-// charge takes bytes from it. Once they run out, or its grant lapses, it is
-// spent, and by default refuses further transfers with ErrBudgetExhausted,
-// which ends the connection reads and writes charged to it. With a fallback
-// set by SetFallback, a spent Budget passes the bytes on to that Limiter
-// instead, such as a slow Rate, so that traffic goes on at its pace.
-//
-// A spent Budget still takes the bytes it lets through, so Left goes below
-// zero by the bytes used beyond it, and a later Grant pays them back first.
-// The fallback is charged for those bytes as well, to set their pace; it
-// does not pay for them instead of the Budget. The choice between refusing
-// and slowing down does not change what the Budget, or a Counter beside it,
-// counts.
-//
-// Grant adds bytes, optionally until a time after which the whole Budget
-// lapses, and OnLow reports when it runs low, for example so that more can
-// be requested in time. When and how to grant, and what to do with bytes
-// left at a lapse, is up to the caller.
-//
-// A Budget without a fallback never blocks: Wait takes the bytes or refuses
-// them at once. Put it in a Hierarchy with Rates to limit the speed as well.
-//
-// All methods are safe for concurrent use and on a nil *Budget, which never
-// refuses. The zero value has no bytes.
-type Budget struct {
-	left     atomic.Int64
-	expires  atomic.Int64 // nowNs after which the Budget lapses, 0 for never
-	lowMark  atomic.Int64
-	onLow    atomic.Pointer[func(left int64)]
-	fallback atomic.Pointer[fallbackLimiter]
+// Step is a step of a Budget: what applies once the bytes used in the period
+// reach After.
+type Step struct {
+	// After is the number of bytes used in the period from which the step
+	// applies.
+	After int64
+	// Limit, if set, is charged for the bytes of the step on top of the
+	// other limits, so that it sets their pace, such as a slower Rate. A
+	// step with Stop needs none.
+	Limit Limiter
+	// Stop ends the period's traffic: from After on, the Budget refuses all
+	// bytes with ErrBudgetExhausted, which ends the connection reads and
+	// writes charged to it, and steps after it never apply.
+	Stop bool
 }
 
-// fallbackLimiter holds the Limiter of a spent Budget and the bytes charged
-// to it and not refunded, which no refund to it may exceed.
-type fallbackLimiter struct {
-	l    Limiter
+// Budget is a Limiter that counts the bytes used in a period and applies a
+// Step once they reach its After: from there on, its Limit sets their pace,
+// or Stop refuses them. Steps can slow traffic down in stages and stop it,
+// such as to 1 MiB/s past 10 GiB, to 64 KiB/s past 20 GiB and not at all
+// past 30 GiB. Before the first step a Budget limits nothing, and without
+// steps it only counts.
+//
+// Reset starts a new period, and SetSteps and SetUsed change the steps and
+// the bytes used, at any time and without ending the connections charged to
+// the Budget: the next charge sees the change. When periods begin, such as
+// each hour, day or month, is up to the caller. SetExpiry makes the Budget
+// stop all bytes after a time, until it is set again.
+//
+// The bytes used count everything charged to the Budget, refunds taken off,
+// whichever step applied; a step's Limit sees only the bytes of its step.
+// Ready and the connection wrappers end a grant at the next step, so a step
+// applies from its After, and a Write never takes the usage past a Stop. A
+// Read charges what it read, so concurrent Reads can each pass a Stop by
+// their last grant; Charge, which records bytes already transferred, counts
+// them in the step that applied before them.
+//
+// All methods are safe for concurrent use and on a nil *Budget, which never
+// limits. The zero value only counts until SetSteps.
+type Budget struct {
+	used    atomic.Int64
+	period  atomic.Uint64 // counts Reset and SetUsed, which void earlier charges
+	expires atomic.Int64  // nowNs after which the Budget stops all bytes, 0 for never
+	steps   atomic.Pointer[budgetSteps]
+	onStep  atomic.Pointer[func(step int, used int64)]
+}
+
+// budgetSteps is one set of steps of a Budget, sorted by After, and the After
+// of its first step with Stop, or maxI64 for none.
+type budgetSteps struct {
+	steps  []budgetStep
+	stopAt int64
+}
+
+// budgetStep is a Step and the bytes charged to its Limit and not refunded,
+// which no refund to it may exceed.
+type budgetStep struct {
+	Step
 	owed atomic.Int64
 }
 
-// NewBudget returns a Budget of n bytes that does not lapse.
-func NewBudget(n int64) *Budget {
+// noSteps is the step set of a Budget without steps.
+var noSteps = &budgetSteps{stopAt: maxI64}
+
+// NewBudget returns a Budget with steps, at the start of a period.
+func NewBudget(steps ...Step) *Budget {
 	b := &Budget{}
-	b.left.Store(n)
+	b.SetSteps(steps...)
 	return b
 }
 
-// Grant adds n bytes to b and sets when b lapses: never for a zero expires.
-// Bytes left at a lapse stay in b and count again after a Grant that sets a
-// later time, less what a fallback let through meanwhile.
-func (b *Budget) Grant(n int64, expires time.Time) {
+// SetSteps replaces the steps of b, given in any order, from the next
+// charge; Steps returns them sorted. Of steps with the same After, the last
+// one given applies, except that a step with Stop always does: from its After
+// on, b refuses everything. A step's Limit must not be or contain b.
+func (b *Budget) SetSteps(steps ...Step) {
+	if b == nil {
+		return
+	}
+	sorted := slices.Clone(steps)
+	slices.SortStableFunc(sorted, func(x, y Step) int { return cmp.Compare(x.After, y.After) })
+	set := &budgetSteps{steps: make([]budgetStep, len(sorted)), stopAt: maxI64}
+	for i, s := range sorted {
+		s.Limit = nilLimiter(s.Limit)
+		if limits(s.Limit, b) {
+			panic("byterate: Budget step limited by the Budget itself")
+		}
+		set.steps[i].Step = s
+		if s.Stop && set.stopAt == maxI64 {
+			set.stopAt = s.After
+		}
+	}
+	b.steps.Store(set)
+}
+
+// limits reports whether l is b or a Hierarchy that holds it.
+func limits(l Limiter, b *Budget) bool {
+	switch t := l.(type) {
+	case *Budget:
+		return t == b
+	case *Hierarchy:
+		for _, lv := range t.levels {
+			if limits(lv.other, b) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// Steps returns b's steps, sorted by After.
+func (b *Budget) Steps() []Step {
+	set := b.stepSet()
+	steps := make([]Step, len(set.steps))
+	for i := range set.steps {
+		steps[i] = set.steps[i].Step
+	}
+	return steps
+}
+
+// Reset starts a new period: the bytes used go back to zero, and with them
+// the step that applies. Refunds of bytes charged before it are dropped.
+func (b *Budget) Reset() { b.SetUsed(0) }
+
+// Used returns the bytes used in the period.
+func (b *Budget) Used() int64 {
+	if b == nil {
+		return 0
+	}
+	return b.used.Load()
+}
+
+// SetUsed makes n the bytes used in the period, such as the bytes persisted
+// before a restart, or a total that several Budgets share. Refunds of bytes
+// charged before it are dropped, and OnStep does not report the step it
+// brings b into.
+func (b *Budget) SetUsed(n int64) {
+	if b == nil {
+		return
+	}
+	b.period.Add(1)
+	b.used.Store(max(n, 0))
+}
+
+// Step returns the index of the step that applies, in the order of After,
+// or -1 before the first step.
+func (b *Budget) Step() int {
+	if b == nil {
+		return -1
+	}
+	i, _ := b.stepSet().at(b.used.Load())
+	return i
+}
+
+// SetExpiry makes b stop all bytes after t, as a step with Stop does; a zero
+// t means never.
+func (b *Budget) SetExpiry(t time.Time) {
 	if b == nil {
 		return
 	}
 	var at int64
-	if !expires.IsZero() {
+	if !t.IsZero() {
 		// On the monotonic clock, measured from now; 0 means never.
-		if at = clampAdd(nowNs(), int64(time.Until(expires))); at == 0 {
+		if at = clampAdd(nowNs(), int64(time.Until(t))); at == 0 {
 			at = -1
 		}
 	}
 	b.expires.Store(at)
-	b.left.Add(n)
 }
 
-// SetFallback makes a spent b pass the bytes charged to it on to l, which
-// then sets their pace, instead of refusing them; a nil l restores the
-// refusal. Meant for pacing, l is charged for those bytes in addition to b.
-// Refunds of bytes charged to an earlier fallback do not reach it. l must not
-// be, contain or fall back to b.
-func (b *Budget) SetFallback(l Limiter) {
+// OnStep makes b call f with the index of the step that a charge brought b
+// into and the bytes used then, each time a charge reaches a later step; of
+// several steps passed at once, it reports the last. f runs on the goroutine
+// of that charge, so it must return quickly. Reports of concurrent charges
+// may come out of order, and a step reached again after a refund is reported
+// again. A nil f stops the reports.
+func (b *Budget) OnStep(f func(step int, used int64)) {
 	if b == nil {
 		return
 	}
-	if l = nilLimiter(l); l == nil {
-		b.fallback.Store(nil)
-		return
-	}
-	if l == Limiter(b) {
-		panic("byterate: Budget falls back to itself")
-	}
-	b.fallback.Store(&fallbackLimiter{l: l})
-}
-
-// Left returns the bytes left in b, at most 0 once b has lapsed. It is
-// negative by the bytes used beyond b, which a spent b let through to its
-// fallback or Charge recorded.
-func (b *Budget) Left() int64 {
-	if b == nil {
-		return 0
-	}
-	left := b.left.Load()
-	if b.lapsed() {
-		return min(left, 0)
-	}
-	return left
-}
-
-// OnLow makes b call f with the bytes left whenever a charge takes it from
-// mark bytes or more to fewer: once as it runs low, and again after a Grant
-// or Refund has lifted it back to mark. f runs on the goroutine of that
-// charge, so it must return quickly. A nil f stops the reports.
-func (b *Budget) OnLow(mark int64, f func(left int64)) {
-	if b == nil {
-		return
-	}
-	b.lowMark.Store(mark)
 	if f == nil {
-		b.onLow.Store(nil)
+		b.onStep.Store(nil)
 		return
 	}
-	b.onLow.Store(&f)
+	b.onStep.Store(&f)
 }
 
-// Wait takes n bytes from b. When fewer are left, or b has lapsed, it refuses
-// them with ErrBudgetExhausted, taking none, or with a fallback takes them
-// anyway and waits for the fallback for the bytes beyond what was left.
+// Wait charges n bytes to b and to the Limit of the step that applies, and
+// waits for that Limit. It refuses them with ErrBudgetExhausted, charging
+// nothing, when they would take the usage past a step with Stop, or after
+// the expiry.
 func (b *Budget) Wait(ctx context.Context, n int64) error {
-	return b.wait(ctx, nil, n)
-}
-
-// wait is Wait in timer t, nil for one per wait.
-func (b *Budget) wait(ctx context.Context, t *waitTimer, n int64) error {
-	if b == nil || n <= 0 {
-		return nil
-	}
-	lapsed := b.lapsed()
-	if !lapsed {
-		for {
-			left := b.left.Load()
-			if left < n {
-				break
-			}
-			if b.left.CompareAndSwap(left, left-n) {
-				b.checkLow(left, left-n)
-				return nil
-			}
-		}
-	}
-	fb := b.fallback.Load()
-	if fb == nil {
-		return ErrBudgetExhausted
-	}
-	// The fallback first, so that one refusing leaves b as it was.
-	beyond := b.beyond(n, b.left.Load(), lapsed)
-	err := fb.wait(ctx, t, beyond)
-	if err != nil {
-		if ctxErr := ctx.Err(); ctxErr == nil || !errors.Is(err, ctxErr) {
-			return err // refused, so neither b nor the fallback kept a charge
-		}
-	}
-	left := b.left.Add(-n)
-	b.checkLow(left+n, left)
-	// Charges since the first look moved the bytes beyond b: settle the
-	// difference with the fallback, which a refusal here cannot undo.
-	switch d := b.beyond(n, left+n, lapsed) - beyond; {
-	case d > 0:
-		fb.owed.Add(d)
-		_ = fb.l.Charge(d)
-	case d < 0:
-		fb.refund(-d)
-	}
+	_, err := b.wait(ctx, nil, n)
 	return err
 }
 
-// Ready returns how many of n bytes b has left. A spent b returns
-// ErrBudgetExhausted, or with a fallback what the fallback's Ready returns.
-// It charges nothing.
+// wait is Wait in timer t, nil for one per wait. It returns a receipt of the
+// charge for a refund, empty when nothing was charged.
+func (b *Budget) wait(ctx context.Context, t *waitTimer, n int64) (budgetReceipt, error) {
+	if b == nil || n <= 0 {
+		return budgetReceipt{}, nil
+	}
+	set := b.stepSet()
+	period := b.period.Load()
+	// Take the bytes before waiting, so that concurrent charges cannot pass
+	// a Stop together.
+	var used int64
+	for {
+		if b.expired() {
+			return budgetReceipt{}, ErrBudgetExhausted
+		}
+		used = b.used.Load()
+		if used+n > set.stopAt || used+n < used {
+			return budgetReceipt{}, ErrBudgetExhausted
+		}
+		if b.used.CompareAndSwap(used, used+n) {
+			break
+		}
+	}
+	_, s := set.at(used)
+	if s != nil && s.Limit != nil {
+		if err := s.wait(ctx, t, n); err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil && errors.Is(err, ctxErr) {
+				return budgetReceipt{b: b, step: s, period: period}, err // kept
+			}
+			b.release(n, period) // refused, so b keeps no charge either
+			return budgetReceipt{}, err
+		}
+	}
+	b.report(set, used, used+n)
+	return budgetReceipt{b: b, step: s, period: period}, nil
+}
+
+// Ready returns how many of n bytes may pass at once: up to the next step,
+// and as the Limit of the step that applies allows. It refuses with
+// ErrBudgetExhausted once the usage reaches a step with Stop, or after the
+// expiry, and charges nothing.
 func (b *Budget) Ready(ctx context.Context, n int64) (int64, error) {
 	return b.ready(ctx, nil, n)
 }
@@ -187,109 +259,191 @@ func (b *Budget) ready(ctx context.Context, t *waitTimer, n int64) (int64, error
 	if b == nil || n <= 0 {
 		return n, nil
 	}
-	if !b.lapsed() {
-		if left := b.left.Load(); left > 0 {
-			return min(n, left), nil
-		}
+	if b.expired() {
+		return 0, ErrBudgetExhausted
 	}
-	if fb := b.fallback.Load(); fb != nil {
-		v := levelsOf(fb.l)
-		return v.ready(ctx, t, nil, n, false)
+	set := b.stepSet()
+	used := b.used.Load()
+	if used >= set.stopAt {
+		return 0, ErrBudgetExhausted
 	}
-	return 0, ErrBudgetExhausted
+	i, s := set.at(used)
+	// Up to the next step, so that a step applies from its After.
+	if i+1 < len(set.steps) {
+		n = min(n, max(set.steps[i+1].After-used, 1))
+	}
+	if s == nil || s.Limit == nil {
+		return n, nil
+	}
+	v := levelsOf(s.Limit)
+	return v.ready(ctx, t, nil, n, false)
 }
 
-// Charge takes n transferred bytes from b, also beyond what is left. When
-// that spent b, it returns ErrBudgetExhausted, or with a fallback charges the
-// fallback for the bytes beyond what was left and returns its error.
+// Charge records n transferred bytes on b and on the Limit of the step that
+// applied before them, without waiting. It returns ErrBudgetExhausted when
+// the usage has reached a step with Stop, or after the expiry, and otherwise
+// the Limit's error; the bytes stay charged either way.
 func (b *Budget) Charge(n int64) error {
 	if b == nil || n <= 0 {
 		return nil
 	}
-	left := b.left.Add(-n)
-	b.checkLow(left+n, left)
-	lapsed := b.lapsed()
-	if left >= 0 && !lapsed {
-		return nil
+	set := b.stepSet()
+	used := b.add(n)
+	_, s := set.at(used)
+	var err error
+	if s != nil && s.Limit != nil {
+		s.owed.Add(n)
+		err = s.Limit.Charge(n)
 	}
-	fb := b.fallback.Load()
-	if fb == nil {
+	after := clampAdd(used, n)
+	b.report(set, used, after)
+	if after >= set.stopAt || b.expired() {
 		return ErrBudgetExhausted
-	}
-	beyond := b.beyond(n, left+n, lapsed)
-	fb.owed.Add(beyond)
-	return fb.l.Charge(beyond)
-}
-
-// Refund gives back n bytes that were taken but not transferred. The part
-// that lifts b back from below zero goes back to the fallback as well, up to
-// what the fallback took and has not had back, so a lapse, Grant or
-// SetFallback between a charge and its refund can leave the fallback with
-// some of it, never with less than it took.
-func (b *Budget) Refund(n int64) {
-	if b == nil || n <= 0 {
-		return
-	}
-	was := b.left.Add(n) - n
-	if fb := b.fallback.Load(); fb != nil {
-		fb.refund(min(n, max(-was, 0)))
-	}
-}
-
-// wait charges the fallback n bytes in timer t and waits for it, keeping
-// count of what it took.
-func (fb *fallbackLimiter) wait(ctx context.Context, t *waitTimer, n int64) error {
-	if n <= 0 {
-		return nil
-	}
-	v := levelsOf(fb.l)
-	var receipt writeCharge
-	_, err := v.wait(ctx, t, nil, n, true, &receipt)
-	if err == nil || ctx.Err() != nil && errors.Is(err, ctx.Err()) {
-		fb.owed.Add(n) // taken, as a wait that ctx ended keeps its charge
 	}
 	return err
 }
 
-// refund gives back up to n bytes to the fallback, no more than it is owed.
-func (fb *fallbackLimiter) refund(n int64) {
-	for n > 0 {
-		owed := fb.owed.Load()
-		back := min(n, owed)
-		if back <= 0 {
-			return
+// Refund takes back the last n bytes charged, which were not transferred,
+// and gives them back to the Limits of the steps they were charged in, as
+// far as those took them, from the latest step down. The connection wrappers
+// refund the exact step they charged instead.
+func (b *Budget) Refund(n int64) {
+	if b == nil || n <= 0 {
+		return
+	}
+	set := b.stepSet()
+	was := b.sub(n)
+	now := max(was-n, 0)
+	i, _ := set.at(was - 1)
+	for ; i >= 0 && n > 0; i-- {
+		s := &set.steps[i]
+		if s.Limit != nil {
+			n -= s.refund(n)
 		}
-		if fb.owed.CompareAndSwap(owed, owed-back) {
-			fb.l.Refund(back)
-			return
+		if s.After <= now {
+			break
 		}
 	}
 }
 
-// beyond returns how many of n bytes charged when b had was left go beyond
-// it, to the fallback: all of them while b has lapsed.
-func (b *Budget) beyond(n, was int64, lapsed bool) int64 {
-	if lapsed {
-		return n
-	}
-	return n - min(max(was, 0), n)
+// budgetReceipt records a charge to a Budget: the step whose Limit took it,
+// and the period it was charged in.
+type budgetReceipt struct {
+	b      *Budget
+	step   *budgetStep
+	period uint64
 }
 
-// lapsed reports whether b's grant has run out of time.
-func (b *Budget) lapsed() bool {
+// refund gives back n bytes of the charge: to the Budget, unless a Reset or
+// SetUsed since then voided it, and to the step's Limit.
+func (r *budgetReceipt) refund(n int64) {
+	if r.b == nil {
+		return
+	}
+	r.b.release(n, r.period)
+	if r.step != nil && r.step.Limit != nil {
+		r.step.refund(n)
+	}
+}
+
+// release takes n bytes charged in period off the usage, unless a Reset or
+// SetUsed since voided them.
+func (b *Budget) release(n int64, period uint64) {
+	if b.period.Load() == period {
+		b.sub(n)
+	}
+}
+
+// add adds n bytes to the usage, saturating, and returns the usage before.
+func (b *Budget) add(n int64) int64 {
+	for {
+		used := b.used.Load()
+		if b.used.CompareAndSwap(used, clampAdd(used, n)) {
+			return used
+		}
+	}
+}
+
+// sub takes n bytes off the usage, down to zero, and returns the usage
+// before.
+func (b *Budget) sub(n int64) int64 {
+	for {
+		used := b.used.Load()
+		if b.used.CompareAndSwap(used, max(used-n, 0)) {
+			return used
+		}
+	}
+}
+
+// report tells the OnStep callback of a charge that took the usage from
+// from to to into a later step of set.
+func (b *Budget) report(set *budgetSteps, from, to int64) {
+	f := b.onStep.Load()
+	if f == nil {
+		return
+	}
+	i, _ := set.at(from)
+	if j, _ := set.at(to); j > i {
+		(*f)(j, to)
+	}
+}
+
+// stepSet returns b's steps.
+func (b *Budget) stepSet() *budgetSteps {
+	if b != nil {
+		if set := b.steps.Load(); set != nil {
+			return set
+		}
+	}
+	return noSteps
+}
+
+// at returns the index of the step of set that applies at used bytes and
+// the step, or -1 and nil before the first step.
+func (set *budgetSteps) at(used int64) (int, *budgetStep) {
+	i := -1
+	for j := range set.steps {
+		if set.steps[j].After > used {
+			break
+		}
+		i = j
+	}
+	if i < 0 {
+		return -1, nil
+	}
+	return i, &set.steps[i]
+}
+
+// expired reports whether b's expiry has passed.
+func (b *Budget) expired() bool {
 	at := b.expires.Load()
 	return at != 0 && nowNs() >= at
 }
 
-// checkLow reports to the OnLow callback when a charge took b from was to
-// left bytes across the mark. Each charge sees its own change of the count,
-// so only the one that crosses the mark reports it.
-func (b *Budget) checkLow(was, left int64) {
-	f := b.onLow.Load()
-	if f == nil {
-		return
+// wait charges the step's Limit n bytes in timer t and waits for it, keeping
+// count of what it took.
+func (s *budgetStep) wait(ctx context.Context, t *waitTimer, n int64) error {
+	v := levelsOf(s.Limit)
+	var receipt writeCharge
+	_, err := v.wait(ctx, t, nil, n, true, &receipt)
+	if err == nil || ctx.Err() != nil && errors.Is(err, ctx.Err()) {
+		s.owed.Add(n) // taken, as a wait that ctx ended keeps its charge
 	}
-	if mark := b.lowMark.Load(); was >= mark && left < mark {
-		(*f)(left)
+	return err
+}
+
+// refund gives back up to n bytes to the step's Limit, no more than it is
+// owed, and returns how many it gave back.
+func (s *budgetStep) refund(n int64) int64 {
+	for {
+		owed := s.owed.Load()
+		back := min(n, owed)
+		if back <= 0 {
+			return 0
+		}
+		if s.owed.CompareAndSwap(owed, owed-back) {
+			s.Limit.Refund(back)
+			return back
+		}
 	}
 }

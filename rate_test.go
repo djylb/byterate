@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"runtime"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -713,7 +714,7 @@ func TestRateReadyAndCharge(t *testing.T) {
 func TestReadyEndsWithContext(t *testing.T) {
 	for name, wrap := range map[string]func(*Rate) Limiter{
 		"Rate":      func(r *Rate) Limiter { return r },
-		"Hierarchy": func(r *Rate) Limiter { return NewHierarchy(r, NewBudget(1<<30)) },
+		"Hierarchy": func(r *Rate) Limiter { return NewHierarchy(r, stopAfter(1<<30)) },
 		"Switch":    func(r *Rate) Limiter { return NewSwitch(r) },
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -736,4 +737,54 @@ func TestReadyEndsWithContext(t *testing.T) {
 			})
 		})
 	}
+}
+
+// SetBurst sets how much passes at once after an idle period, and the
+// grants of the connection wrappers follow it.
+func TestRateSetBurst(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		r := NewRate(1000)
+		if r.Burst() != 2*time.Second {
+			t.Fatalf("default Burst() = %v, want 2s", r.Burst())
+		}
+		r.SetBurst(100 * time.Millisecond)
+		time.Sleep(time.Second) // idle long past the burst
+		if wait := r.reserve(100); wait != 0 {
+			t.Fatalf("reserve(100) within a 100 B burst waited %v", time.Duration(wait))
+		}
+		if wait := r.reserve(100); wait != int64(100*time.Millisecond) {
+			t.Fatalf("reserve(100) past the burst waits %v, want 100ms", time.Duration(wait))
+		}
+		inner := &dataConn{}
+		conn := NewConn(inner, r)
+		time.Sleep(time.Second)
+		_, _ = conn.Write(make([]byte, 1000))
+		if largest := slices.Max(inner.runs); largest > 100 {
+			t.Fatalf("largest write with a 100 ms burst at 1000 B/s = %d B, want at most 100", largest)
+		}
+		if c := r.Clone(); c.Burst() != 100*time.Millisecond {
+			t.Fatalf("Clone() Burst() = %v, want 100ms", c.Burst())
+		}
+		r.SetBurst(0)
+		if r.Burst() != 2*time.Second {
+			t.Fatalf("Burst() after SetBurst(0) = %v, want the default 2s", r.Burst())
+		}
+	})
+}
+
+// A huge burst saturates instead of wrapping, also inside a synctest bubble,
+// where the clock reads below zero.
+func TestRateHugeBurstInBubble(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		r := NewRate(1000)
+		r.SetBurst(time.Duration(1<<63 - 1))
+		r.reserve(2000)
+		time.Sleep(10 * time.Second) // credit builds up past the default burst
+		if wait := r.reserve(10000); wait != 0 {
+			t.Fatalf("reserve(10000) after 10s with a huge burst waits %v, want 0", time.Duration(wait))
+		}
+		if wait := r.reserve(1000); wait != int64(time.Second) {
+			t.Fatalf("reserve(1000) then waits %v, want 1s", time.Duration(wait))
+		}
+	})
 }

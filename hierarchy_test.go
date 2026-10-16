@@ -325,26 +325,26 @@ func TestHierarchyRefundSkipsRestartedLevels(t *testing.T) {
 // bytes back to every level, while Charge keeps them and reports the refusal.
 func TestHierarchyRefusalRefundsEveryLevel(t *testing.T) {
 	r := NewRate(1 << 20)
-	b := NewBudget(100)
+	b := stopAfter(100)
 	l := NewHierarchy(r, b)
 	if err := l.Wait(bg, 1000); !errors.Is(err, ErrBudgetExhausted) {
 		t.Fatalf("Wait(1000) on a 100 B Budget = %v, want ErrBudgetExhausted", err)
 	}
-	if got := metered(r); got != 0 || b.Left() != 100 {
-		t.Fatalf("after a refused Wait the Rate metered %d and the Budget has %d left; want 0 and 100", got, b.Left())
+	if got := metered(r); got != 0 || b.Used() != 0 {
+		t.Fatalf("after a refused Wait the Rate metered %d and the Budget used %d; want 0 and 0", got, b.Used())
 	}
 	if n, err := l.Ready(bg, 1000); n != 100 || err != nil {
 		t.Fatalf("Ready(1000) = %d, %v; want the Budget's 100", n, err)
 	}
-	if err := l.Charge(1000); !errors.Is(err, ErrBudgetExhausted) || metered(r) != 1000 || b.Left() != -900 {
-		t.Fatalf("Charge(1000) = %v, metered %d, left %d; want ErrBudgetExhausted and the bytes kept", err, metered(r), b.Left())
+	if err := l.Charge(1000); !errors.Is(err, ErrBudgetExhausted) || metered(r) != 1000 || b.Used() != 1000 {
+		t.Fatalf("Charge(1000) = %v, metered %d, used %d; want ErrBudgetExhausted and the bytes kept", err, metered(r), b.Used())
 	}
 }
 
 // NewHierarchy takes any Limiter: it flattens a Hierarchy given as a level,
 // leaves out nil and repeated levels and collapses to a single one.
 func TestNewHierarchyFlattens(t *testing.T) {
-	r1, r2, b := NewRate(1), NewRate(2), NewBudget(1)
+	r1, r2, b := NewRate(1), NewRate(2), stopAfter(1)
 	s := NewSwitch(nil)
 	inner := NewHierarchy(r1, b)
 	l := NewHierarchy(inner, r2, b, (*Budget)(nil), (*Switch)(nil), s, s, nil).(*Hierarchy)

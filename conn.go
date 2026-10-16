@@ -45,7 +45,7 @@ type direction struct {
 // returns c unchanged.
 //
 // Data passes in grants of what the limit lets through at once: its credit,
-// up to two seconds of traffic after an idle period, or without credit a
+// up to the limit's burst after an idle period, or without credit a
 // quantum of about 20 ms of traffic, no more than the credit at its cap. A
 // Write sends its bytes a grant at a time, each charged before it goes out,
 // so a large Write neither bursts past the credit nor holds a shared limit

@@ -43,17 +43,32 @@ until `SetLimit`.
 
 ## More
 
-**Budgets.** A `Budget` caps the total bytes. Once it is spent, reads and
-writes fail with `ErrBudgetExhausted`, or, with a fallback, go on at the
-fallback's pace:
+**Budgets.** A `Budget` counts the bytes used in a period and applies steps
+as they grow: past each step's `After`, its `Limit` slows the traffic down,
+or `Stop` ends it with `ErrBudgetExhausted`:
 
 ```go
-budget := byterate.NewBudget(10 << 30) // 10 GiB
-budget.OnLow(100<<20, func(left int64) { /* ask for more */ })
-budget.Grant(1<<30, time.Now().Add(time.Minute)) // 1 GiB more, all lapsing in 1 min
-budget.SetFallback(byterate.NewRate(64 << 10))   // once spent, slow down to 64 KiB/s
+daily := byterate.NewBudget(
+	byterate.Step{After: 10 << 30, Limit: byterate.NewRate(1 << 20)},  // past 10 GiB: 1 MiB/s
+	byterate.Step{After: 20 << 30, Limit: byterate.NewRate(64 << 10)}, // past 20 GiB: 64 KiB/s
+	byterate.Step{After: 30 << 30, Stop: true},                        // past 30 GiB: stop
+)
+daily.OnStep(func(step int, used int64) { /* notify */ })
 
-c := byterate.NewConn(conn, byterate.NewHierarchy(user, budget, global))
+c := byterate.NewConn(conn, byterate.NewHierarchy(user, daily))
+
+daily.Reset()        // a new period starts over
+daily.SetSteps(...)  // new steps, from the next read or write; Steps() returns them
+daily.Used()         // the bytes used in the period
+```
+
+None of these changes ends a connection. Periods are up to the caller, such
+as each hour, day or week:
+
+```go
+var next func()
+next = func() { daily.Reset(); time.AfterFunc(24*time.Hour, next) }
+time.AfterFunc(time.Until(midnight), next)
 ```
 
 **Counting.** A `Counter` adds up the bytes transferred and measures their
@@ -108,7 +123,8 @@ bytes that were not transferred.
 ## How it behaves
 
 **Limits.** Limits are in bytes per second; `0` or less means unlimited. After
-an idle period a `Rate` lets two seconds' worth of bytes through at once.
+an idle period a `Rate` lets a burst through at once: two seconds' worth, or
+what `SetBurst` sets; a smaller burst smooths traffic out.
 `SetLimit` takes effect from the next charge and keeps what is owed: bytes
 charged at the old limit are repaid at the new one. `Reset` instead wakes
 blocked callers, drops the debt and starts over with a full burst.
@@ -146,25 +162,29 @@ bytes still waiting on a stricter one: it keeps its long-run limit, but when
 many waits on stricter levels end together, it can pass more than its burst at
 once. Pass `nil` for levels that should neither limit nor meter.
 
-**Refusals.** A level that refuses bytes, such as a spent `Budget`, is asked
+**Refusals.** A level that refuses bytes, such as a stopped `Budget`, is asked
 first and refuses them for the whole `Hierarchy`: the other levels neither
 take them nor make the caller wait. `Charge`, which records bytes already
 transferred, keeps them on every level and returns the refusal.
 
-**Budgets.** Without a fallback, a `Budget` never blocks: a `Write` sends what
-is left of it and then fails, and a `Read` that overdraws it returns the bytes
-it read with `ErrBudgetExhausted`. With a fallback, a spent `Budget` passes the
-bytes on to it, which sets their pace; the fallback is charged for them in
-addition to the `Budget`. Either way the `Budget` keeps taking the bytes it
-lets through, so `Left` goes below zero by the bytes used beyond it, and a
-later `Grant` pays them back first; a `Counter` beside it counts all of them.
-The choice between ending and slowing down the traffic does not change what
-is counted.
+**Budgets.** A `Budget` never blocks by itself; the `Limit` of its step does.
+Once the usage reaches a `Stop` step, it refuses everything until the next
+period. Writes never take the usage past it: a `Write` sends what fits and
+fails. A `Read` charges what it read, so the `Read` that reaches the stop
+returns its bytes with `ErrBudgetExhausted`, and concurrent reads can each
+pass it by their last grant. Steps apply from their `After`, as reads and writes end
+a grant there. The bytes used count everything charged to the `Budget`,
+whichever step applied, and a step's `Limit` only the bytes of its step; a
+`Limit` adds to the other limits, so it can only slow traffic down. For steps
+that also speed it up, leave the base speed out of the `Hierarchy` and give
+the first step, at `After: 0`, a `Limit` as well.
 
-`Grant` adds bytes and sets when the whole budget lapses, and `OnLow` reports
-each time a charge takes it below a mark, so once until a `Grant` or `Refund`
-lifts it back. When to grant, and what to do with bytes left at a lapse, is
-up to the caller.
+`Reset`, `SetUsed` and `SetSteps` take effect from the next read or write,
+without ending connections; a slowed connection gets its full speed back
+from its next grant. `SetUsed` takes back persisted usage after a restart,
+or a total that several budgets share, and `SetExpiry` stops all bytes after
+a time. `Reset` drops the usage of the period, so keep what is billed in a
+`Counter`.
 
 **Switching.** After `Switch.Set`, new charges go to the new limiter, and a
 wait in progress on a `Rate` of the old one ends, is refunded there, and

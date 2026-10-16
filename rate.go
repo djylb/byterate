@@ -9,8 +9,8 @@ import (
 	"time"
 )
 
-// burstWindowNs is the burst allowance: after an idle period a Rate lets up
-// to two seconds' worth of bytes through without waiting.
+// burstWindowNs is the default burst allowance: after an idle period a Rate
+// lets up to two seconds' worth of bytes through without waiting.
 const burstWindowNs = int64(2 * time.Second)
 
 // generation is the state of a Rate from one Enable that clears it to the
@@ -76,9 +76,9 @@ var (
 
 // newGeneration returns a generation with a full burst and a meter whose
 // first window starts at now.
-func newGeneration(now int64) *generation {
+func newGeneration(now, burstNs int64) *generation {
 	g := &generation{}
-	g.tat.Store(now - burstWindowNs)
+	g.tat.Store(subSat(now, burstNs))
 	g.lastSampleNs.Store(now)
 	return g
 }
@@ -136,8 +136,9 @@ func (g *generation) closeStop() {
 
 // Rate is a bytes-per-second limiter (GCRA, a token-bucket variant) with a
 // built-in throughput meter. A limit <= 0 means unlimited, and after an idle
-// period up to two seconds' worth of bytes pass without waiting. The meter
-// counts up to 2^63-1 bytes in a sampling window.
+// period a burst of bytes passes without waiting, two seconds' worth unless
+// SetBurst sets another. The meter counts up to 2^63-1 bytes in a sampling
+// window.
 //
 // All methods are safe for concurrent use and on a nil *Rate, which never
 // limits. The zero value is an enabled, unlimited Rate, ready for SetLimit. A
@@ -147,10 +148,11 @@ type Rate struct {
 	// every charge reads share it with nothing that others write.
 	gen      atomic.Pointer[generation] // nil until a zero value's first charge or Enable
 	rate     atomic.Int64               // bytes/s, <=0 => unlimited
+	burst    atomic.Int64               // ns of traffic passed at once after an idle period, 0 for burstWindowNs
 	debtRate int64                      // protected by mu: the limit tat's debt is reckoned at, the last one above 0
 	mu       sync.Mutex                 // serializes Enable, Disable, SetLimit, Clone and refunds; charges take no lock
 	disabled atomic.Bool                // written under mu
-	_        [cacheLineSize - 36]byte
+	_        [cacheLineSize - 44]byte
 }
 
 // NewRate returns a Rate limited to limitBps bytes per second with a full
@@ -161,7 +163,7 @@ func NewRate(limitBps int64) *Rate {
 	r := &Rate{debtRate: limitBps}
 	r.rate.Store(limitBps)
 	if limitBps > 0 {
-		r.gen.Store(newGeneration(nowNs())) // the full burst starts now
+		r.gen.Store(newGeneration(nowNs(), burstWindowNs)) // the full burst starts now
 	}
 	return r
 }
@@ -172,14 +174,14 @@ func (r *Rate) generation(now int64) *generation {
 	if g := r.gen.Load(); g != nil {
 		return g
 	}
-	if g := newGeneration(now); r.gen.CompareAndSwap(nil, g) {
+	if g := newGeneration(now, r.burstNs()); r.gen.CompareAndSwap(nil, g) {
 		return g
 	}
 	return r.gen.Load() // another charge's, or Enable's
 }
 
-// Clone returns an independent copy of r's limit, debt, enabled or disabled
-// state and meter. Callers blocked on r are not affected by the copy.
+// Clone returns an independent copy of r's limit, burst, debt, enabled or
+// disabled state and meter. Callers blocked on r are not affected by the copy.
 func (r *Rate) Clone() *Rate {
 	if r == nil {
 		return nil
@@ -191,6 +193,7 @@ func (r *Rate) Clone() *Rate {
 	defer r.mu.Unlock()
 	c := &Rate{debtRate: r.debtRate}
 	c.rate.Store(r.rate.Load())
+	c.burst.Store(r.burst.Load())
 	if g := r.gen.Load(); g != nil {
 		cg := &generation{}
 		cg.tat.Store(g.tat.Load())
@@ -317,12 +320,12 @@ func (r *Rate) Enable() {
 	if !r.disabled.Load() {
 		// Only a zero value's first generation may be missing; a charge
 		// that makes it at the same time keeps its own.
-		r.gen.CompareAndSwap(nil, newGeneration(nowNs()))
+		r.gen.CompareAndSwap(nil, newGeneration(nowNs(), r.burstNs()))
 		return
 	}
 	// A charge that loaded the old generation lands there, where it no
 	// longer limits anyone, or sees the new one and charges it instead.
-	r.gen.Store(newGeneration(nowNs()))
+	r.gen.Store(newGeneration(nowNs(), r.burstNs()))
 	r.disabled.Store(false)
 }
 
@@ -348,13 +351,13 @@ func (r *Rate) Disable() {
 
 // Refund gives back n bytes charged by Wait or Charge that were not
 // transferred, such as the unwritten part of a short write. A refund never
-// raises the available burst above two seconds' worth of bytes. The bytes also
-// come off the meter: a refund of bytes metered in an earlier sampling window
-// is taken off the following windows. While r is unlimited, the refund still
-// comes off the debt left from the last limit, which SetLimit keeps as bytes.
-// Bytes charged before the last Enable or Reset, which cleared the debt and the
-// meter, are refunded all the same; the connection wrappers of this package
-// leave them out.
+// raises the available burst above r's burst. The bytes also come off the
+// meter: a refund of bytes metered in an earlier sampling window is taken off
+// the following windows. While r is unlimited, the refund still comes off the
+// debt left from the last limit, which SetLimit keeps as bytes. Bytes charged
+// before the last Enable or Reset, which cleared the debt and the meter, are
+// refunded all the same; the connection wrappers of this package leave them
+// out.
 //
 // This method takes no receipt: callers must match refunds to limited charges
 // when limits change, and avoid refunding charges that Enable or Reset cleared.
@@ -387,7 +390,7 @@ func (r *Rate) refund(g *generation, size int64, debt bool) {
 	}
 
 	refund := bytesToNsCeil(size, rate)
-	minTat := nowNs() - burstWindowNs
+	minTat := subSat(nowNs(), r.burstNs())
 	for {
 		prev := g.tat.Load()
 		next := max(clampSub(prev, refund), minTat)
@@ -446,11 +449,12 @@ func (r *Rate) credit(now int64) (creditNs, limit int64) {
 	if limit <= 0 {
 		return 0, 0
 	}
+	burst := r.burstNs()
 	g := r.gen.Load()
 	if g == nil {
-		return burstWindowNs, limit // a zero value's first charge gets a full burst
+		return burst, limit // a zero value's first charge gets a full burst
 	}
-	return max(subSat(now, max(g.tat.Load(), now-burstWindowNs)), 0), limit
+	return max(subSat(now, max(g.tat.Load(), subSat(now, burst))), 0), limit
 }
 
 // covers reports whether creditNs of traffic at limit, as credit returns
@@ -465,21 +469,22 @@ func covers(size, creditNs, limit int64) bool {
 	return hi > shi || hi == shi && lo >= slo
 }
 
-// grant returns how much of size creditNs of traffic at limit let through
-// in one charge: the bytes they cover or, when fewer, a quantum.
-func grant(size, creditNs, limit int64) int64 {
+// grant returns how much of size creditNs of traffic at limit, with a burst
+// of burstNs, let through in one charge: the bytes they cover or, when fewer,
+// a quantum.
+func grant(size, creditNs, limit, burstNs int64) int64 {
 	if covers(size, creditNs, limit) {
 		return size
 	}
-	return min(size, max(mulDiv(creditNs, limit, int64(time.Second)), quantumAt(limit)))
+	return min(size, max(mulDiv(creditNs, limit, int64(time.Second)), quantumAt(limit, burstNs)))
 }
 
 // quantumAt returns the grant without credit at limit: about quantumNs of
-// traffic, within [minQuantum, maxQuantum], but never more than the burst,
-// which a credit at its cap must cover.
-func quantumAt(limit int64) int64 {
+// traffic, within [minQuantum, maxQuantum], but never more than the burst of
+// burstNs, which a credit at its cap must cover.
+func quantumAt(limit, burstNs int64) int64 {
 	q := min(max(mulDiv(limit, quantumNs, int64(time.Second)), minQuantum), maxQuantum)
-	return max(min(q, mulDiv(limit, burstWindowNs, int64(time.Second))), 1)
+	return max(min(q, mulDiv(limit, burstNs, int64(time.Second))), 1)
 }
 
 // quantum returns r's grant without credit, or maxI64 if r does not limit.
@@ -488,7 +493,7 @@ func (r *Rate) quantum() int64 {
 		return maxI64
 	}
 	if limit := r.rate.Load(); limit > 0 {
-		return quantumAt(limit)
+		return quantumAt(limit, r.burstNs())
 	}
 	return maxI64
 }
@@ -498,7 +503,35 @@ func (r *Rate) quantum() int64 {
 // race to other chargers waits as any charge does.
 func (r *Rate) allowance(size, now int64) int64 {
 	creditNs, limit := r.credit(now)
-	return grant(size, creditNs, limit)
+	return grant(size, creditNs, limit, r.burstNs())
+}
+
+// SetBurst sets how much traffic r lets through at once after an idle
+// period: d's worth at the limit, two seconds' worth by default and for a
+// d <= 0. A smaller burst smooths traffic out, a larger one lets bursts
+// through; it also bounds the bytes a connection passes per grant. It
+// applies from the next charge.
+func (r *Rate) SetBurst(d time.Duration) {
+	if r == nil {
+		return
+	}
+	r.burst.Store(max(int64(d), 0))
+}
+
+// Burst returns how much traffic r lets through at once after an idle
+// period.
+func (r *Rate) Burst() time.Duration {
+	return time.Duration(r.burstNs())
+}
+
+// burstNs returns r's burst in nanoseconds of traffic.
+func (r *Rate) burstNs() int64 {
+	if r != nil {
+		if b := r.burst.Load(); b > 0 {
+			return b
+		}
+	}
+	return burstWindowNs
 }
 
 // debtEnd returns when r's debt is repaid, as nowNs, and its generation,
@@ -565,7 +598,7 @@ func (g *generation) charge(r *Rate, size, now int64) (int64, bool) {
 		return 0, false
 	}
 	cost := bytesToNsCeil(size, rate)
-	minTat := now - burstWindowNs
+	minTat := subSat(now, r.burstNs())
 	for {
 		prev := g.tat.Load()
 		// The limit again, after tat: see SetLimit.

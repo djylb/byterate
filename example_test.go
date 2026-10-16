@@ -65,21 +65,6 @@ func ExampleRate() {
 	// Output: 65536
 }
 
-// Cap the total bytes of a connection: once the Budget is spent, Write sends
-// what is left and fails.
-func ExampleBudget() {
-	client, server := net.Pipe()
-	defer func() { _ = server.Close() }()
-	go func() { _, _ = io.Copy(io.Discard, server) }()
-	budget := byterate.NewBudget(1000)
-	conn := byterate.NewConn(client, byterate.NewHierarchy(byterate.NewRate(1<<20), budget))
-	defer func() { _ = conn.Close() }()
-
-	n, err := conn.Write(make([]byte, 4000))
-	fmt.Println(n, err, budget.Left())
-	// Output: 1000 byterate: budget exhausted 0
-}
-
 // Count the bytes of a transfer and take the totals for a report.
 func ExampleCounter() {
 	var c byterate.Counter
@@ -126,22 +111,6 @@ func ExampleRate_Ready() {
 	// Output: 102400
 }
 
-// Slow a connection down, instead of ending it, once its Budget is spent;
-// the Budget still counts the bytes used beyond it.
-func ExampleBudget_SetFallback() {
-	client, server := net.Pipe()
-	defer func() { _ = server.Close() }()
-	go func() { _, _ = io.Copy(io.Discard, server) }()
-	budget := byterate.NewBudget(1000)
-	budget.SetFallback(byterate.NewRate(1 << 20)) // the pace once it is spent
-	conn := byterate.NewConn(client, budget)
-	defer func() { _ = conn.Close() }()
-
-	n, err := conn.Write(make([]byte, 4000))
-	fmt.Println(n, err, budget.Left())
-	// Output: 4000 <nil> -3000
-}
-
 // Count exactly what a connection's reads and writes take.
 func ExampleCounter_Inbound() {
 	client, server := net.Pipe()
@@ -154,4 +123,43 @@ func ExampleCounter_Inbound() {
 	_, _ = io.ReadFull(conn, make([]byte, 5))
 	fmt.Println(traffic.Total())
 	// Output: 5 0
+}
+
+// Stop a connection once it has used its allowance: Write sends what fits
+// and fails.
+func ExampleBudget() {
+	client, server := net.Pipe()
+	defer func() { _ = server.Close() }()
+	go func() { _, _ = io.Copy(io.Discard, server) }()
+	budget := byterate.NewBudget(byterate.Step{After: 1000, Stop: true})
+	conn := byterate.NewConn(client, byterate.NewHierarchy(byterate.NewRate(1<<20), budget))
+	defer func() { _ = conn.Close() }()
+
+	n, err := conn.Write(make([]byte, 4000))
+	fmt.Println(n, err, budget.Used())
+	// Output: 1000 byterate: budget exhausted 1000
+}
+
+// Slow traffic down in stages as it is used, and stop it at the end. Each
+// period, such as a day, starts over with Reset; changing the steps or their
+// limits keeps connections open.
+func ExampleNewBudget() {
+	slow, slower := byterate.NewRate(1<<20), byterate.NewRate(64<<10)
+	daily := byterate.NewBudget(
+		byterate.Step{After: 10 << 30, Limit: slow},   // past 10 GiB: 1 MiB/s
+		byterate.Step{After: 20 << 30, Limit: slower}, // past 20 GiB: 64 KiB/s
+		byterate.Step{After: 30 << 30, Stop: true},    // past 30 GiB: stop
+	)
+	daily.OnStep(func(step int, used int64) { fmt.Println("step", step, "at", used) })
+
+	_ = daily.Charge(15 << 30)
+	fmt.Println(daily.Step(), daily.Used())
+
+	daily.Reset()          // the next day starts over
+	slow.SetLimit(2 << 20) // a new speed for the first step
+	fmt.Println(daily.Step(), daily.Used())
+	// Output:
+	// step 0 at 16106127360
+	// 0 16106127360
+	// -1 0
 }
