@@ -149,6 +149,11 @@ upload := hooks{Wait: l.Ready, Done: l.Charge}
 per `Read` and `Write`; UDP, IP and Unix datagram sockets are recognized by
 `NewConn` itself.
 
+**Saving limits.** The package has no JSON form of its own, since what an
+application stores, and under which names, is its own format;
+`ExampleRate_json` shows a small wrapper that saves `Limit` and restores it
+with `NewRate` or `SetLimit`.
+
 **Direct use.** Any limiter can be charged directly: `Wait(ctx, n)` charges
 `n` bytes and blocks until the limit allows them, and `Refund(n)` gives back
 bytes that were not transferred.
