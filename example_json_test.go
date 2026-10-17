@@ -19,7 +19,7 @@ type savedRateJSON struct {
 	Throughput int64 `json:"throughput"` // bytes/s, measured
 }
 
-func (r savedRate) MarshalJSON() ([]byte, error) {
+func (r *savedRate) MarshalJSON() ([]byte, error) {
 	return json.Marshal(savedRateJSON{Limit: max(r.Limit(), 0), Throughput: r.Throughput()})
 }
 
@@ -38,11 +38,12 @@ func (r *savedRate) UnmarshalJSON(b []byte) error {
 
 // Keep a Rate in JSON. The package leaves the JSON form to the
 // application, since what is stored, and under which names, is the
-// application's format.
+// application's format. The field is a pointer, so that encoding/json finds
+// the methods also when the struct around it is not addressable.
 func ExampleRate_json() {
 	var user struct {
-		Name string    `json:"name"`
-		Rate savedRate `json:"rate"`
+		Name string     `json:"name"`
+		Rate *savedRate `json:"rate"`
 	}
 	_ = json.Unmarshal([]byte(`{"name":"alice","rate":{"limit":1048576}}`), &user)
 	fmt.Println(user.Rate.Limit())
