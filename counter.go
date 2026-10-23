@@ -8,11 +8,11 @@ import (
 	"unsafe"
 )
 
-// Counter adds up the inbound and outbound bytes of a transfer, for
-// accounting and for measuring throughput, without limiting it. Swap takes
-// the totals since the last Swap, so that each byte is reported exactly once
-// however Adds and Swaps interleave, and Throughput reports the bytes per
-// second.
+// Counter adds up the bytes read and written by a transfer, for accounting
+// and for measuring throughput, without limiting it. Swap takes the totals
+// since the last Swap, so that each byte is reported exactly once however
+// Adds and Swaps interleave, and Throughput reports the bytes per second of
+// the last whole second.
 //
 // The zero value is ready to use and adds to one pair of counters, which
 // suits a counter that few goroutines add to at once, such as one per
@@ -23,22 +23,19 @@ import (
 // All methods are safe for concurrent use and on a nil *Counter. A Counter
 // must not be copied after first use.
 type Counter struct {
-	in, out atomic.Int64   // totals since the Counter began, unless sharded
-	shards  []counterShard // spread Adds, made by NewSharedCounter
-	started atomic.Bool    // the first throughput window has begun
+	read, written atomic.Int64   // totals since the Counter began, unless sharded
+	shards        []counterShard // spread Adds, made by NewSharedCounter
+	meter         window         // over the totals
 
-	mu                    sync.Mutex // serializes Load, Swap and Throughput
-	swappedIn, swappedOut int64      // totals at the last Swap
-	windowAt              int64      // nowNs at which the current window began
-	windowIn, windowOut   int64      // totals then
-	inBps, outBps         int64      // throughput of the last window closed
+	mu      sync.Mutex // serializes Load, Swap, Restore and Set
+	swapped [2]int64   // totals at the last Swap
 }
 
 // counterShard is one of the counter pairs of a shared Counter, on a cache
 // line of its own.
 type counterShard struct {
-	in, out atomic.Int64
-	_       [cacheLineSize - 16]byte
+	read, written atomic.Int64
+	_             [cacheLineSize - 16]byte
 }
 
 // NewSharedCounter returns a Counter that spreads Adds over counters, one per
@@ -46,199 +43,215 @@ type counterShard struct {
 // one. It takes a cache line per counter, so keep it for counters that many
 // goroutines share.
 func NewSharedCounter() *Counter {
-	n := 1
-	for n < runtime.GOMAXPROCS(0) {
-		n <<= 1
-	}
-	c := &Counter{shards: make([]counterShard, n)}
-	c.start()
-	return c
+	return &Counter{shards: make([]counterShard, pow2AtLeast(runtime.GOMAXPROCS(0)))}
 }
 
-// Add adds in inbound and out outbound bytes; negative counts subtract.
-func (c *Counter) Add(in, out int64) {
+// Add adds read bytes read and written bytes written; negative counts
+// subtract. It does not read the clock, so for Throughput the bytes count in
+// the sampling window that is open when the next count through one of c's
+// views, or Throughput, closes it; the views count with the time of each
+// charge.
+func (c *Counter) Add(read, written int64) {
 	if c == nil {
 		return
 	}
-	ci, co := &c.in, &c.out
+	cr, cw := &c.read, &c.written
 	if s := c.shards; s != nil {
 		shard := &s[shardKey()&uint32(len(s)-1)]
-		ci, co = &shard.in, &shard.out
+		cr, cw = &shard.read, &shard.written
 	}
-	if in != 0 {
-		ci.Add(in)
+	if read != 0 {
+		cr.Add(read)
 	}
-	if out != 0 {
-		co.Add(out)
-	}
-	if !c.started.Load() {
-		c.start()
+	if written != 0 {
+		cw.Add(written)
 	}
 }
 
-// start begins the first throughput window, at the first Add of a zero
-// value.
-func (c *Counter) start() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if !c.started.Load() {
-		c.windowAt = nowNs()
-		c.started.Store(true)
+// addAt is Add at now, as nowNs returns it: it closes the sampling window
+// before counting once now is past it, so that the bytes count in now's.
+func (c *Counter) addAt(read, written, now int64) {
+	if c.meter.due(now) && c.meter.mu.TryLock() {
+		c.meter.roll(now, c.totals())
+		c.meter.mu.Unlock()
 	}
+	c.Add(read, written)
 }
 
-// ChargeIn adds n inbound bytes and returns nil, so that it can stand for a
-// Limiter's Charge, such as a relay's hook after each write.
-func (c *Counter) ChargeIn(n int64) error {
-	c.Add(n, 0)
-	return nil
-}
-
-// ChargeOut adds n outbound bytes and returns nil, as ChargeIn does.
-func (c *Counter) ChargeOut(n int64) error {
-	c.Add(0, n)
-	return nil
-}
-
-// Total returns the inbound and outbound bytes since c began, which Swap does
+// Total returns the bytes read and written since c began, which Swap does
 // not change: the running totals to persist, or to report as snapshots that
 // the receiver takes differences of. Refunds through c's views take bytes
-// off, so a total can also go down. Restore takes persisted totals back.
-func (c *Counter) Total() (in, out int64) {
+// off, so a total can also go down. Restore and Set take persisted totals
+// back.
+func (c *Counter) Total() (read, written int64) {
 	if c == nil {
 		return 0, 0
 	}
-	return c.totals()
+	t := c.totals()
+	return t[0], t[1]
 }
 
-// Restore adds in and out to c's totals as bytes counted before, such as the
-// persisted totals of a counter that resumes after a restart: Total includes
-// them, but neither Swap nor Throughput reports them as new traffic.
-func (c *Counter) Restore(in, out int64) {
+// Restore adds read and written to c's totals as bytes counted before, such
+// as the persisted totals of a counter that resumes after a restart: Total
+// includes them, but neither Swap nor Throughput reports them as new
+// traffic.
+func (c *Counter) Restore(read, written int64) {
 	if c == nil {
 		return
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.in.Add(in)
-	c.out.Add(out)
-	c.swappedIn += in
-	c.swappedOut += out
-	c.windowIn += in
-	c.windowOut += out
+	c.shift([2]int64{read, written}, false)
 }
 
-// Inbound returns a Limiter that never limits and counts the bytes charged to
-// it as c's inbound bytes, refunds taken off. Put it in a Hierarchy with the
-// limiters of the reads it counts, such as the read Limiter of NewDuplexConn,
-// so that c counts what the reads take, also through a Switch.
-func (c *Counter) Inbound() Limiter { return (*inboundCounter)(c) }
+// Set makes read and written c's totals, as Restore does for a difference:
+// Total returns them, but neither Swap nor Throughput reports the change as
+// traffic. Each byte that an Add adds while Set runs counts as added before
+// Set, and is replaced, or after it, and is added to the new totals.
+func (c *Counter) Set(read, written int64) {
+	if c == nil {
+		return
+	}
+	c.shift([2]int64{read, written}, true)
+}
 
-// Outbound returns a Limiter that counts the bytes charged to it as c's
-// outbound bytes, as Inbound does for inbound ones.
-func (c *Counter) Outbound() Limiter { return (*outboundCounter)(c) }
+// shift adds v to the totals, or with to makes them v, and to the baselines
+// of Swap and Throughput, so that neither reports the change.
+func (c *Counter) shift(v [2]int64, to bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.meter.mu.Lock()
+	defer c.meter.mu.Unlock()
+	if to {
+		t := c.totals()
+		v[0], v[1] = v[0]-t[0], v[1]-t[1]
+	}
+	c.read.Add(v[0])
+	c.written.Add(v[1])
+	for i := range v {
+		c.swapped[i] += v[i]
+		c.meter.start[i] += v[i]
+	}
+}
 
-// inboundCounter and outboundCounter are the Limiter views of a Counter.
+// Reads returns a Limiter that never limits and counts the bytes charged to
+// it as c's bytes read, refunds taken off. Put it in a NewHierarchy with the
+// limiters of the reads it counts, such as the read Limiter of
+// NewDuplexConn, so that c counts what the reads take, also through a
+// Switch.
+func (c *Counter) Reads() Limiter { return (*counterReads)(c) }
+
+// Writes returns a Limiter that counts the bytes charged to it as c's bytes
+// written, as Reads does for bytes read.
+func (c *Counter) Writes() Limiter { return (*counterWrites)(c) }
+
+// counterReads and counterWrites are the Limiter views of a Counter. They
+// count with the time of each charge, for Throughput.
 type (
-	inboundCounter  Counter
-	outboundCounter Counter
+	counterReads  Counter
+	counterWrites Counter
 )
 
-func (c *inboundCounter) Wait(_ context.Context, n int64) error {
-	return c.Charge(n)
+func (c *counterReads) Wait(_ context.Context, n int64) error { return c.Charge(n) }
+func (c *counterReads) TryWait(n int64) error                 { return c.Charge(n) }
+func (c *counterReads) Ready(_ context.Context, n int64) (int64, error) {
+	return n, nil
 }
 
-func (c *inboundCounter) Refund(n int64) {
-	if n > 0 {
-		(*Counter)(c).Add(-n, 0)
+func (c *counterReads) Refund(n int64) {
+	if c != nil && n > 0 {
+		(*Counter)(c).addAt(-n, 0, nowNs())
 	}
 }
 
-func (c *inboundCounter) Ready(_ context.Context, n int64) (int64, error) { return n, nil }
-
-func (c *inboundCounter) Charge(n int64) error {
-	if n > 0 {
-		(*Counter)(c).Add(n, 0)
-	}
-	return nil
-}
-
-func (c *outboundCounter) Wait(_ context.Context, n int64) error {
-	return c.Charge(n)
-}
-
-func (c *outboundCounter) Refund(n int64) {
-	if n > 0 {
-		(*Counter)(c).Add(0, -n)
-	}
-}
-
-func (c *outboundCounter) Ready(_ context.Context, n int64) (int64, error) { return n, nil }
-
-func (c *outboundCounter) Charge(n int64) error {
-	if n > 0 {
-		(*Counter)(c).Add(0, n)
+func (c *counterReads) Charge(n int64) error {
+	if c != nil && n > 0 {
+		(*Counter)(c).addAt(n, 0, nowNs())
 	}
 	return nil
 }
 
-// totals returns the inbound and outbound bytes since c began.
-func (c *Counter) totals() (in, out int64) {
-	in, out = c.in.Load(), c.out.Load()
+func (c *counterWrites) Wait(_ context.Context, n int64) error { return c.Charge(n) }
+func (c *counterWrites) TryWait(n int64) error                 { return c.Charge(n) }
+func (c *counterWrites) Ready(_ context.Context, n int64) (int64, error) {
+	return n, nil
+}
+
+func (c *counterWrites) Refund(n int64) {
+	if c != nil && n > 0 {
+		(*Counter)(c).addAt(0, -n, nowNs())
+	}
+}
+
+func (c *counterWrites) Charge(n int64) error {
+	if c != nil && n > 0 {
+		(*Counter)(c).addAt(0, n, nowNs())
+	}
+	return nil
+}
+
+// totals returns the bytes read and written since c began.
+func (c *Counter) totals() [2]int64 {
+	t := [2]int64{c.read.Load(), c.written.Load()}
 	for i := range c.shards {
-		in += c.shards[i].in.Load()
-		out += c.shards[i].out.Load()
+		t[0] += c.shards[i].read.Load()
+		t[1] += c.shards[i].written.Load()
 	}
-	return in, out
+	return t
 }
 
-// Load returns the inbound and outbound bytes since the last Swap.
-func (c *Counter) Load() (in, out int64) {
+// Load returns the bytes read and written since the last Swap.
+func (c *Counter) Load() (read, written int64) {
 	if c == nil {
 		return 0, 0
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	in, out = c.totals()
-	return in - c.swappedIn, out - c.swappedOut
+	t := c.totals()
+	return t[0] - c.swapped[0], t[1] - c.swapped[1]
 }
 
-// Swap returns the inbound and outbound bytes since the last Swap and starts
+// Swap returns the bytes read and written since the last Swap and starts
 // counting them over. A count that an Add adds while Swap runs lands in this
-// Swap's result or in the next one's, never in both or neither; the inbound
-// and outbound counts of one Add may land in different Swaps. Swap does not
-// change Throughput.
-func (c *Counter) Swap() (in, out int64) {
+// Swap's result or in the next one's, never in both or neither; the two
+// counts of one Add may land in different Swaps. Swap does not change
+// Throughput.
+func (c *Counter) Swap() (read, written int64) {
 	if c == nil {
 		return 0, 0
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	totalIn, totalOut := c.totals()
-	in, out = totalIn-c.swappedIn, totalOut-c.swappedOut
-	c.swappedIn, c.swappedOut = totalIn, totalOut
-	return in, out
+	t := c.totals()
+	read, written = t[0]-c.swapped[0], t[1]-c.swapped[1]
+	c.swapped = t
+	return read, written
 }
 
-// Throughput returns the inbound and outbound bytes per second over the last
-// sampling window of at least one second, closing the current window if it
-// is due: the window runs from the first Add, or the previous window's end,
-// to a call of Throughput a second or more later. It reports 0 for a window
-// with no traffic, and before the first window closes.
-func (c *Counter) Throughput() (inBps, outBps int64) {
-	if c == nil || !c.started.Load() {
+// Throughput returns the bytes per second read and written in the last whole
+// second, in the sampling windows that Rate.Throughput has: one-second
+// slices of a clock that every Rate and Counter shares, of which it reports
+// the one before the current one, so that what it reports depends on when
+// the bytes passed and not on how often or by how many callers it is
+// called. Bytes counted through c's views count in the window of their
+// charge; those of Add, which does not read the clock, in the window open
+// when the next count through a view, or a call of Throughput, closes it,
+// so a Counter that only Add feeds and Throughput reads every N seconds
+// reports N seconds of bytes as one. Bytes added before c's first window
+// count in no window. A window in which more was refunded than counted
+// reports 0 and takes the rest off the following ones.
+func (c *Counter) Throughput() (readBps, writtenBps int64) {
+	if c == nil {
 		return 0, 0
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	now := nowNs()
-	if dt := subSat(now, c.windowAt); dt >= sampleIntervalNs {
-		totalIn, totalOut := c.totals()
-		c.inBps = bytesPerSec(totalIn-c.windowIn, dt)
-		c.outBps = bytesPerSec(totalOut-c.windowOut, dt)
-		c.windowAt, c.windowIn, c.windowOut = now, totalIn, totalOut
-	}
-	return c.inBps, c.outBps
+	t := c.throughput(nowNs())
+	return t[0], t[1]
+}
+
+// throughput is Throughput at now.
+func (c *Counter) throughput(now int64) [2]int64 {
+	c.meter.mu.Lock()
+	defer c.meter.mu.Unlock()
+	c.meter.roll(now, c.totals())
+	return c.meter.last()
 }
 
 // shardKey spreads goroutines over the shards of a shared Counter by where
@@ -247,5 +260,5 @@ func (c *Counter) Throughput() (inBps, outBps int64) {
 // its goroutine to another shard.
 func shardKey() uint32 {
 	var probe byte
-	return uint32(uint64(uintptr(unsafe.Pointer(&probe))>>12) * 0x9E3779B97F4A7C15 >> 32)
+	return mix32(uintptr(unsafe.Pointer(&probe)) >> 12)
 }

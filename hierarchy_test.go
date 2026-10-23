@@ -36,23 +36,8 @@ func TestNewHierarchyCollapses(t *testing.T) {
 		NewHierarchy(unlimited, nil, limited),
 		NewHierarchy(unlimited, limited, NewRate(0), NewRate(0)),
 	} {
-		if _, ok := l.(*Hierarchy); !ok {
-			t.Fatalf("two or more rates: got %T, want *Hierarchy", l)
-		}
-	}
-}
-
-// TestHierarchyMetersUnlimitedRates checks that an unlimited level,
-// such as a global one kept only for its throughput, is charged too.
-func TestHierarchyMetersUnlimitedRates(t *testing.T) {
-	global := NewRate(0)
-	conn := NewRate(1 << 30)
-	l := NewHierarchy(conn, global)
-	_ = l.Wait(bg, 64<<10)
-	for _, r := range []*Rate{global, conn} {
-		genOf(r).lastSampleNs.Store(nowNs() - int64(time.Second))
-		if got := r.Throughput(); got < 32<<10 {
-			t.Fatalf("Throughput() = %d B/s, want the charged 64 KiB over about a second", got)
+		if _, ok := l.(*hierarchy); !ok {
+			t.Fatalf("two or more rates: got %T, want *hierarchy", l)
 		}
 	}
 }
@@ -61,10 +46,10 @@ func TestHierarchyMetersUnlimitedRates(t *testing.T) {
 // after the limiter was built applies to it.
 func TestHierarchyAppliesLaterLimit(t *testing.T) {
 	later := NewRate(0)
-	l := NewHierarchy(later, NewRate(0)).(*Hierarchy)
+	l := NewHierarchy(later, NewRate(0)).(*hierarchy)
 	later.SetLimit(1000)
 	// Two seconds' burst is free; the third second of bytes must wait.
-	if wait := l.reserve(3000, nil); wait < int64(900*time.Millisecond) {
+	if wait := l.reserve(3000); wait < int64(900*time.Millisecond) {
 		t.Fatalf("wait = %v, want about a second", time.Duration(wait))
 	}
 }
@@ -74,8 +59,8 @@ func TestHierarchyRefundsAllChildrenOnShortWrite(t *testing.T) {
 	second := NewRate(2 << 20)
 
 	limiter := NewHierarchy(first, second)
-	if _, ok := limiter.(*Hierarchy); !ok {
-		t.Fatalf("NewHierarchy() type = %T, want *Hierarchy", limiter)
+	if _, ok := limiter.(*hierarchy); !ok {
+		t.Fatalf("NewHierarchy() type = %T, want *hierarchy", limiter)
 	}
 
 	wantErr := errors.New("short write")
@@ -198,7 +183,7 @@ func TestHierarchyWakeOnMaxWaitLimiterDisable(t *testing.T) {
 func TestHierarchyWaitCancel(t *testing.T) {
 	first := NewRate(1024)
 	second := NewRate(2048)
-	limiter := NewHierarchy(first, second).(*Hierarchy)
+	limiter := NewHierarchy(first, second).(*hierarchy)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
@@ -293,8 +278,8 @@ func TestHierarchyChargesRepeatedRateOnce(t *testing.T) {
 		t.Fatalf("a Rate given twice: got %T, want the Rate itself", l)
 	}
 	other := NewRate(0)
-	l := NewHierarchy(r, other, r, other, r).(*Hierarchy)
-	if wait := l.reserve(2000, nil); wait != 0 {
+	l := NewHierarchy(r, other, r, other, r).(*hierarchy)
+	if wait := l.reserve(2000); wait != 0 {
 		t.Fatalf("reserve(2000) within the burst wait=%s, want 0", time.Duration(wait))
 	}
 	for _, rate := range []*Rate{r, other} {
@@ -309,7 +294,7 @@ func TestHierarchyChargesRepeatedRateOnce(t *testing.T) {
 // the refund: that level was not charged, so it must not be refunded.
 func TestHierarchyRefundSkipsRestartedLevels(t *testing.T) {
 	conn, user := NewRate(1000), NewRate(1000)
-	l := NewHierarchy(conn, user).(*Hierarchy)
+	l := NewHierarchy(conn, user).(*hierarchy)
 	user.Disable()
 	c := NewReadWriteCloser(&changingWriteConn{change: user.Enable}, l)
 	_, _ = c.Write(make([]byte, 500))
@@ -347,9 +332,9 @@ func TestNewHierarchyFlattens(t *testing.T) {
 	r1, r2, b := NewRate(1), NewRate(2), stopAfter(1)
 	s := NewSwitch(nil)
 	inner := NewHierarchy(r1, b)
-	l := NewHierarchy(inner, r2, b, (*Budget)(nil), (*Switch)(nil), s, s, nil).(*Hierarchy)
-	if len(l.levels) != 4 || l.levels[0].rate != r1 || l.levels[1].other != b || l.levels[2].rate != r2 || l.levels[3].other != s {
-		t.Fatalf("levels = %+v, want r1, b, r2, s", l.levels)
+	l := NewHierarchy(inner, r2, b, (*Budget)(nil), (*Switch)(nil), s, s, nil).(*hierarchy)
+	if len(l.lv) != 4 || l.lv[0].rate != r1 || l.lv[1].l != b || l.lv[2].rate != r2 || l.lv[3].l != s {
+		t.Fatalf("levels = %+v, want r1, b, r2, s", l.lv)
 	}
 	if got := NewHierarchy(b, (*Rate)(nil)); got != Limiter(b) {
 		t.Fatalf("NewHierarchy(b, nil) = %v, want b", got)

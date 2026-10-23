@@ -2,8 +2,6 @@ package byterate
 
 import (
 	"context"
-	"math/bits"
-	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -13,132 +11,13 @@ import (
 // lets up to two seconds' worth of bytes through without waiting.
 const burstWindowNs = int64(2 * time.Second)
 
-// generation is the state of a Rate from one Enable that clears it to the
-// next: its debt, its meter and the channels that Disable closes. Enable
-// replaces the generation instead of clearing it in place, and a new one is
-// complete before it is published, so a charge, a refund and a sampling
-// window each act on the one generation they loaded, and one that an Enable
-// retired keeps its effects to itself.
-//
-// It fills two cache lines of its size class exactly: the first is read by
-// every charge, the second written by every charge.
-type generation struct {
-	stop         atomic.Pointer[stopSet] // made by the first waiter
-	lastSampleNs atomic.Int64            // start of the sampling window, written once per window
-	nowBps       atomic.Int64            // throughput of the last sampling window, bytes/s
-	_            [cacheLineSize - 24]byte
-	tat          atomic.Int64 // theoretical arrival time (ns since epoch), can be negative
-	bytesAcc     atomic.Int64 // bytes charged in the current sampling window, net of refunds
-	_            [cacheLineSize - 16]byte
-}
-
-// stopSet holds the channels of a generation that Disable closes. Waiters
-// spread over them, as a wait locks the channel it selects on, and one
-// channel for every waiter of a shared Rate would serialize them. A
-// generation makes a small set for its first waiter and each channel for the
-// first waiter keyed to it, so that a Rate that never makes callers wait pays
-// for none, and one of a single connection, whose directions keep a key
-// each, pays for a channel per direction. Once every channel of the small set
-// is made, the Rate is shared, and a set sized for the processors replaces
-// it, keeping the small one for Disable to close.
-type stopSet struct {
-	shards []atomic.Pointer[stopChan] // a power of two of them
-	made   atomic.Int32               // channels made in shards
-	prev   *stopSet                   // the set this one replaced, still to close
-}
-
-// initialStopShards is the size of a generation's first stop set.
-const initialStopShards = 8
-
-func newStopSet(n int, prev *stopSet) *stopSet {
-	return &stopSet{shards: make([]atomic.Pointer[stopChan], n), prev: prev}
-}
-
-// sharedStopShards is the size of the set that replaces a full first one:
-// eight channels per processor, at most 256.
-func sharedStopShards() int {
-	n := initialStopShards
-	for n < 8*runtime.GOMAXPROCS(0) && n < 256 {
-		n *= 2
-	}
-	return n
-}
-
-// stopChan is one of the channels of a generation that Disable closes.
-type stopChan struct{ ch chan struct{} }
-
-var (
-	// stoppedSet is left by Disable in a generation that no waiter had given a
-	// set, and closedStop in the shards of a set that no waiter had made.
-	stoppedSet = &stopSet{}
-	closedStop = &stopChan{ch: closedChan}
-)
-
-// newGeneration returns a generation with a full burst and a meter whose
-// first window starts at now.
-func newGeneration(now, burstNs int64) *generation {
-	g := &generation{}
-	g.tat.Store(subSat(now, burstNs))
-	g.lastSampleNs.Store(now)
-	return g
-}
-
-// waitCh returns the channel of g that Disable closes for the waiter keyed by
-// key, or nil for no generation.
-func (g *generation) waitCh(key uint32) <-chan struct{} {
-	if g == nil {
-		return nil
-	}
-	set := g.stop.Load()
-	if set == nil {
-		set = newStopSet(initialStopShards, nil)
-		if !g.stop.CompareAndSwap(nil, set) {
-			set = g.stop.Load() // another waiter's, or stoppedSet
-		}
-	}
-	if set == stoppedSet {
-		return closedChan
-	}
-	s := &set.shards[key&uint32(len(set.shards)-1)]
-	c := s.Load()
-	if c == nil {
-		c = &stopChan{ch: make(chan struct{})}
-		if !s.CompareAndSwap(nil, c) {
-			return s.Load().ch // another waiter's, or closedStop
-		}
-		if int(set.made.Add(1)) == len(set.shards) {
-			g.grow(set)
-		}
-	}
-	return c.ch
-}
-
-// grow replaces g's full stop set with a larger one, unless Disable or another
-// waiter replaced it first. Waiters keep the channels they took from the
-// full set, which Disable closes through the new set's prev.
-func (g *generation) grow(full *stopSet) {
-	if n := sharedStopShards(); n > len(full.shards) {
-		g.stop.CompareAndSwap(full, newStopSet(n, full))
-	}
-}
-
-// closeStop closes g's channels, waking its waiters, and leaves stoppedSet
-// and closedStop for waiters to come. It runs once, for Disable.
-func (g *generation) closeStop() {
-	for set := g.stop.Swap(stoppedSet); set != nil; set = set.prev {
-		for i := range set.shards {
-			if c := set.shards[i].Swap(closedStop); c != nil {
-				close(c.ch)
-			}
-		}
-	}
-}
-
 // Rate is a bytes-per-second limiter (GCRA, a token-bucket variant) with a
 // built-in throughput meter. A limit <= 0 means unlimited, and after an idle
 // period a burst of bytes passes without waiting, two seconds' worth unless
-// SetBurst sets another. The meter counts up to 2^63-1 bytes in a sampling
-// window.
+// SetBurst sets another. Disable turns the limit off for a while, waking
+// the callers waiting for it; unlimited and disabled alike, a Rate passes
+// everything and still meters it. The meter counts up to 2^63-1 bytes in a
+// sampling window.
 //
 // All methods are safe for concurrent use and on a nil *Rate, which never
 // limits. The zero value is an enabled, unlimited Rate, ready for SetLimit. A
@@ -197,9 +76,8 @@ func (r *Rate) Clone() *Rate {
 	if g := r.gen.Load(); g != nil {
 		cg := &generation{}
 		cg.tat.Store(g.tat.Load())
-		cg.bytesAcc.Store(g.bytesAcc.Load())
-		cg.lastSampleNs.Store(g.lastSampleNs.Load())
-		cg.nowBps.Store(g.nowBps.Load())
+		cg.total.Store(g.total.Load())
+		cg.meter.copyFrom(&g.meter)
 		if r.disabled.Load() {
 			cg.closeStop()
 		}
@@ -263,7 +141,7 @@ func (g *generation) convertDebt(from, to int64) {
 		now := nowNs()
 		next := prev
 		if prev > now {
-			next = clampAdd(now, mulDiv(subSat(prev, now), from, to))
+			next = addSat(now, mulDiv(subSat(prev, now), from, to))
 		}
 		next--
 		if next == prev {
@@ -294,19 +172,23 @@ func (r *Rate) Limit() int64 {
 	return r.rate.Load()
 }
 
-// Throughput returns the measured throughput in bytes per second over the
-// last sampling window of at least one second, closing the current window if
-// it is due. It reports 0 while r is disabled.
+// Throughput returns the bytes charged to r, refunds taken off, in the last
+// whole second: the sampling windows are one-second slices of a clock that
+// every Rate and Counter shares, and Throughput reports the one before the
+// current one, so it lags by one to two seconds. What it reports depends only on
+// when the bytes were charged, not on how often or by how many callers it is
+// called. A refund of bytes charged in an earlier window comes off the
+// following ones. r meters whether it is limited, unlimited or disabled;
+// Enable and Reset clear the meter.
 func (r *Rate) Throughput() int64 {
-	if r == nil || r.disabled.Load() {
+	if r == nil {
 		return 0
 	}
 	g := r.gen.Load()
 	if g == nil {
 		return 0
 	}
-	g.roll(nowNs())
-	return g.nowBps.Load()
+	return g.throughput(nowNs())
 }
 
 // Enable undoes Disable, starting over with a full burst and a cleared
@@ -329,9 +211,10 @@ func (r *Rate) Enable() {
 	r.disabled.Store(false)
 }
 
-// Disable turns r off until Enable: it stops limiting, so traffic charged to
-// it passes at once and callers blocked in Wait are woken, and stops
-// metering. It does not block traffic; a Hierarchy keeps its other Rates.
+// Disable turns r's limit off until Enable: traffic charged to it passes at
+// once, as with no limit, and callers blocked in Wait are woken. It still
+// meters, and keeps the limit for Enable. It does not block traffic; a
+// hierarchy keeps its other Rates.
 func (r *Rate) Disable() {
 	if r == nil {
 		return
@@ -349,28 +232,30 @@ func (r *Rate) Disable() {
 	}
 }
 
-// Refund gives back n bytes charged by Wait or Charge that were not
+// Refund gives back n bytes charged by Wait, TryWait or Charge that were not
 // transferred, such as the unwritten part of a short write. A refund never
 // raises the available burst above r's burst. The bytes also come off the
 // meter: a refund of bytes metered in an earlier sampling window is taken off
 // the following windows. While r is unlimited, the refund still comes off the
-// debt left from the last limit, which SetLimit keeps as bytes. Bytes charged
-// before the last Enable or Reset, which cleared the debt and the meter, are
-// refunded all the same; the connection wrappers of this package leave them
-// out.
+// debt left from the last limit, which SetLimit keeps as bytes; while it is
+// disabled, only off the meter.
 //
-// This method takes no receipt: callers must match refunds to limited charges
-// when limits change, and avoid refunding charges that Enable or Reset cleared.
-// The connection wrappers track both conditions automatically, including
-// meter-only refunds for writes charged while unlimited.
+// Refund takes no receipt, so it cannot tell which charge it gives back:
+// bytes charged before the last Enable or Reset, which cleared the debt and
+// the meter, are refunded all the same, and so is debt for bytes charged
+// while r was unlimited or disabled, which added none. Refund only bytes of
+// a charge that r took since the last Enable or Reset and while it had the
+// same kind of limit. The connection wrappers, hierarchies, Switches,
+// Budgets and Groups keep a receipt of each charge instead and refund
+// exactly what it took, in the generation it took it.
 func (r *Rate) Refund(n int64) {
 	if r == nil || n <= 0 {
 		return
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if g := r.gen.Load(); g != nil && !r.disabled.Load() {
-		r.refund(g, n, true)
+	if g := r.gen.Load(); g != nil {
+		r.refund(g, n, !r.disabled.Load())
 	}
 }
 
@@ -380,7 +265,8 @@ func (r *Rate) Refund(n int64) {
 // the same generation and limit as the tat they change. Charges still move
 // tat concurrently, hence the CAS.
 func (r *Rate) refund(g *generation, size int64, debt bool) {
-	g.bytesAcc.Add(-size)
+	now := nowNs()
+	g.count(-size, now)
 
 	// While temporarily unlimited, old debt is still denominated at the
 	// last positive limit. Canceling an old write must remove that debt too.
@@ -390,10 +276,10 @@ func (r *Rate) refund(g *generation, size int64, debt bool) {
 	}
 
 	refund := bytesToNsCeil(size, rate)
-	minTat := subSat(nowNs(), r.burstNs())
+	minTat := subSat(now, r.burstNs())
 	for {
 		prev := g.tat.Load()
-		next := max(clampSub(prev, refund), minTat)
+		next := max(subSat(prev, refund), minTat)
 		if g.tat.CompareAndSwap(prev, next) {
 			return
 		}
@@ -405,14 +291,24 @@ func (r *Rate) refund(g *generation, size int64, debt bool) {
 // that were not transferred with Refund. It returns at once if r is nil,
 // disabled or unlimited; Disable and Reset wake a blocked Wait early.
 func (r *Rate) Wait(ctx context.Context, n int64) error {
+	// A whole charge, as grant makes it, without its cuts and receipt.
 	wait, g := r.reserveAt(n, nowNs())
-	if wait <= coalesceWaitNs {
-		return nil
-	}
-	if sleepNs(wait, g, ctx.Done()) == canceled {
+	if wait > coalesceWaitNs && (*waitTimer)(nil).sleep(wait, g, ctx.Done(), nil) == canceled {
 		return ctx.Err()
 	}
 	return nil
+}
+
+// TryWait charges n bytes if r lets them through without waiting, as Wait
+// would, and otherwise charges nothing and returns ErrWouldWait. A nil,
+// disabled or unlimited r lets everything through; a limited one never
+// lets through more than its burst at once, so set the burst to at least
+// the largest datagram.
+func (r *Rate) TryWait(n int64) error {
+	if n <= 0 || r.tryTake(n, nowNs(), nil) {
+		return nil
+	}
+	return ErrWouldWait
 }
 
 // Ready blocks until r has no debt worth a wait, or until ctx is done, and
@@ -423,8 +319,7 @@ func (r *Rate) Ready(ctx context.Context, n int64) (int64, error) {
 	if n <= 0 {
 		return n, nil
 	}
-	v := levels{one: level{rate: r}}
-	return v.ready(ctx, nil, nil, n, false)
+	return r.ready(ctx, nil, n, false)
 }
 
 // Charge records n transferred bytes without waiting, as debt that the next
@@ -434,9 +329,102 @@ func (r *Rate) Charge(n int64) error {
 	return nil
 }
 
-func (r *Rate) reserve(size int64) int64 {
-	wait, _ := r.reserveAt(size, nowNs())
-	return wait
+// grant is levels.wait for r alone, without a waitSet: it charges r for a
+// transfer of size bytes, or unless whole for r's grant of them, records the
+// charge in rc, and waits in t until r allows it or ctx is done. It returns
+// the bytes charged.
+func (r *Rate) grant(ctx context.Context, t *waitTimer, size int64, whole bool, rc *receipt) (int64, error) {
+	now := nowNs()
+	if !whole {
+		size = r.allowance(size, now)
+	}
+	wait, g := r.take(size, now, rc)
+	if !whole && wait > coalesceWaitNs {
+		if q, ok := requeue(size, r.quantum()); ok {
+			rc.refund(size)
+			size = q
+			wait, g = r.take(size, nowNs(), rc)
+		}
+	}
+	if wait > coalesceWaitNs && t.sleep(wait, g, ctx.Done(), nil) == canceled {
+		return size, ctx.Err()
+	}
+	return size, nil
+}
+
+// ready is levels.ready for r alone, without a waitSet: it waits in t until
+// r has no debt worth a wait and returns how much of size a transfer may
+// take, all of it when whole.
+func (r *Rate) ready(ctx context.Context, t *waitTimer, size int64, whole bool) (int64, error) {
+	now := nowNs()
+	if end, g := r.debtEnd(now); end != 0 {
+		if t.sleep(subSat(end, now), g, ctx.Done(), nil) == canceled {
+			return 0, ctx.Err()
+		}
+		now = nowNs()
+	}
+	if whole {
+		return size, nil
+	}
+	return r.allowance(size, now), nil
+}
+
+// take charges size to r at now, records the charge in rc unless rc is nil,
+// and returns how long the caller must wait and the generation charged,
+// whose Disable ends the wait. It takes no lock.
+func (r *Rate) take(size, now int64, rc *receipt) (int64, *generation) {
+	wait, g, metered, debt := r.reserveCore(size, now)
+	if metered && rc != nil {
+		rc.addRate(r, g, debt)
+	}
+	r.notifyReserved(wait)
+	return wait, g
+}
+
+// wouldWait reports whether a charge of size bytes at now would wait, as
+// tryTake would refuse it. It charges nothing.
+func (r *Rate) wouldWait(size, now int64) bool {
+	if r == nil || r.disabled.Load() {
+		return false
+	}
+	limit := r.rate.Load()
+	if limit <= 0 {
+		return false
+	}
+	tat := subSat(now, r.burstNs()) // a zero value's first charge gets a full burst
+	if g := r.gen.Load(); g != nil {
+		tat = max(tat, g.tat.Load())
+	}
+	return subSat(addSat(tat, bytesToNsCeil(size, limit)), now) > coalesceWaitNs
+}
+
+// tryTake charges size to r at now, recording the charge in rc unless rc is
+// nil, unless the charge would wait, and reports whether it charged. It
+// takes no lock.
+func (r *Rate) tryTake(size, now int64, rc *receipt) bool {
+	if r == nil || size <= 0 {
+		return true
+	}
+	for {
+		g := r.generation(now)
+		debt := false
+		if r.disabled.Load() {
+			g.count(size, now)
+		} else {
+			var ok bool
+			if ok, debt = g.tryCharge(r, size, now); !ok {
+				return false
+			}
+		}
+		// As in reserveCore: a charge to a generation that an Enable
+		// retired meanwhile is made again on the new one.
+		if r.gen.Load() == g {
+			if rc != nil {
+				rc.addRate(r, g, debt)
+			}
+			return true
+		}
+	}
 }
 
 // credit returns r's credit at now, the nanoseconds of traffic it passes at
@@ -455,18 +443,6 @@ func (r *Rate) credit(now int64) (creditNs, limit int64) {
 		return burst, limit // a zero value's first charge gets a full burst
 	}
 	return max(subSat(now, max(g.tat.Load(), subSat(now, burst))), 0), limit
-}
-
-// covers reports whether creditNs of traffic at limit, as credit returns
-// them, cover size bytes. It multiplies instead of dividing, as most charges
-// are covered.
-func covers(size, creditNs, limit int64) bool {
-	if limit <= 0 {
-		return true
-	}
-	hi, lo := bits.Mul64(uint64(creditNs), uint64(limit))
-	shi, slo := bits.Mul64(uint64(size), uint64(time.Second))
-	return hi > shi || hi == shi && lo >= slo
 }
 
 // grant returns how much of size creditNs of traffic at limit, with a burst
@@ -552,7 +528,7 @@ func (r *Rate) debtEnd(now int64) (int64, *generation) {
 
 // reserveAt charges size at time now, as returned by nowNs, and returns how
 // long the caller must wait and the generation charged, whose Disable ends the
-// wait. A Hierarchy passes one now to all its Rates, reading the
+// wait. A hierarchy passes one now to all its Rates, reading the
 // clock once.
 func (r *Rate) reserveAt(size, now int64) (int64, *generation) {
 	wait, g, _, _ := r.reserveCore(size, now)
@@ -572,7 +548,11 @@ func (r *Rate) reserveCore(size, now int64) (wait int64, g *generation, metered,
 		// this charge closes the channel the caller waits on.
 		g = r.generation(now)
 		if r.disabled.Load() {
-			return 0, g, false, false
+			g.count(size, now)
+			if r.gen.Load() == g {
+				return 0, g, true, false
+			}
+			continue
 		}
 		if hook := testHooks.charging.Load(); hook != nil {
 			(*hook)(r)
@@ -590,8 +570,7 @@ func (r *Rate) reserveCore(size, now int64) (wait int64, g *generation, metered,
 // charge adds size to g's meter and, while r has a limit, to g's debt. It
 // returns how long the caller must wait and whether it added debt.
 func (g *generation) charge(r *Rate, size, now int64) (int64, bool) {
-	g.bytesAcc.Add(size)
-	g.roll(now)
+	g.count(size, now)
 
 	rate := r.rate.Load()
 	if rate <= 0 {
@@ -608,7 +587,7 @@ func (g *generation) charge(r *Rate, size, now int64) (int64, bool) {
 			}
 			rate, cost = cur, bytesToNsCeil(size, cur)
 		}
-		next := clampAdd(max(prev, minTat), cost)
+		next := addSat(max(prev, minTat), cost)
 		if g.tat.CompareAndSwap(prev, next) {
 			return max(subSat(next, now), 0), true
 		}
@@ -618,6 +597,35 @@ func (g *generation) charge(r *Rate, size, now int64) (int64, bool) {
 			return 0, false
 		}
 	}
+}
+
+// tryCharge is charge for a charge that may not wait: it charges size
+// unless that would make the caller wait, and reports whether it charged and
+// whether it added debt.
+func (g *generation) tryCharge(r *Rate, size, now int64) (ok, debt bool) {
+	if rate := r.rate.Load(); rate > 0 {
+		cost := bytesToNsCeil(size, rate)
+		minTat := subSat(now, r.burstNs())
+		for !debt {
+			prev := g.tat.Load()
+			if cur := r.rate.Load(); cur != rate { // after tat: see SetLimit
+				if cur <= 0 {
+					break
+				}
+				rate, cost = cur, bytesToNsCeil(size, cur)
+			}
+			next := addSat(max(prev, minTat), cost)
+			if subSat(next, now) > coalesceWaitNs {
+				return false, false
+			}
+			debt = g.tat.CompareAndSwap(prev, next)
+			if !debt && r.disabled.Load() {
+				break
+			}
+		}
+	}
+	g.count(size, now)
+	return true, debt
 }
 
 func (r *Rate) notifyReserved(wait int64) {
@@ -640,38 +648,4 @@ var testHooks struct {
 	// there.
 	reserved atomic.Pointer[func(*Rate)]
 	_        cacheLinePad
-}
-
-// stopCh returns a channel that Disable closes.
-func (r *Rate) stopCh() <-chan struct{} {
-	if r == nil {
-		return nil
-	}
-	return r.gen.Load().waitCh(0)
-}
-
-// roll closes g's sampling window once it is at least a second old.
-func (g *generation) roll(now int64) {
-	last := g.lastSampleNs.Load()
-	if now-last < sampleIntervalNs {
-		return
-	}
-	if !g.lastSampleNs.CompareAndSwap(last, now) {
-		return
-	}
-
-	bytes := g.bytesAcc.Swap(0)
-	if bytes < 0 {
-		// Refunds of bytes metered in an earlier window, such as a canceled
-		// write, outweigh this window's charges: carry the rest forward.
-		// Charges and refunds share one counter, so a refund never lands
-		// in an earlier window than its charge.
-		g.bytesAcc.Add(bytes)
-		bytes = 0
-	}
-	dt := now - last
-	if dt <= 0 {
-		return
-	}
-	g.nowBps.Store(bytesPerSec(bytes, dt))
 }

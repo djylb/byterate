@@ -3,6 +3,7 @@ package byterate
 import (
 	"context"
 	"errors"
+	"net"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -61,8 +62,8 @@ func TestGroupConnSlots(t *testing.T) {
 }
 
 // A connection opened in a Group is limited by every level and counted in
-// every level's traffic, read bytes as inbound and written ones as
-// outbound; closing it gives its slot back once.
+// every level's traffic, bytes read and written; closing it gives its slot
+// back once.
 func TestGroupOpenLimitsAndCounts(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		root, user, client, tunnel := tree()
@@ -94,8 +95,8 @@ func TestGroupOpenLimitsAndCounts(t *testing.T) {
 
 		user.SetMaxConns(1)
 		first, _ := tunnel.Open(&recordingConn{})
-		if c, err := client.Open(&recordingConn{}); !errors.Is(err, ErrTooManyConns) || c == nil {
-			t.Fatalf("Open past the cap = %v, %v; want ErrTooManyConns and the connection back", c, err)
+		if c, err := client.Open(&recordingConn{}); !errors.Is(err, ErrTooManyConns) || c != nil {
+			t.Fatalf("Open past the cap = %v, %v; want nil and ErrTooManyConns", c, err)
 		}
 		_ = first.Close()
 	})
@@ -154,12 +155,12 @@ func TestGroupSetParentMovesConnections(t *testing.T) {
 	})
 }
 
-// A Group's Reader and Writer serve a relay's hooks as any Limiter does.
+// A Group's Reads and Writes serve a relay's hooks as any Limiter does.
 func TestGroupRelayHooks(t *testing.T) {
 	root := NewGroup(nil)
 	user := NewGroup(root)
 	user.SetReadLimiter(NewBudget(Step{After: 1000, Stop: true}))
-	reader := user.Reader()
+	reader := user.Reads()
 	sent := int64(0)
 	var err error
 	for err == nil {
@@ -176,60 +177,242 @@ func TestGroupRelayHooks(t *testing.T) {
 		t.Fatalf("root counted %d B in, want 1000", in)
 	}
 	var zero Group
-	if err := zero.Writer().Wait(bg, 10); err != nil {
+	if err := zero.Writes().Wait(bg, 10); err != nil {
 		t.Fatal(err)
 	}
 	if _, out := zero.Traffic().Load(); out != 10 {
 		t.Fatalf("a zero Group counted %d B out, want 10", out)
 	}
 	var none *Group
-	if none.Reader() != nil || none.Writer() != nil {
+	if none.Reads() != nil || none.Writes() != nil {
 		t.Fatal("a nil Group has limiters")
 	}
 }
 
-// Acquire, Release and SetParent racing leave every count exact.
+// Moves within and between trees, of leaves, inner Groups and roots, race
+// with Acquire, AcquireContext and Release in both trees: every slot taken
+// is given back where its Group is then, nothing deadlocks, and the bytes
+// of every level add up.
 func TestGroupMovesRaceSlots(t *testing.T) {
-	root := NewGroup(nil)
-	a, b := NewGroup(root), NewGroup(root)
-	client := NewGroup(a)
+	r1, r2 := NewGroup(nil), NewGroup(nil)
+	a1, a2 := NewGroup(r1), NewGroup(r2)
+	l1, l2 := NewGroup(a1), NewGroup(a2)
+	a2.SetMaxConns(2)
+	all := []*Group{r1, r2, a1, a2, l1, l2}
 	var stop atomic.Bool
 	var wg sync.WaitGroup
-	for range 4 {
+	for i := range 6 {
 		wg.Go(func() {
+			g := all[2+i%4]
 			for !stop.Load() {
-				if client.Acquire() == nil {
-					_ = client.Writer().Charge(10)
-					client.Release()
+				var err error
+				if i%2 == 0 {
+					err = g.Acquire()
+				} else {
+					ctx, cancel := context.WithTimeout(bg, time.Millisecond)
+					err = g.AcquireContext(ctx)
+					cancel()
+				}
+				if err == nil {
+					_ = g.Writes().Charge(10)
+					g.Release()
 				}
 				runtime.Gosched() // js/wasm does not preempt this loop
 			}
 		})
 	}
-	for i := range 2000 {
-		target := a
-		if i%2 == 0 {
-			target = b
+	moves := []struct {
+		g, p *Group
+	}{
+		{l1, a2}, {l1, r2}, {l1, nil}, {l1, a1},
+		{a1, r2}, {r2, a1}, {r2, nil}, {a1, r1},
+		{r1, l2}, {r1, nil}, {l2, l1}, {l2, a2},
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := range 3000 {
+			m := moves[i%len(moves)]
+			if err := m.g.SetParent(m.p); err != nil && !errors.Is(err, ErrGroupCycle) {
+				t.Error(err)
+			}
+			runtime.Gosched()
 		}
-		if err := client.SetParent(target); err != nil {
-			t.Fatal(err)
-		}
-		runtime.Gosched()
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Minute):
+		t.Fatal("SetParent deadlocked with Acquire and Release")
 	}
 	stop.Store(true)
 	wg.Wait()
-	for name, g := range map[string]*Group{"root": root, "a": a, "b": b, "client": client} {
+	var leaves int64
+	for _, g := range all {
 		if g.Conns() != 0 {
-			t.Fatalf("%s Conns() = %d after every slot was released, want 0", name, g.Conns())
+			t.Fatalf("Conns() = %d after every slot was released, want 0", g.Conns())
+		}
+		if a := g.queue(); a.n.Load() != 0 || len(a.q) != 0 {
+			t.Fatalf("%d waiters left after every AcquireContext returned", a.n.Load())
 		}
 	}
-	_, rootOut := root.Traffic().Load()
-	_, aOut := a.Traffic().Load()
-	_, bOut := b.Traffic().Load()
-	_, clientOut := client.Traffic().Load()
-	if rootOut != clientOut || aOut+bOut != clientOut {
-		t.Fatalf("counted %d B out in the root, %d+%d in a and b, %d in the client; want them equal", rootOut, aOut, bOut, clientOut)
+	for _, g := range []*Group{a1, a2, l1, l2} {
+		_, out := g.Traffic().Load()
+		leaves += out
 	}
+	_, out1 := r1.Traffic().Load()
+	_, out2 := r2.Traffic().Load()
+	if out1+out2 > leaves || out1+out2 == 0 {
+		t.Fatalf("counted %d B in the roots, more than the %d B of the levels below or none", out1+out2, leaves)
+	}
+}
+
+// AcquireContext waits for a slot: a Release wakes the waiters in the order
+// they came, one per slot, and a canceled wait takes nothing and leaves no
+// waiter behind.
+func TestGroupAcquireContextWaits(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		root := NewGroup(nil)
+		root.SetMaxConns(1)
+		user := NewGroup(root)
+		if err := user.Acquire(); err != nil {
+			t.Fatal(err)
+		}
+		var tme *TooManyConnsError
+		if err := user.Acquire(); !errors.Is(err, ErrTooManyConns) || !errors.As(err, &tme) || tme.Group() != root {
+			t.Fatalf("Acquire past the root's cap = %v, want a TooManyConnsError of the root", err)
+		}
+		var order []int
+		var mu sync.Mutex
+		for i := range 3 {
+			go func() {
+				if err := user.AcquireContext(bg); err != nil {
+					t.Error(err)
+				}
+				mu.Lock()
+				order = append(order, i)
+				mu.Unlock()
+			}()
+			synctest.Wait() // queued before the next
+		}
+		canceled, cancel := context.WithCancel(bg)
+		errc := make(chan error, 1)
+		go func() { errc <- user.AcquireContext(canceled) }()
+		synctest.Wait()
+		cancel()
+		if err := <-errc; !errors.Is(err, context.Canceled) {
+			t.Fatalf("canceled AcquireContext = %v, want context.Canceled", err)
+		}
+		for i := range 3 {
+			user.Release()
+			synctest.Wait()
+			mu.Lock()
+			if len(order) != i+1 || order[i] != i {
+				t.Fatalf("waiters acquired in order %v, want the order they came", order)
+			}
+			mu.Unlock()
+		}
+		if root.Conns() != 1 || root.queue().n.Load() != 0 {
+			t.Fatalf("Conns() = %d with %d waiters, want 1 and none", root.Conns(), root.queue().n.Load())
+		}
+		user.Release()
+
+		// Raising the cap, and moving away from the full Group, wake waiters.
+		root.SetMaxConns(1)
+		_ = root.Acquire()
+		got := make(chan error, 2)
+		go func() { got <- user.AcquireContext(bg) }()
+		synctest.Wait()
+		root.SetMaxConns(2)
+		if err := <-got; err != nil {
+			t.Fatal(err)
+		}
+		go func() { got <- user.AcquireContext(bg) }()
+		synctest.Wait()
+		if err := user.SetParent(nil); err != nil {
+			t.Fatal(err)
+		}
+		if err := <-got; err != nil || user.Conns() != 2 {
+			t.Fatalf("AcquireContext after the move = %v with %d slots, want nil and 2", err, user.Conns())
+		}
+	})
+}
+
+// Callers of AcquireContext at several levels of capped Groups, holding
+// slots briefly, all get theirs: no freed slot is left without a waiter
+// woken to take it, also when a waiter woken for one is refused by
+// another level.
+func TestGroupAcquireContextLosesNoWakeup(t *testing.T) {
+	root := NewGroup(nil)
+	root.SetMaxConns(3)
+	a, b := NewGroup(root), NewGroup(root)
+	a.SetMaxConns(2)
+	b.SetMaxConns(2)
+	leaves := []*Group{a, b, NewGroup(a), NewGroup(b)}
+	var wg sync.WaitGroup
+	for i := range 16 {
+		wg.Go(func() {
+			g := leaves[i%len(leaves)]
+			for range 200 {
+				if err := g.AcquireContext(bg); err != nil {
+					t.Error(err)
+					return
+				}
+				runtime.Gosched()
+				g.Release()
+			}
+		})
+	}
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(time.Minute):
+		t.Fatalf("callers of AcquireContext still waiting with %d of 3 slots taken", root.Conns())
+	}
+	if root.Conns() != 0 {
+		t.Fatalf("Conns() = %d, want 0", root.Conns())
+	}
+}
+
+// Open can wait for a slot and charge limiters of the connection's own
+// within the Group.
+func TestGroupOpenOptions(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		g := NewGroup(nil)
+		g.SetMaxConns(1)
+		g.SetLimiters(NewRate(1<<30), NewRate(1<<30))
+		perConn := NewRate(1000)
+		c, err := g.Open(&recordingConn{}, WithLimiters(nil, perConn))
+		if err != nil {
+			t.Fatal(err)
+		}
+		start := time.Now()
+		if _, err := c.Write(make([]byte, 3000)); err != nil {
+			t.Fatal(err)
+		}
+		if elapsed := time.Since(start); elapsed < time.Second {
+			t.Fatalf("Write of 3000 bytes at the connection's 1000 B/s took %v, want 1s past the burst", elapsed)
+		}
+		if _, out := g.Traffic().Total(); out != 3000 || metered(perConn) != 3000 {
+			t.Fatalf("counted %d in the Group and %d on the connection, want 3000", out, metered(perConn))
+		}
+		ctx, cancel := context.WithTimeout(bg, time.Minute)
+		defer cancel()
+		opened := make(chan net.Conn)
+		go func() {
+			c, err := g.Open(&recordingConn{}, WithWait(ctx))
+			if err != nil {
+				t.Error(err)
+			}
+			opened <- c
+		}()
+		synctest.Wait()
+		_ = c.Close()
+		_ = (<-opened).Close()
+		if g.Conns() != 0 {
+			t.Fatalf("Conns() = %d, want 0", g.Conns())
+		}
+	})
 }
 
 // A throttled Write through a tree of Groups allocates nothing, with a Rate
@@ -266,8 +449,8 @@ func TestGroupCanceledWaitKeepsCount(t *testing.T) {
 		g.SetWriteLimiter(NewBudget(Step{Limit: NewRate(100)}))
 		var c Counter
 		for name, l := range map[string]Limiter{
-			"group":     g.Writer(),
-			"hierarchy": NewHierarchy(c.Outbound(), NewBudget(Step{Limit: NewRate(100)})),
+			"group":     g.Writes(),
+			"hierarchy": NewHierarchy(c.Writes(), NewBudget(Step{Limit: NewRate(100)})),
 		} {
 			ctx, cancel := context.WithTimeout(bg, 20*time.Millisecond)
 			err := l.Wait(ctx, 1000)
@@ -292,7 +475,7 @@ func TestGroupRefusalsAndSwitchesCountOnce(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		stopped := NewGroup(nil)
 		stopped.SetWriteLimiter(NewBudget(Step{Stop: true}))
-		if err := stopped.Writer().Wait(bg, 100); !errors.Is(err, ErrBudgetExhausted) {
+		if err := stopped.Writes().Wait(bg, 100); !errors.Is(err, ErrBudgetExhausted) {
 			t.Fatalf("Wait under a stopped Budget = %v, want ErrBudgetExhausted", err)
 		}
 		if _, out := stopped.Traffic().Load(); out != 0 {
@@ -303,11 +486,11 @@ func TestGroupRefusalsAndSwitchesCountOnce(t *testing.T) {
 		slow := NewRate(100)
 		slow.reserve(1000) // so that a Wait under a blocks
 		a.SetWriteLimiter(slow)
-		sw := NewSwitch(a.Writer())
+		sw := NewSwitch(a.Writes())
 		done := make(chan error)
 		go func() { done <- sw.Wait(bg, 100) }()
 		synctest.Wait()
-		sw.Set(b.Writer())
+		sw.Set(b.Writes())
 		if err := <-done; err != nil {
 			t.Fatal(err)
 		}
@@ -330,7 +513,7 @@ func TestGroupSharedLevelsChargeOnce(t *testing.T) {
 		g.SetWriteLimiter(budget)
 		g.SetTraffic(&traffic)
 	}
-	if err := tunnel.Writer().Charge(100); err != nil {
+	if err := tunnel.Writes().Charge(100); err != nil {
 		t.Fatal(err)
 	}
 	if _, out := traffic.Load(); budget.Used() != 100 || out != 100 {
@@ -338,7 +521,7 @@ func TestGroupSharedLevelsChargeOnce(t *testing.T) {
 	}
 	fresh := &Counter{}
 	user.SetTraffic(fresh)
-	_ = tunnel.Writer().Charge(10)
+	_ = tunnel.Writes().Charge(10)
 	if _, out := fresh.Load(); out != 10 {
 		t.Fatalf("the new Counter counted %d B, want 10", out)
 	}
@@ -351,11 +534,11 @@ func TestGroupSharedLevelsChargeOnce(t *testing.T) {
 func TestGroupChangesRebuildOnlyBelow(t *testing.T) {
 	root, user, _, tunnel := tree()
 	other := NewGroup(root)
-	_ = tunnel.Writer().Charge(1)
+	_ = tunnel.Writes().Charge(1)
 	built := tunnel.cache.Load()
 	other.SetWriteLimiter(NewRate(1000))
 	other.SetTraffic(nil)
-	_ = tunnel.Writer().Charge(1)
+	_ = tunnel.Writes().Charge(1)
 	if tunnel.cache.Load() != built {
 		t.Fatal("a change to an unrelated Group rebuilt the levels")
 	}
@@ -367,7 +550,7 @@ func TestGroupChangesRebuildOnlyBelow(t *testing.T) {
 		func() { _ = root.SetParent(NewGroup(nil)) }, // a new ancestor past the chain
 	} {
 		change()
-		_ = tunnel.Writer().Charge(1)
+		_ = tunnel.Writes().Charge(1)
 		if tunnel.cache.Load() == built {
 			t.Fatal("a change to an ancestor left the levels as they were")
 		}
@@ -388,7 +571,7 @@ func TestGroupChangesRaceCharges(t *testing.T) {
 	for range 4 {
 		wg.Go(func() {
 			for !stop.Load() {
-				_ = leaf.Writer().Charge(10)
+				_ = leaf.Writes().Charge(10)
 				charged.Add(10)
 				runtime.Gosched() // js/wasm does not preempt this loop
 			}

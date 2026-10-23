@@ -105,7 +105,11 @@ func TestBudgetStopsReads(t *testing.T) {
 func TestBudgetExpiry(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		var b Budget
-		b.SetExpiry(time.Now().Add(time.Minute))
+		at := time.Now().Add(time.Minute)
+		b.SetExpiry(at)
+		if got := b.Expiry(); !got.Equal(at) {
+			t.Fatalf("Expiry() = %v, want %v", got, at)
+		}
 		time.Sleep(time.Minute - time.Second)
 		if err := b.Wait(bg, 10); err != nil {
 			t.Fatalf("Wait before the expiry = %v", err)
@@ -117,7 +121,13 @@ func TestBudgetExpiry(t *testing.T) {
 		if err := b.Charge(10); !errors.Is(err, ErrBudgetExhausted) || b.Used() != 20 {
 			t.Fatalf("Charge after the expiry = %v with %d used; want ErrBudgetExhausted and 20", err, b.Used())
 		}
+		if got := b.Remaining(); got != 0 {
+			t.Fatalf("Remaining() after the expiry = %d, want 0", got)
+		}
 		b.SetExpiry(time.Time{})
+		if got := b.Expiry(); !got.IsZero() {
+			t.Fatalf("Expiry() after clearing it = %v", got)
+		}
 		time.Sleep(time.Hour)
 		if err := b.Wait(bg, 10); err != nil {
 			t.Fatalf("Wait after clearing the expiry = %v", err)
@@ -190,6 +200,9 @@ func (l *hookLimiter) Wait(_ context.Context, n int64) error {
 	}
 	l.taken += n
 	return nil
+}
+func (l *hookLimiter) TryWait(n int64) error {
+	return l.Wait(bg, n)
 }
 func (l *hookLimiter) Refund(n int64)                                  { l.back += n }
 func (l *hookLimiter) Ready(_ context.Context, n int64) (int64, error) { return n, nil }

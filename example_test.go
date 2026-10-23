@@ -112,12 +112,12 @@ func ExampleRate_Ready() {
 }
 
 // Count exactly what a connection's reads and writes take.
-func ExampleCounter_Inbound() {
+func ExampleCounter_Reads() {
 	client, server := net.Pipe()
 	defer func() { _ = server.Close() }()
 	go func() { _, _ = server.Write([]byte("hello")) }()
 	var traffic byterate.Counter
-	conn := byterate.NewDuplexConn(client, traffic.Inbound(), traffic.Outbound())
+	conn := byterate.NewDuplexConn(client, traffic.Reads(), traffic.Writes())
 	defer func() { _ = conn.Close() }()
 
 	_, _ = io.ReadFull(conn, make([]byte, 5))
@@ -171,8 +171,7 @@ func ExampleGroup() {
 	server := byterate.NewGroup(nil)
 	user := byterate.NewGroup(server)
 	tunnel := byterate.NewGroup(user)
-	user.SetReadLimiter(byterate.NewRate(1 << 20)) // 1 MiB/s each way
-	user.SetWriteLimiter(byterate.NewRate(1 << 20))
+	user.SetLimiters(byterate.NewRate(1<<20), byterate.NewRate(1<<20)) // 1 MiB/s each way
 	user.SetMaxConns(100)
 
 	client, peer := net.Pipe()
@@ -180,7 +179,8 @@ func ExampleGroup() {
 	go func() { _, _ = io.Copy(io.Discard, peer) }()
 	conn, err := tunnel.Open(client)
 	if err != nil {
-		return // byterate.ErrTooManyConns
+		_ = client.Close() // a *byterate.TooManyConnsError, matching ErrTooManyConns
+		return
 	}
 	_, _ = conn.Write(make([]byte, 1000))
 	fmt.Println(server.Conns(), user.Conns())
@@ -192,4 +192,56 @@ func ExampleGroup() {
 	// 1 1
 	// 1000
 	// 0
+}
+
+// Give a user a speed and a monthly allowance shared by both directions: past
+// 100 GiB its traffic slows to 1 MiB/s, and at 120 GiB it stops until Reset
+// starts the next month. Open refuses connections past the user's cap.
+func ExampleGroup_budget() {
+	server := byterate.NewGroup(nil)
+	user := byterate.NewGroup(server)
+	monthly := byterate.NewBudget(
+		byterate.Step{After: 100 << 30, Limit: byterate.NewRate(1 << 20)},
+		byterate.Step{After: 120 << 30, Stop: true},
+	)
+	limit := byterate.NewHierarchy(byterate.NewRate(10<<20), monthly) // 10 MiB/s
+	user.SetLimiters(limit, limit)
+	user.SetMaxConns(10)
+
+	client, peer := net.Pipe()
+	defer func() { _ = peer.Close() }()
+	go func() { _, _ = io.Copy(io.Discard, peer) }()
+	conn, err := user.Open(client)
+	if err != nil {
+		_ = client.Close()
+		return
+	}
+	defer func() { _ = conn.Close() }()
+	_, _ = conn.Write(make([]byte, 1500))
+	in, out := user.Traffic().Total()
+	fmt.Println(monthly.Used(), in, out)
+
+	monthly.Reset() // at the start of the next month
+	fmt.Println(monthly.Used())
+	// Output:
+	// 1500 0 1500
+	// 0
+}
+
+// Drop the datagrams that a limit does not let through at once, as a UDP
+// relay does, instead of waiting for them.
+func ExampleRate_TryWait() {
+	limit := byterate.NewRate(1000) // a burst of 2000 bytes
+	sent, dropped := 0, 0
+	for range 5 {
+		packet := make([]byte, 600)
+		if err := limit.TryWait(int64(len(packet))); err != nil {
+			dropped++ // byterate.ErrWouldWait, or a refusal such as ErrBudgetExhausted
+			continue
+		}
+		sent++ // conn.WriteTo(packet, addr)
+	}
+	fmt.Println(sent, dropped)
+	// Output:
+	// 3 2
 }

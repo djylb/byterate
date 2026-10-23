@@ -2,7 +2,6 @@ package byterate
 
 import (
 	"context"
-	"errors"
 	"sync/atomic"
 )
 
@@ -14,10 +13,10 @@ import (
 // a Switch follows the new Limiter for the bytes it has not yet sent or
 // received.
 //
-// The connection wrappers and a Hierarchy that holds the Switch refund a
-// canceled or failed charge to the Limiter that took it. Refund called
-// directly goes to the current Limiter, so call it before Set for bytes
-// charged to the old one.
+// The connection wrappers and a hierarchy that holds the Switch refund a
+// canceled or failed charge to the Limiters that took it, Rates only within
+// the generation they charged. Refund called directly goes to the current
+// Limiter, so call it before Set for bytes charged to the old one.
 //
 // All methods are safe for concurrent use and on a nil *Switch, which never
 // limits. The zero value passes everything until Set.
@@ -25,10 +24,11 @@ type Switch struct {
 	st atomic.Pointer[switchState]
 }
 
-// switchState is one Limiter of a Switch and the channel that Set closes when
-// it replaces it.
+// switchState is one Limiter of a Switch, the channel that Set closes when
+// it replaces it, and the Switch itself as a level, for its own waits.
 type switchState struct {
-	l       Limiter
+	t       target
+	self    [1]level
 	changed chan struct{}
 }
 
@@ -40,29 +40,37 @@ var noSwitchState = &switchState{}
 // nothing.
 func NewSwitch(l Limiter) *Switch {
 	s := &Switch{}
-	s.st.Store(&switchState{l: nilLimiter(l), changed: make(chan struct{})})
+	s.st.Store(s.newState(l))
 	return s
+}
+
+func (s *Switch) newState(l Limiter) *switchState {
+	st := &switchState{self: [1]level{{l: s, kind: kindSwitch}}, changed: make(chan struct{})}
+	st.t.init(l)
+	return st
 }
 
 // Set makes s pass charges on to l from now on, and ends the waits in
 // progress on the Rates of the old Limiter, which start over on l; a wait
-// inside another kind of Limiter runs to its end there. l must not be or
-// contain s.
+// inside another kind of Limiter runs to its end there. It panics if l
+// passes charges on to s, which would charge s without end.
 func (s *Switch) Set(l Limiter) {
 	if s == nil {
 		return
 	}
-	if l == Limiter(s) {
-		panic("byterate: Switch set to itself")
+	configMu.Lock()
+	defer configMu.Unlock()
+	if reaches(l, func(x Limiter) bool { return x == Limiter(s) }) {
+		panic("byterate: Switch set to a Limiter that charges the Switch")
 	}
-	if old := s.st.Swap(&switchState{l: nilLimiter(l), changed: make(chan struct{})}); old != nil {
+	if old := s.st.Swap(s.newState(l)); old != nil {
 		close(old.changed)
 	}
 }
 
 // Limiter returns the Limiter s passes charges on to.
 func (s *Switch) Limiter() Limiter {
-	return s.state().l
+	return s.state().t.limiter()
 }
 
 func (s *Switch) state() *switchState {
@@ -77,63 +85,47 @@ func (s *Switch) state() *switchState {
 // Wait charges n bytes to the current Limiter and waits for it; if Set
 // replaces it meanwhile, the charge moves to the new one.
 func (s *Switch) Wait(ctx context.Context, n int64) error {
-	_, err := s.wait(ctx, nil, n)
+	st := s.state()
+	if st == noSwitchState || n <= 0 {
+		return nil // no Limiter, so nothing to wait for
+	}
+	var rc receipt
+	_, err := waitOn(ctx, st.self[:], nil, n, true, &rc)
 	return err
 }
 
-// wait is Wait in timer t, nil for one per wait. It returns the Limiter that
-// kept the charge, which a refund must reach, or nil if none did.
-func (s *Switch) wait(ctx context.Context, t *waitTimer, n int64) (Limiter, error) {
-	if n <= 0 {
-		return nil, nil
+// TryWait charges n bytes to the current Limiter if it lets them through
+// without waiting, as its TryWait does.
+func (s *Switch) TryWait(n int64) error {
+	st := s.state()
+	if st == noSwitchState || n <= 0 {
+		return nil
 	}
-	for {
-		st := s.state()
-		v := levelsOf(st.l)
-		var receipt writeCharge
-		_, err := v.wait(ctx, t, st.changed, n, true, &receipt)
-		if errors.Is(err, errSwitched) {
-			receipt.refund(n)
-			continue
-		}
-		if err != nil && (ctx.Err() == nil || !errors.Is(err, ctx.Err())) {
-			return nil, err // refused, so nothing kept the charge
-		}
-		return st.l, err
-	}
+	var rc receipt
+	return st.t.tryWait(n, nowNs(), &rc)
 }
 
 // Ready waits until the current Limiter is ready, as its Ready does, and
 // starts over on a new one if Set replaces it meanwhile.
 func (s *Switch) Ready(ctx context.Context, n int64) (int64, error) {
-	return s.ready(ctx, nil, n)
-}
-
-// ready is Ready in timer t, nil for one per wait.
-func (s *Switch) ready(ctx context.Context, t *waitTimer, n int64) (int64, error) {
-	if n <= 0 {
+	st := s.state()
+	if st == noSwitchState || n <= 0 {
 		return n, nil
 	}
-	for {
-		st := s.state()
-		v := levelsOf(st.l)
-		granted, err := v.ready(ctx, t, st.changed, n, false)
-		if errors.Is(err, errSwitched) {
-			continue
-		}
-		return granted, err
-	}
+	return readyOn(ctx, st.self[:], nil, n, false)
 }
 
 // Charge records n transferred bytes on the current Limiter.
 func (s *Switch) Charge(n int64) error {
-	v := levelsOf(s.state().l)
-	return v.charge(n)
+	if n <= 0 {
+		return nil
+	}
+	return s.state().t.charge(n)
 }
 
 // Refund gives back n bytes to the current Limiter.
 func (s *Switch) Refund(n int64) {
-	if l := s.state().l; l != nil {
+	if l := s.Limiter(); l != nil {
 		l.Refund(n)
 	}
 }

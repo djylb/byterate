@@ -104,7 +104,11 @@ func TestWaitTimerConcurrentWaits(t *testing.T) {
 // runs itself again with that setting where the toolchain has it.
 func TestWaitTimerDrainsFiredTimer(t *testing.T) {
 	if os.Getenv("BYTERATE_ASYNC_TIMER_CHILD") == "" && runtime.GOOS != "js" && runtime.GOOS != "wasip1" {
-		cmd := exec.Command(os.Args[0], "-test.run=^TestWaitTimerDrainsFiredTimer$", "-test.count=1")
+		exe, err := os.Executable()
+		if err != nil {
+			t.Fatal(err)
+		}
+		cmd := exec.Command(exe, "-test.run=^TestWaitTimerDrainsFiredTimer$", "-test.count=1")
 		cmd.Env = append(os.Environ(), "GODEBUG=asynctimerchan=1", "BYTERATE_ASYNC_TIMER_CHILD=1")
 		out, err := cmd.CombinedOutput()
 		switch {

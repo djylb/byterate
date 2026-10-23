@@ -26,12 +26,8 @@ func TestWriteReceiptRefundsEveryLevel(t *testing.T) {
 			c := NewReadWriteCloser(&scriptedConn{writeN: 50}, NewHierarchy(limiters(rates...)...))
 			_, _ = c.Write(make([]byte, 200))
 			for i, r := range rates {
-				want := int64(50)
-				if i%3 == 2 {
-					want = 0
-				}
-				if got := metered(r); got != want {
-					t.Fatalf("level %d: short write left %d bytes, want %d", i, got, want)
+				if got := metered(r); got != 50 {
+					t.Fatalf("level %d: short write left %d bytes, want 50", i, got)
 				}
 			}
 		})

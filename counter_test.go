@@ -7,15 +7,14 @@ import (
 	"sync/atomic"
 	"testing"
 	"testing/synctest"
-	"time"
 )
 
 func TestCounterAddsAndSwaps(t *testing.T) {
 	for name, c := range map[string]*Counter{"zero": {}, "shared": NewSharedCounter()} {
 		t.Run(name, func(t *testing.T) {
 			c.Add(10, 20)
-			_ = c.ChargeIn(5)
-			_ = c.ChargeOut(7)
+			_ = c.Reads().Charge(5)
+			_ = c.Writes().Charge(7)
 			if in, out := c.Load(); in != 15 || out != 27 {
 				t.Fatalf("Load() = %d, %d; want 15, 27", in, out)
 			}
@@ -34,7 +33,7 @@ func TestCounterAddsAndSwaps(t *testing.T) {
 	}
 }
 
-// Swaps racing with Adds count every byte exactly once.
+// Swaps and Sets racing with Adds count every byte exactly once.
 func TestCounterSwapRacesAdds(t *testing.T) {
 	for name, c := range map[string]*Counter{"zero": {}, "shared": NewSharedCounter()} {
 		t.Run(name, func(t *testing.T) {
@@ -48,6 +47,13 @@ func TestCounterSwapRacesAdds(t *testing.T) {
 					swappedIn.Add(in)
 					swappedOut.Add(out)
 					runtime.Gosched() // js/wasm does not preempt this loop
+				}
+			})
+			// Set replaces the totals, which Swap does not report.
+			swapper.Go(func() {
+				for !stop.Load() {
+					c.Set(0, 0)
+					runtime.Gosched()
 				}
 			})
 			var wg sync.WaitGroup
@@ -65,6 +71,10 @@ func TestCounterSwapRacesAdds(t *testing.T) {
 			if in+swappedIn.Load() != 3*adders*adds || out+swappedOut.Load() != 5*adders*adds {
 				t.Fatalf("swapped %d/%d bytes in total, want %d/%d", in+swappedIn.Load(), out+swappedOut.Load(), 3*adders*adds, 5*adders*adds)
 			}
+			// Each Add came before the last Set or after it, whole.
+			if in, out := c.Total(); in < 0 || in > 3*adders*adds || in%3 != 0 || out < 0 || out%5 != 0 {
+				t.Fatalf("Total() after Sets = %d, %d; want whole Adds after the last Set", in, out)
+			}
 		})
 	}
 }
@@ -81,48 +91,6 @@ func BenchmarkCounterAdd(b *testing.B) {
 	}
 }
 
-// Throughput reports the bytes per second of the last window of at least a
-// second, from the first Add of a zero value, and 0 for an idle window.
-func TestCounterThroughput(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		var c Counter
-		if in, out := c.Throughput(); in != 0 || out != 0 {
-			t.Fatalf("Throughput() before any Add = %d, %d; want 0, 0", in, out)
-		}
-		time.Sleep(time.Hour) // the window starts at the first Add, not before
-		c.Add(3000, 1000)
-		time.Sleep(500 * time.Millisecond)
-		if in, out := c.Throughput(); in != 0 || out != 0 {
-			t.Fatalf("Throughput() within the first second = %d, %d; want 0, 0", in, out)
-		}
-		time.Sleep(1500 * time.Millisecond)
-		c.Swap() // takes the totals, not the throughput
-		if in, out := c.Throughput(); in != 1500 || out != 500 {
-			t.Fatalf("Throughput() over 2s = %d, %d; want 1500, 500", in, out)
-		}
-		time.Sleep(500 * time.Millisecond)
-		if in, out := c.Throughput(); in != 1500 || out != 500 {
-			t.Fatalf("Throughput() within the next window = %d, %d; want the last one's", in, out)
-		}
-		time.Sleep(time.Second)
-		if in, out := c.Throughput(); in != 0 || out != 0 {
-			t.Fatalf("Throughput() of an idle window = %d, %d; want 0, 0", in, out)
-		}
-		c.Add(10<<30, -1)
-		time.Sleep(time.Second)
-		if in, out := c.Throughput(); in != 10<<30 || out != 0 {
-			t.Fatalf("Throughput() of 10 GiB in and a negative count out = %d, %d", in, out)
-		}
-
-		shared := NewSharedCounter()
-		shared.Add(2000, 0)
-		time.Sleep(time.Second)
-		if in, _ := shared.Throughput(); in != 2000 {
-			t.Fatalf("shared Throughput() = %d, want 2000", in)
-		}
-	})
-}
-
 // A Counter's views count what a connection's reads and writes take, refunds
 // taken off, and follow a Switch to another Counter.
 func TestCounterViewsInHierarchy(t *testing.T) {
@@ -130,7 +98,7 @@ func TestCounterViewsInHierarchy(t *testing.T) {
 	failed := errors.New("write failed")
 	r := NewRate(1 << 20)
 	inner := &scriptedConn{readBuf: make([]byte, 3000), writeN: 1000, writeErr: failed}
-	conn := NewDuplexReadWriteCloser(inner, NewHierarchy(r, c.Inbound()), NewHierarchy(r, c.Outbound()))
+	conn := NewDuplexReadWriteCloser(inner, NewHierarchy(r, c.Reads()), NewHierarchy(r, c.Writes()))
 	if n, _ := conn.Read(make([]byte, 5000)); n != 3000 {
 		t.Fatalf("Read = %d, want 3000", n)
 	}
@@ -142,10 +110,10 @@ func TestCounterViewsInHierarchy(t *testing.T) {
 	}
 
 	var a, b Counter
-	s := NewSwitch(a.Outbound())
+	s := NewSwitch(a.Writes())
 	sc := NewConn(&dataConn{}, s)
 	_, _ = sc.Write(make([]byte, 100))
-	s.Set(b.Outbound())
+	s.Set(b.Writes())
 	_, _ = sc.Write(make([]byte, 200))
 	if _, out := a.Load(); out != 100 {
 		t.Fatalf("first counter got %d out, want 100", out)
@@ -168,8 +136,9 @@ func TestCounterTotal(t *testing.T) {
 		}
 		var resumed Counter
 		resumed.Restore(1<<30, 1<<20)
-		resumed.Add(1000, 0)
-		time.Sleep(time.Second)
+		nextWindow()
+		_ = resumed.Reads().Charge(1000)
+		nextWindow()
 		if in, out := resumed.Total(); in != 1<<30+1000 || out != 1<<20 {
 			t.Fatalf("resumed Total() = %d, %d", in, out)
 		}
@@ -185,7 +154,7 @@ func TestCounterTotal(t *testing.T) {
 // The views, as every Limiter here, ignore counts of zero or less.
 func TestCounterViewsIgnoreNonPositive(t *testing.T) {
 	var c Counter
-	for _, l := range []Limiter{c.Inbound(), c.Outbound()} {
+	for _, l := range []Limiter{c.Reads(), c.Writes()} {
 		_ = l.Wait(bg, -5)
 		_ = l.Charge(-5)
 		l.Refund(-5)

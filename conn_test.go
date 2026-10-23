@@ -114,7 +114,8 @@ func (l *plainLimiter) Wait(_ context.Context, size int64) error {
 	l.got += size
 	return nil
 }
-func (l *plainLimiter) Refund(size int64) { l.returned += size }
+func (l *plainLimiter) TryWait(size int64) error { return l.Wait(bg, size) }
+func (l *plainLimiter) Refund(size int64)        { l.returned += size }
 func (l *plainLimiter) Ready(_ context.Context, n int64) (int64, error) {
 	return n, nil
 }
@@ -544,7 +545,9 @@ func (l *gateLimiter) Refund(int64) {}
 func (l *gateLimiter) Ready(_ context.Context, n int64) (int64, error) {
 	return n, nil
 }
-func (l *gateLimiter) Charge(int64) error { return nil }
+func (l *gateLimiter) Charge(int64) error  { return nil }
+func (l *gateLimiter) TryWait(int64) error { return ErrWouldWait }
+
 func (l *gateLimiter) Wait(ctx context.Context, _ int64) error {
 	l.entered <- ctx
 	<-ctx.Done()
@@ -628,7 +631,9 @@ func (derivingLimiter) Refund(int64) {}
 func (derivingLimiter) Ready(_ context.Context, n int64) (int64, error) {
 	return n, nil
 }
-func (derivingLimiter) Charge(int64) error { return nil }
+func (derivingLimiter) Charge(int64) error  { return nil }
+func (derivingLimiter) TryWait(int64) error { return ErrWouldWait }
+
 func (l derivingLimiter) Wait(ctx context.Context, _ int64) error {
 	ctx, cancel := context.WithTimeout(ctx, time.Hour)
 	defer cancel()
@@ -706,10 +711,10 @@ func TestConnTypedNilLimiter(t *testing.T) {
 	client, _ := tcpPair(t)
 
 	var rate *Rate
-	var hier *Hierarchy
+	var hier *hierarchy
 	for name, got := range map[string]any{
 		"NewConn(*Rate)":                          NewConn(client, rate),
-		"NewConn(*Hierarchy)":                     NewConn(client, hier),
+		"NewConn(*hierarchy)":                     NewConn(client, hier),
 		"NewDuplexConn":                           NewDuplexConn(client, rate, hier),
 		"NewRateReadWriteCloser(*Rate)":           NewReadWriteCloser(client, rate),
 		"NewDuplexRateReadWriteCloser(nil, hier)": NewDuplexReadWriteCloser(client, nil, hier),
@@ -720,8 +725,8 @@ func TestConnTypedNilLimiter(t *testing.T) {
 	}
 
 	conn := NewDuplexConn(client, rate, NewRate(1024)).(*rateNetConn)
-	if conn.read.rate != nil {
-		t.Fatalf("read direction limiter = %v, want nil for a nil *Rate", conn.read.rate)
+	if conn.read.limited() {
+		t.Fatalf("read direction limiter = %v, want none for a nil *Rate", conn.read.lim.limiter())
 	}
 }
 
@@ -775,6 +780,7 @@ func (l *errLimiter) Refund(size int64) { l.returned += size }
 func (l *errLimiter) Wait(context.Context, int64) error {
 	return l.err
 }
+func (l *errLimiter) TryWait(int64) error { return l.err }
 func (l *errLimiter) Ready(_ context.Context, n int64) (int64, error) {
 	return n, nil
 }
@@ -1188,7 +1194,7 @@ func TestDatagramConnKeepsMessagesWhole(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		inner := &recordingConn{}
 		r := NewRate(1000)
-		conn := NewDatagramConn(inner, r, r)
+		conn := NewDatagramConn(inner, r)
 		if n, err := conn.Write(make([]byte, 10000)); n != 10000 || err != nil {
 			t.Fatalf("Write() = %d, %v", n, err)
 		}
@@ -1199,6 +1205,29 @@ func TestDatagramConnKeepsMessagesWhole(t *testing.T) {
 			t.Fatalf("Read() = %d, %v; want the whole 9000 B message", n, err)
 		}
 	})
+}
+
+// A duplex datagram connection charges whole reads to one Limiter and
+// whole writes to the other.
+func TestDuplexDatagramConnSeparatesDirections(t *testing.T) {
+	inner := &recordingConn{}
+	var reads, writes Counter
+	conn := NewDuplexDatagramConn(inner, reads.Reads(), writes.Writes())
+	if n, err := conn.Write(make([]byte, 3000)); n != 3000 || err != nil {
+		t.Fatalf("Write() = %d, %v", n, err)
+	}
+	if n, err := conn.Read(make([]byte, 2000)); n != 2000 || err != nil {
+		t.Fatalf("Read() = %d, %v; want the whole 2000 B message", n, err)
+	}
+	if len(inner.writes) != 1 || inner.writes[0] != 3000 {
+		t.Fatalf("writes to the connection = %v, want one of 3000 B", inner.writes)
+	}
+	if r, w := reads.Total(); r != 2000 || w != 0 {
+		t.Fatalf("read Limiter counted %d read, %d written; want 2000, 0", r, w)
+	}
+	if r, w := writes.Total(); r != 0 || w != 3000 {
+		t.Fatalf("write Limiter counted %d read, %d written; want 0, 3000", r, w)
+	}
 }
 
 // NewConn treats UDP, IP and Unix datagram sockets as datagram

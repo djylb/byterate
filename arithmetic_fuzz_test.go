@@ -32,6 +32,5 @@ func FuzzRateArithmetic(f *testing.F) {
 		}
 		check(mulDiv(a, b, divisor), b, false)
 		check(bytesToNsCeil(a, divisor), 1000000000, true)
-		check(bytesPerSec(a, divisor), 1000000000, false)
 	})
 }

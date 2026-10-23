@@ -48,54 +48,23 @@ func TestBytesToNsCeil(t *testing.T) {
 	}
 }
 
-func TestBytesPerSec(t *testing.T) {
-	t.Parallel()
-
-	if got := bytesPerSec(0, 100); got != 0 {
-		t.Fatalf("bytesPerSec(0,100)=%d, want 0", got)
-	}
-	if got := bytesPerSec(100, 0); got != 0 {
-		t.Fatalf("bytesPerSec(100,0)=%d, want 0", got)
-	}
-	if got := bytesPerSec(5, int64(time.Second)); got != 5 {
-		t.Fatalf("bytesPerSec(5,1s)=%d, want 5", got)
-	}
-	if got := bytesPerSec(3, int64(2*time.Second)); got != 1 {
-		t.Fatalf("bytesPerSec(3,2s)=%d, want 1", got)
-	}
-	if got := bytesPerSec(maxI64, 1); got != maxI64 {
-		t.Fatalf("bytesPerSec(maxI64,1)=%d, want maxI64", got)
-	}
-
-	// Inputs whose intermediate product exceeds int64 must stay exact.
-	for _, tc := range []struct{ bytes, dtNs, want int64 }{
-		{9_500_000_000, 10_000_000_000, 950_000_000},
-		{99_000_000_000, 100_000_000_000, 990_000_000},
-		{10_000_000_000, 20_000_000_000, 500_000_000},
-		{10 << 30, int64(1100 * time.Millisecond), 9_761_289_309},
-		{maxI64, int64(time.Second), maxI64},
-		{maxI64, maxI64, 1_000_000_000},
-	} {
-		if got := bytesPerSec(tc.bytes, tc.dtNs); got != tc.want {
-			t.Fatalf("bytesPerSec(%d,%d)=%d, want %d", tc.bytes, tc.dtNs, got, tc.want)
-		}
-	}
-}
-
 func TestClampHelpers(t *testing.T) {
 	t.Parallel()
 
-	if got := clampAdd(1, 2); got != 3 {
-		t.Fatalf("clampAdd(1,2)=%d, want 3", got)
+	if got := addSat(1, 2); got != 3 {
+		t.Fatalf("addSat(1,2)=%d, want 3", got)
 	}
-	if got := clampAdd(maxI64-1, 10); got != maxI64 {
-		t.Fatalf("clampAdd overflow=%d, want maxI64", got)
+	if got := addSat(maxI64-1, 10); got != maxI64 {
+		t.Fatalf("addSat overflow=%d, want maxI64", got)
 	}
-	if got := clampSub(5, 2); got != 3 {
-		t.Fatalf("clampSub(5,2)=%d, want 3", got)
+	if got := addSat(minI64+1, -10); got != minI64 {
+		t.Fatalf("addSat underflow=%d, want minI64", got)
 	}
-	if got := clampSub(minI64+1, 10); got != minI64 {
-		t.Fatalf("clampSub underflow=%d, want minI64", got)
+	if got := subSat(5, 2); got != 3 {
+		t.Fatalf("subSat(5,2)=%d, want 3", got)
+	}
+	if got := subSat(minI64+1, 10); got != minI64 {
+		t.Fatalf("subSat underflow=%d, want minI64", got)
 	}
 }
 
@@ -110,8 +79,8 @@ func TestRateLifecycle(t *testing.T) {
 
 	r.Disable()
 	_ = r.Wait(bg, 1024)
-	if got := r.Throughput(); got != 0 {
-		t.Fatalf("Throughput() after Disable/Wait=%d, want 0", got)
+	if got := metered(r); got != 1024 {
+		t.Fatalf("metered after Disable/Wait=%d, want 1024: a disabled Rate still meters", got)
 	}
 
 	r.Enable()
@@ -217,10 +186,8 @@ func TestZeroValueRateIsReady(t *testing.T) {
 	var r Rate
 	r.SetLimit(1000)
 	expectFullBurst(t, &r)
-	last := genOf(&r).lastSampleNs.Load()
-	genOf(&r).roll(last + int64(2*time.Second))
-	if got := genOf(&r).nowBps.Load(); got != 1500 {
-		t.Fatalf("nowBps after 3000 bytes over 2s = %d, want 1500", got)
+	if got := metered(&r); got != 3000 {
+		t.Fatalf("metered after 3000 bytes = %d, want 3000", got)
 	}
 
 	cloned := (&Rate{}).Clone()
@@ -231,9 +198,9 @@ func TestZeroValueRateIsReady(t *testing.T) {
 	}
 }
 
-// metered returns the bytes r has metered in its current sampling window,
-// net of refunds.
-func metered(r *Rate) int64 { return genOf(r).bytesAcc.Load() }
+// metered returns the bytes r has metered since its generation began, net of
+// refunds.
+func metered(r *Rate) int64 { return genOf(r).total.Load() }
 
 // TestRateSetLimitDebt checks that debt is kept as bytes across limit
 // changes, also through a time without a limit, and that Reset drops it.
@@ -353,21 +320,6 @@ func TestRateSetLimitRacesCharges(t *testing.T) {
 	}
 }
 
-func TestRateThroughputReportsZeroWhenIdle(t *testing.T) {
-	r := NewRate(0)
-	r.reserve(500)
-	genOf(r).lastSampleNs.Store(nowNs() - int64(2*time.Second))
-	if got := r.Throughput(); got < 200 || got > 250 {
-		t.Fatalf("Throughput()=%d, want about 250", got)
-	}
-
-	// An idle window must read 0, not the earlier bytes spread over more time.
-	genOf(r).lastSampleNs.Store(nowNs() - int64(time.Second))
-	if got := r.Throughput(); got != 0 {
-		t.Fatalf("idle Throughput()=%d, want 0", got)
-	}
-}
-
 func TestRateWaitCancel(t *testing.T) {
 	r := NewRate(1024)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -423,37 +375,6 @@ func TestRateStartsWithFullBurstForLaterLimit(t *testing.T) {
 	}
 }
 
-// TestRateMeterCarriesRefunds checks that a refund of bytes metered in an
-// earlier window, such as a canceled write, is taken off later windows rather
-// than dropped.
-func TestRateMeterCarriesRefunds(t *testing.T) {
-	r := NewRate(0) // unlimited, still metered
-	last := nowNs() + int64(time.Hour)
-	genOf(r).lastSampleNs.Store(last) // only roll closes a window
-	roll := func() int64 {
-		last += sampleIntervalNs
-		genOf(r).roll(last)
-		return genOf(r).nowBps.Load()
-	}
-
-	_ = r.Wait(bg, 1000)
-	if got := roll(); got != 1000 {
-		t.Fatalf("window 1 = %d B/s, want 1000", got)
-	}
-	r.Refund(1000) // the 1000 bytes were never sent
-	_ = r.Wait(bg, 600)
-	if got := roll(); got != 0 {
-		t.Fatalf("window 2 = %d B/s, want 0", got)
-	}
-	_ = r.Wait(bg, 1000)
-	if got := roll(); got != 600 {
-		t.Fatalf("window 3 = %d B/s, want 600 after the remaining 400-byte refund", got)
-	}
-	if got := roll(); got != 0 {
-		t.Fatalf("idle window = %d B/s, want 0", got)
-	}
-}
-
 // TestRateCloneDuringEnableDisable clones a Rate that is being disabled and
 // enabled: every clone must be either disabled or able to wait.
 func TestRateCloneDuringEnableDisable(t *testing.T) {
@@ -482,38 +403,14 @@ func TestRateCloneDuringEnableDisable(t *testing.T) {
 	}
 }
 
-// TestRateThroughputWhileDisabled checks that a charge that raced with
-// Disable is not reported as throughput while the Rate is disabled.
-func TestRateThroughputWhileDisabled(t *testing.T) {
-	r := NewRate(0)
-	r.Disable()
-	genOf(r).bytesAcc.Add(1000) // a charge that passed the disabled check before Disable
-	genOf(r).lastSampleNs.Store(nowNs() - int64(time.Second))
-	if got := r.Throughput(); got != 0 {
-		t.Fatalf("Throughput() of a disabled Rate = %d, want 0", got)
-	}
-}
-
-// meterWindows sets r up so that only the returned roll closes a sampling
-// window, a second long, and returns its throughput.
-func meterWindows(r *Rate) (roll func() int64) {
-	last := nowNs() + int64(time.Hour)
-	genOf(r).lastSampleNs.Store(last)
-	return func() int64 {
-		last += sampleIntervalNs
-		genOf(r).roll(last)
-		return genOf(r).nowBps.Load()
-	}
-}
-
 // TestRateChargeRefundDropsChargesBeforeReset refunds, after Reset, a
 // charge made before it, as a write that Reset woke and that then
 // failed does: the cleared meter must not go below 0, and the refund must
 // not credit the debt charged since.
 func TestRateChargeRefundDropsChargesBeforeReset(t *testing.T) {
 	r := NewRate(1000)
-	var charge rateCharge
-	charge.reserve(r, 1<<20, nowNs())
+	var charge receipt
+	r.take(1<<20, nowNs(), &charge)
 	r.Reset(1000)
 	r.reserve(2000)  // spend the new burst
 	r.reserve(10000) // 10s of debt since the reset
@@ -526,83 +423,10 @@ func TestRateChargeRefundDropsChargesBeforeReset(t *testing.T) {
 	}
 
 	// A refund of a charge made since the last Enable is applied.
-	charge.reserve(r, 1000, nowNs())
+	r.take(1000, nowNs(), &charge)
 	charge.refund(1000)
 	if got := metered(r); got != 12001 {
 		t.Fatalf("metered after a current refund = %d, want 12001", got)
-	}
-}
-
-// TestRateMeterCarriesRefundAcrossIdleWindows refunds a write that waited
-// through idle windows closed by Throughput before Close canceled it: the
-// refund must still come off the following windows.
-func TestRateMeterCarriesRefundAcrossIdleWindows(t *testing.T) {
-	r := NewRate(0)
-	roll := meterWindows(r)
-	r.reserve(64 << 10)
-	roll()
-	roll() // idle
-	roll() // idle
-	r.Refund(64 << 10)
-	r.reserve(10 << 10)
-	if got := roll(); got != 0 {
-		t.Fatalf("window with the refund = %d B/s, want 0", got)
-	}
-	r.reserve(100 << 10)
-	if got, want := roll(), int64((10+100-64)<<10); got != want {
-		t.Fatalf("next window = %d B/s, want %d after the rest of the refund", got, want)
-	}
-}
-
-// TestRateMeterChargeRefundRace charges and refunds the same bytes while
-// windows close: as the pairs net to 0, so must the windows together with
-// the refunds still carried, however a charge and its refund fall around a
-// window's end.
-func TestRateMeterChargeRefundRace(t *testing.T) {
-	r := NewRate(0)
-	roll := meterWindows(r)
-	var stop atomic.Bool
-	var wg sync.WaitGroup
-	for range 4 {
-		wg.Go(func() {
-			for !stop.Load() {
-				r.reserve(1000)
-				r.Refund(1000)
-				runtime.Gosched() // js/wasm does not preempt this loop
-			}
-		})
-	}
-	var reported int64
-	for range 10000 {
-		reported += roll()
-	}
-	stop.Store(true)
-	wg.Wait()
-	reported += roll()
-	if carried := -metered(r); reported != carried {
-		t.Fatalf("windows reported %d bytes of charges that were all refunded, with %d bytes of refunds carried", reported, carried)
-	}
-}
-
-// TestRateMeterCarriesRefundPastNettedWindow cancels a write charged in a
-// window that another refund netted to 0: its refund must still come off
-// the next windows.
-func TestRateMeterCarriesRefundPastNettedWindow(t *testing.T) {
-	r := NewRate(0)
-	roll := meterWindows(r)
-	r.reserve(100_000) // write B
-	roll()
-	r.reserve(100_000) // write A
-	r.Refund(100_000)  // B is canceled
-	roll()
-	r.reserve(50_000)
-	r.Refund(100_000) // A is canceled
-	if got := roll(); got != 0 {
-		t.Fatalf("window with A's refund = %d B/s, want 0", got)
-	}
-	r.reserve(50_000)
-	if got := roll(); got != 0 {
-		t.Fatalf("next window = %d B/s, want 0 with the rest of A's refund", got)
 	}
 }
 
@@ -619,6 +443,13 @@ func TestLayoutFillsCacheLines(t *testing.T) {
 	}
 	if got := unsafe.Offsetof(g.tat); got != cacheLineSize {
 		t.Errorf("generation.tat at offset %d, want %d", got, cacheLineSize)
+	}
+	var gr Group
+	if got := unsafe.Sizeof(gr); got != 2*cacheLineSize {
+		t.Errorf("Group is %d bytes, want %d", got, 2*cacheLineSize)
+	}
+	if got := unsafe.Offsetof(gr.conns); got != cacheLineSize {
+		t.Errorf("Group.conns at offset %d, want %d", got, cacheLineSize)
 	}
 }
 
