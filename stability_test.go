@@ -48,7 +48,7 @@ func TestShortReadWaitDeadline(t *testing.T) {
 		_ = r.Wait(bg, 2000)
 		r.reserve(1) // 1ms of debt, which a Read waits for before reading
 		inner := &deadlineReadConn{scriptedConn: scriptedConn{readBuf: []byte("x")}}
-		c := NewConn(inner, r)
+		c := NewConn(inner, WithLimiter(r))
 		defer func() { _ = c.Close() }()
 		if err := c.SetReadDeadline(time.Now().Add(100 * time.Microsecond)); err != nil {
 			t.Fatal(err)
@@ -84,9 +84,9 @@ func TestHalfCloseWakesLimiter(t *testing.T) {
 				inner := &deadlineReadConn{scriptedConn: scriptedConn{readBuf: []byte("x"), writeN: 1}}
 				var c io.ReadWriteCloser
 				if read {
-					c = NewDuplexReadWriteCloser(inner, r, nil)
+					c = NewStream(inner, WithLimiters(r, nil))
 				} else {
-					c = NewDuplexReadWriteCloser(inner, nil, r)
+					c = NewStream(inner, WithLimiters(nil, r))
 				}
 				defer func() { _ = c.Close() }()
 				done := make(chan ioResult, 1)
@@ -103,9 +103,9 @@ func TestHalfCloseWakesLimiter(t *testing.T) {
 				synctest.Wait()
 				var err error
 				if read {
-					err = c.(interface{ CloseRead() error }).CloseRead()
+					err = any(c).(interface{ CloseRead() error }).CloseRead()
 				} else {
-					err = c.(interface{ CloseWrite() error }).CloseWrite()
+					err = any(c).(interface{ CloseWrite() error }).CloseWrite()
 				}
 				if err != nil {
 					t.Fatal(err)
@@ -189,7 +189,7 @@ func TestConcurrentDeadlineSettersStayConsistent(t *testing.T) {
 			_ = r.Wait(bg, 2000)
 			inner := &interleavedDeadlineConn{release: make(chan struct{}), entered: make(chan struct{})}
 			inner.readBuf = []byte("x")
-			c := NewConn(inner, r)
+			c := NewConn(inner, WithLimiter(r))
 			defer func() { _ = c.Close() }()
 			done := make(chan error, 1)
 			second := make(chan error, 1)
@@ -238,7 +238,7 @@ func TestConcurrentDeadlineSettersStayConsistent(t *testing.T) {
 // a Write deadline setter: only setters of the same direction are ordered.
 func TestDeadlineSettersOfOtherDirectionDoNotWait(t *testing.T) {
 	inner := &interleavedDeadlineConn{release: make(chan struct{}), entered: make(chan struct{})}
-	c := NewConn(inner, NewRate(1000))
+	c := NewConn(inner, WithLimiter(NewRate(1000)))
 	defer func() { _ = c.Close() }()
 	first := make(chan error, 1)
 	go func() { first <- c.SetReadDeadline(time.Now().Add(time.Minute)) }()

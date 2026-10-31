@@ -8,19 +8,17 @@ import (
 )
 
 // savedRate stores a Rate in a configuration file or an API response in the
-// application's own JSON form: the limit is restored, and the measured
-// throughput is reported but not read back, as it is measured anew.
+// application's own JSON form.
 type savedRate struct {
 	*byterate.Rate
 }
 
 type savedRateJSON struct {
-	Limit      int64 `json:"limit"`      // bytes/s, 0 for none
-	Throughput int64 `json:"throughput"` // bytes/s, measured
+	Limit int64 `json:"limit"` // bytes/s, 0 for none
 }
 
 func (r *savedRate) MarshalJSON() ([]byte, error) {
-	return json.Marshal(savedRateJSON{Limit: max(r.Limit(), 0), Throughput: r.Throughput()})
+	return json.Marshal(savedRateJSON{Limit: max(r.Limit(), 0)})
 }
 
 func (r *savedRate) UnmarshalJSON(b []byte) error {
@@ -51,5 +49,5 @@ func ExampleRate_json() {
 	fmt.Println(string(out))
 	// Output:
 	// 1048576
-	// {"name":"alice","rate":{"limit":1048576,"throughput":0}}
+	// {"name":"alice","rate":{"limit":1048576}}
 }

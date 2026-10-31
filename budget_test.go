@@ -71,7 +71,7 @@ func TestBudgetStepsInStages(t *testing.T) {
 		var reached []int
 		b.OnStep(func(step int, _ int64) { reached = append(reached, step) })
 		inner := &dataConn{}
-		conn := NewConn(inner, NewHierarchy(NewRate(1<<30), b))
+		conn := NewConn(inner, WithLimiter(NewHierarchy(NewRate(1<<30), b)))
 		start := time.Now()
 		n, err := conn.Write(make([]byte, 10000))
 		// 1000 B at once, 1000 B at 1000 B/s, 1000 B at 500 B/s, then stop.
@@ -89,13 +89,13 @@ func TestBudgetStepsInStages(t *testing.T) {
 	})
 }
 
-// A Read takes up to a step, and the Read that reaches a stop returns its
-// bytes with ErrBudgetExhausted.
+// A Read reads no more than the Budget has left, and the next one is
+// refused.
 func TestBudgetStopsReads(t *testing.T) {
 	b := stopAfter(1000)
-	conn := NewConn(&recordingConn{}, b)
-	if n, err := conn.Read(make([]byte, 4000)); n != 1000 || !errors.Is(err, ErrBudgetExhausted) {
-		t.Fatalf("Read on a 1000 B Budget = %d, %v; want 1000 and ErrBudgetExhausted", n, err)
+	conn := NewConn(&recordingConn{}, WithLimiter(b))
+	if n, err := conn.Read(make([]byte, 4000)); n != 1000 || err != nil {
+		t.Fatalf("Read on a 1000 B Budget = %d, %v; want 1000, nil", n, err)
 	}
 	if n, err := conn.Read(make([]byte, 4000)); n != 0 || !errors.Is(err, ErrBudgetExhausted) {
 		t.Fatalf("Read past the stop = %d, %v; want 0 and ErrBudgetExhausted", n, err)
@@ -265,7 +265,7 @@ func TestBudgetChangesKeepConnections(t *testing.T) {
 		slow := NewRate(1000)
 		slow.reserve(2000) // spend the step limit's burst
 		b := NewBudget(Step{After: 1000, Limit: slow})
-		conn := NewConn(&dataConn{}, NewHierarchy(NewRate(1<<20), b))
+		conn := NewConn(&dataConn{}, WithLimiter(NewHierarchy(NewRate(1<<20), b)))
 		done := make(chan ioResult, 1)
 		start := time.Now()
 		go func() {
@@ -300,7 +300,7 @@ func TestBudgetStepAllocatesNothing(t *testing.T) {
 	slow := NewRate(1 << 20)
 	slow.reserve(2 << 20) // spend the burst, so that each Write below waits
 	b := NewBudget(Step{After: 0, Limit: slow})
-	conn := NewConn(&nopNetConn{}, NewHierarchy(NewRate(1<<30), b))
+	conn := NewConn(&nopNetConn{}, WithLimiter(NewHierarchy(NewRate(1<<30), b)))
 	buf := make([]byte, 8<<10) // about 8 ms at the step's pace
 	_, _ = conn.Write(buf)
 	if allocs := testing.AllocsPerRun(20, func() { _, _ = conn.Write(buf) }); allocs != 0 {
@@ -370,7 +370,7 @@ func TestBudgetRefundsReachTheirSteps(t *testing.T) {
 		slow.reserve(2000) // spend the burst, so that the write waits
 		b := NewBudget(Step{After: 0, Limit: slow})
 		failed := errors.New("write failed")
-		conn := NewReadWriteCloser(&scriptedConn{writeErr: failed}, b)
+		conn := NewStream(&scriptedConn{writeErr: failed}, WithLimiter(b))
 		done := make(chan error, 1)
 		go func() {
 			_, err := conn.Write(make([]byte, 100))
@@ -409,8 +409,8 @@ func TestBudgetUsageBounds(t *testing.T) {
 
 	failed := errors.New("write failed")
 	c := NewBudget()
-	conn := NewReadWriteCloser(&scriptedConn{writeErr: failed}, NewHierarchy(NewRate(1<<20), c,
-		&hookLimiter{hook: func() { c.SetUsed(500) }})) // a new count while the write is charged
+	conn := NewStream(&scriptedConn{writeErr: failed}, WithLimiter(NewHierarchy(NewRate(1<<20), c,
+		&hookLimiter{hook: func() { c.SetUsed(500) }}))) // a new count while the write is charged
 	_, _ = conn.Write(make([]byte, 100))
 	if c.Used() != 500 {
 		t.Fatalf("a refund of a write charged before SetUsed left %d used, want 500", c.Used())

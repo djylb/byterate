@@ -5,19 +5,17 @@ import "context"
 // NewHierarchy combines limiters into one Limiter of nested levels, such as
 // a connection's Rate within its user's Rate and Budget within a global
 // Rate. It charges every level and waits until every one allows the bytes,
-// so the strictest sets the pace. Every Rate also meters the traffic,
-// whether it is limited, unlimited or disabled, so each level reports its
-// own Throughput, and a limit set on any of them later applies to the next
-// charge. Disable on a Rate ends the wait it imposes, and the others still
+// so the strictest sets the pace. A limit set on any of them later applies
+// to the next charge, also an unlimited Rate's. Disable on a Rate ends the wait it imposes, and the others still
 // apply; a disabled Rate limits nothing until Enable.
 //
 // The levels of a hierarchy given as a level take its place. Nil limiters,
 // also nil pointers of this package's types, are left out, and so are
 // repeats of a limiter of this package, so that a level given twice is
-// charged once; unlimited Rates are kept, as they meter and can be limited
-// later. NewHierarchy returns nil when no level remains and that level
-// itself when one does. Pass nil for levels that should neither limit nor
-// meter: an unlimited Rate still costs a charge per call.
+// charged once; unlimited Rates are kept, as they can be limited later.
+// NewHierarchy returns nil when no level remains and that level itself when
+// one does. Pass nil for levels that never limit: an unlimited Rate still
+// costs a charge per call, and keeps a wrapper off its fast path.
 //
 // A level that refuses a charge, such as an exhausted Budget, is asked first
 // and refuses it for the whole: Wait then gives the bytes back to every
@@ -28,7 +26,6 @@ import "context"
 // leaves them on every level and returns the first refusal. Refund gives
 // the bytes back to every level; Ready returns the least that any level
 // grants, at least 1.
-// The views of a Counter are counted once the other levels accept the bytes.
 //
 // Every level is charged when the bytes are, not when the strictest lets them
 // pass, so a looser Rate counts bytes still waiting on a stricter one. Each

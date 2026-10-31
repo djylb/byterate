@@ -13,8 +13,8 @@ func TestCounterAddsAndSwaps(t *testing.T) {
 	for name, c := range map[string]*Counter{"zero": {}, "shared": NewSharedCounter()} {
 		t.Run(name, func(t *testing.T) {
 			c.Add(10, 20)
-			_ = c.Reads().Charge(5)
-			_ = c.Writes().Charge(7)
+			_ = c.reads().Charge(5)
+			_ = c.writes().Charge(7)
 			if in, out := c.Load(); in != 15 || out != 27 {
 				t.Fatalf("Load() = %d, %d; want 15, 27", in, out)
 			}
@@ -98,7 +98,7 @@ func TestCounterViewsInHierarchy(t *testing.T) {
 	failed := errors.New("write failed")
 	r := NewRate(1 << 20)
 	inner := &scriptedConn{readBuf: make([]byte, 3000), writeN: 1000, writeErr: failed}
-	conn := NewDuplexReadWriteCloser(inner, NewHierarchy(r, c.Reads()), NewHierarchy(r, c.Writes()))
+	conn := NewStream(inner, WithLimiters(NewHierarchy(r, c.reads()), NewHierarchy(r, c.writes())))
 	if n, _ := conn.Read(make([]byte, 5000)); n != 3000 {
 		t.Fatalf("Read = %d, want 3000", n)
 	}
@@ -110,10 +110,10 @@ func TestCounterViewsInHierarchy(t *testing.T) {
 	}
 
 	var a, b Counter
-	s := NewSwitch(a.Writes())
-	sc := NewConn(&dataConn{}, s)
+	s := NewSwitch(a.writes())
+	sc := NewConn(&dataConn{}, WithLimiter(s))
 	_, _ = sc.Write(make([]byte, 100))
-	s.Set(b.Writes())
+	s.Set(b.writes())
 	_, _ = sc.Write(make([]byte, 200))
 	if _, out := a.Load(); out != 100 {
 		t.Fatalf("first counter got %d out, want 100", out)
@@ -137,7 +137,8 @@ func TestCounterTotal(t *testing.T) {
 		var resumed Counter
 		resumed.Restore(1<<30, 1<<20)
 		nextWindow()
-		_ = resumed.Reads().Charge(1000)
+		resumed.Sample()
+		_ = resumed.reads().Charge(1000)
 		nextWindow()
 		if in, out := resumed.Total(); in != 1<<30+1000 || out != 1<<20 {
 			t.Fatalf("resumed Total() = %d, %d", in, out)
@@ -154,7 +155,7 @@ func TestCounterTotal(t *testing.T) {
 // The views, as every Limiter here, ignore counts of zero or less.
 func TestCounterViewsIgnoreNonPositive(t *testing.T) {
 	var c Counter
-	for _, l := range []Limiter{c.Reads(), c.Writes()} {
+	for _, l := range []Limiter{c.reads(), c.writes()} {
 		_ = l.Wait(bg, -5)
 		_ = l.Charge(-5)
 		l.Refund(-5)

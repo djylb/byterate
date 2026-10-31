@@ -11,13 +11,12 @@ import (
 // lets up to two seconds' worth of bytes through without waiting.
 const burstWindowNs = int64(2 * time.Second)
 
-// Rate is a bytes-per-second limiter (GCRA, a token-bucket variant) with a
-// built-in throughput meter. A limit <= 0 means unlimited, and after an idle
-// period a burst of bytes passes without waiting, two seconds' worth unless
-// SetBurst sets another. Disable turns the limit off for a while, waking
-// the callers waiting for it; unlimited and disabled alike, a Rate passes
-// everything and still meters it. The meter counts up to 2^63-1 bytes in a
-// sampling window.
+// Rate is a bytes-per-second limiter (GCRA, a token-bucket variant). A limit
+// <= 0 means unlimited, and after an idle period a burst of bytes passes
+// without waiting, two seconds' worth unless SetBurst sets another. Disable
+// turns the limit off for a while, waking the callers waiting for it;
+// unlimited and disabled alike, a Rate passes everything. A Counter measures
+// throughput.
 //
 // All methods are safe for concurrent use and on a nil *Rate, which never
 // limits. The zero value is an enabled, unlimited Rate, ready for SetLimit. A
@@ -60,7 +59,7 @@ func (r *Rate) generation(now int64) *generation {
 }
 
 // Clone returns an independent copy of r's limit, burst, debt, enabled or
-// disabled state and meter. Callers blocked on r are not affected by the copy.
+// disabled state. Callers blocked on r are not affected by the copy.
 func (r *Rate) Clone() *Rate {
 	if r == nil {
 		return nil
@@ -77,7 +76,6 @@ func (r *Rate) Clone() *Rate {
 		cg := &generation{}
 		cg.tat.Store(g.tat.Load())
 		cg.total.Store(g.total.Load())
-		cg.meter.copyFrom(&g.meter)
 		if r.disabled.Load() {
 			cg.closeStop()
 		}
@@ -91,7 +89,7 @@ func (r *Rate) Clone() *Rate {
 // It applies from the next charge, and debt is kept as bytes: what callers
 // owe at the old limit is repaid at the new one, also after a time without a
 // limit. Callers blocked in Wait are not woken and keep their wait; Reset
-// wakes them, drops the debt, restores the full burst and clears the meter.
+// wakes them, drops the debt, and restores the full burst.
 func (r *Rate) SetLimit(limitBps int64) {
 	if r == nil {
 		return
@@ -154,7 +152,7 @@ func (g *generation) convertDebt(from, to int64) {
 }
 
 // Reset is Disable, SetLimit and Enable: it wakes blocked callers, clears the
-// debt and the meter, and starts over with a full burst at the new limit.
+// debt, and starts over with a full burst at the new limit.
 func (r *Rate) Reset(limitBps int64) {
 	if r == nil {
 		return
@@ -172,27 +170,7 @@ func (r *Rate) Limit() int64 {
 	return r.rate.Load()
 }
 
-// Throughput returns the bytes charged to r, refunds taken off, in the last
-// whole second: the sampling windows are one-second slices of a clock that
-// every Rate and Counter shares, and Throughput reports the one before the
-// current one, so it lags by one to two seconds. What it reports depends only on
-// when the bytes were charged, not on how often or by how many callers it is
-// called. A refund of bytes charged in an earlier window comes off the
-// following ones. r meters whether it is limited, unlimited or disabled;
-// Enable and Reset clear the meter.
-func (r *Rate) Throughput() int64 {
-	if r == nil {
-		return 0
-	}
-	g := r.gen.Load()
-	if g == nil {
-		return 0
-	}
-	return g.throughput(nowNs())
-}
-
-// Enable undoes Disable, starting over with a full burst and a cleared
-// meter. It is a no-op on an enabled Rate.
+// Enable undoes Disable, starting over with a full burst. It is a no-op on an enabled Rate.
 func (r *Rate) Enable() {
 	if r == nil {
 		return
@@ -212,8 +190,8 @@ func (r *Rate) Enable() {
 }
 
 // Disable turns r's limit off until Enable: traffic charged to it passes at
-// once, as with no limit, and callers blocked in Wait are woken. It still
-// meters, and keeps the limit for Enable. It does not block traffic; a
+// once, as with no limit, and callers blocked in Wait are woken. It keeps
+// the limit for Enable. It does not block traffic; a
 // hierarchy keeps its other Rates.
 func (r *Rate) Disable() {
 	if r == nil {
@@ -234,15 +212,12 @@ func (r *Rate) Disable() {
 
 // Refund gives back n bytes charged by Wait, TryWait or Charge that were not
 // transferred, such as the unwritten part of a short write. A refund never
-// raises the available burst above r's burst. The bytes also come off the
-// meter: a refund of bytes metered in an earlier sampling window is taken off
-// the following windows. While r is unlimited, the refund still comes off the
-// debt left from the last limit, which SetLimit keeps as bytes; while it is
-// disabled, only off the meter.
+// raises the available burst above r's burst. While r is unlimited, the
+// refund still comes off the debt left from the last limit, which SetLimit
+// keeps as bytes; while it is disabled, it does nothing.
 //
 // Refund takes no receipt, so it cannot tell which charge it gives back:
-// bytes charged before the last Enable or Reset, which cleared the debt and
-// the meter, are refunded all the same, and so is debt for bytes charged
+// bytes charged before the last Enable or Reset, which cleared the debt, are refunded all the same, and so is debt for bytes charged
 // while r was unlimited or disabled, which added none. Refund only bytes of
 // a charge that r took since the last Enable or Reset and while it had the
 // same kind of limit. The connection wrappers, hierarchies, Switches,
@@ -259,15 +234,14 @@ func (r *Rate) Refund(n int64) {
 	}
 }
 
-// refund takes size bytes off g's meter and, with debt, off its debt. r.mu
+// refund takes size bytes off g's total and, with debt, off its debt. r.mu
 // must be held, which serializes it with Enable, Disable and SetLimit: the
 // caller's check that g is current and the conversion at debtRate then see
 // the same generation and limit as the tat they change. Charges still move
 // tat concurrently, hence the CAS.
 func (r *Rate) refund(g *generation, size int64, debt bool) {
 	now := nowNs()
-	g.count(-size, now)
-
+	g.total.Add(-size)
 	// While temporarily unlimited, old debt is still denominated at the
 	// last positive limit. Canceling an old write must remove that debt too.
 	rate := r.debtRate
@@ -319,7 +293,7 @@ func (r *Rate) Ready(ctx context.Context, n int64) (int64, error) {
 	if n <= 0 {
 		return n, nil
 	}
-	return r.ready(ctx, nil, n, false)
+	return r.ready(ctx, nil, n, false, nil)
 }
 
 // Charge records n transferred bytes without waiting, as debt that the next
@@ -333,7 +307,9 @@ func (r *Rate) Charge(n int64) error {
 // transfer of size bytes, or unless whole for r's grant of them, records the
 // charge in rc, and waits in t until r allows it or ctx is done. It returns
 // the bytes charged.
-func (r *Rate) grant(ctx context.Context, t *waitTimer, size int64, whole bool, rc *receipt) (int64, error) {
+//
+// A closed switchCh ends the wait with errSwitched, keeping the charge.
+func (r *Rate) grant(ctx context.Context, t *waitTimer, size int64, whole bool, rc *receipt, switchCh <-chan struct{}) (int64, error) {
 	now := nowNs()
 	if !whole {
 		size = r.allowance(size, now)
@@ -346,8 +322,14 @@ func (r *Rate) grant(ctx context.Context, t *waitTimer, size int64, whole bool, 
 			wait, g = r.take(size, nowNs(), rc)
 		}
 	}
-	if wait > coalesceWaitNs && t.sleep(wait, g, ctx.Done(), nil) == canceled {
-		return size, ctx.Err()
+	if wait > coalesceWaitNs {
+		switch t.sleep(wait, g, ctx.Done(), switchCh) {
+		case canceled:
+			return size, ctx.Err()
+		case switched:
+			return size, errSwitched
+		case slept, stopped:
+		}
 	}
 	return size, nil
 }
@@ -355,11 +337,17 @@ func (r *Rate) grant(ctx context.Context, t *waitTimer, size int64, whole bool, 
 // ready is levels.ready for r alone, without a waitSet: it waits in t until
 // r has no debt worth a wait and returns how much of size a transfer may
 // take, all of it when whole.
-func (r *Rate) ready(ctx context.Context, t *waitTimer, size int64, whole bool) (int64, error) {
+//
+// A closed switchCh ends the wait with errSwitched.
+func (r *Rate) ready(ctx context.Context, t *waitTimer, size int64, whole bool, switchCh <-chan struct{}) (int64, error) {
 	now := nowNs()
 	if end, g := r.debtEnd(now); end != 0 {
-		if t.sleep(subSat(end, now), g, ctx.Done(), nil) == canceled {
+		switch t.sleep(subSat(end, now), g, ctx.Done(), switchCh) {
+		case canceled:
 			return 0, ctx.Err()
+		case switched:
+			return 0, errSwitched
+		case slept, stopped:
 		}
 		now = nowNs()
 	}
@@ -409,7 +397,7 @@ func (r *Rate) tryTake(size, now int64, rc *receipt) bool {
 		g := r.generation(now)
 		debt := false
 		if r.disabled.Load() {
-			g.count(size, now)
+			g.total.Add(size)
 		} else {
 			var ok bool
 			if ok, debt = g.tryCharge(r, size, now); !ok {
@@ -537,7 +525,7 @@ func (r *Rate) reserveAt(size, now int64) (int64, *generation) {
 }
 
 // reserveCore is reserveAt without the test hook. It returns the generation
-// charged, and reports whether the charge was metered there and whether it
+// charged, and reports whether the charge was made there and whether it
 // added debt there, for write receipts.
 func (r *Rate) reserveCore(size, now int64) (wait int64, g *generation, metered, debt bool) {
 	if r == nil || size <= 0 {
@@ -548,7 +536,7 @@ func (r *Rate) reserveCore(size, now int64) (wait int64, g *generation, metered,
 		// this charge closes the channel the caller waits on.
 		g = r.generation(now)
 		if r.disabled.Load() {
-			g.count(size, now)
+			g.total.Add(size)
 			if r.gen.Load() == g {
 				return 0, g, true, false
 			}
@@ -567,11 +555,10 @@ func (r *Rate) reserveCore(size, now int64) (wait int64, g *generation, metered,
 	}
 }
 
-// charge adds size to g's meter and, while r has a limit, to g's debt. It
+// charge adds size to g's total and, while r has a limit, to its debt. It
 // returns how long the caller must wait and whether it added debt.
 func (g *generation) charge(r *Rate, size, now int64) (int64, bool) {
-	g.count(size, now)
-
+	g.total.Add(size)
 	rate := r.rate.Load()
 	if rate <= 0 {
 		return 0, false
@@ -624,7 +611,7 @@ func (g *generation) tryCharge(r *Rate, size, now int64) (ok, debt bool) {
 			}
 		}
 	}
-	g.count(size, now)
+	g.total.Add(size)
 	return true, debt
 }
 

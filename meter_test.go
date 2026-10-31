@@ -19,212 +19,159 @@ func nextWindow() {
 	time.Sleep(time.Duration(sampleIntervalNs - m))
 }
 
-// Throughput reports the bytes of the last whole second of the clock, for a
-// Rate as for a Counter counted through its views, and 0 for an idle one.
+// Sampled each second, Throughput reports the bytes of the last whole
+// second, the same all through the next one, and 0 for an idle one.
 func TestThroughputWindows(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		r := NewRate(0)
 		var c Counter
-		l := NewHierarchy(r, c.Reads(), c.Writes())
 		nextWindow()
+		c.Sample()
 		time.Sleep(300 * time.Millisecond)
-		_ = l.Wait(bg, 1000)
-		if got := r.Throughput(); got != 0 {
-			t.Fatalf("Throughput() in the window of the charge = %d, want 0 until it ends", got)
+		c.Add(1000, 100)
+		if in, out := c.Throughput(); in != 0 || out != 0 {
+			t.Fatalf("Throughput() in the window of the bytes = %d, %d; want 0 until it ends", in, out)
 		}
 		time.Sleep(500 * time.Millisecond)
-		_ = l.Wait(bg, 500)
+		c.Add(500, 50)
 		nextWindow()
-		for range 3 { // the same all through the next window
-			if got := r.Throughput(); got != 1500 {
-				t.Fatalf("Rate.Throughput() = %d, want the 1500 bytes of the last second", got)
-			}
-			if in, out := c.Throughput(); in != 1500 || out != 1500 {
-				t.Fatalf("Counter.Throughput() = %d, %d; want 1500, 1500", in, out)
+		for range 3 {
+			if in, out := c.Throughput(); in != 1500 || out != 150 {
+				t.Fatalf("Throughput() = %d, %d; want 1500, 150", in, out)
 			}
 			time.Sleep(300 * time.Millisecond)
 		}
 		nextWindow()
-		if got := r.Throughput(); got != 0 {
-			t.Fatalf("Throughput() after an idle second = %d, want 0", got)
-		}
 		if in, out := c.Throughput(); in != 0 || out != 0 {
-			t.Fatalf("Counter.Throughput() after an idle second = %d, %d; want 0", in, out)
+			t.Fatalf("Throughput() after an idle second = %d, %d; want 0", in, out)
 		}
 	})
 }
 
-// What Throughput reports depends on when the bytes were charged, not on
-// who reads it or how often: readers that read at different times read the
-// same windows.
-func TestThroughputIgnoresReaders(t *testing.T) {
-	type reading struct{ rate, read, written int64 }
-	run := func(readEvery int) []reading {
-		var got []reading
-		synctest.Test(t, func(t *testing.T) {
-			r := NewRate(0)
-			c := NewSharedCounter()
-			reads, writes := NewHierarchy(r, c.Reads()), c.Writes()
+// A reader that samples every N seconds sees the average of those seconds.
+func TestThroughputAveragesSparseSamples(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var c Counter
+		nextWindow()
+		c.Sample()
+		c.Add(3000, 0)
+		for range 3 {
 			nextWindow()
+		}
+		if in, _ := c.Throughput(); in != 1000 {
+			t.Fatalf("Throughput() over 3 s = %d, want their average 1000", in)
+		}
+	})
+}
+
+// Readers at any time within a window read the same throughput, so many of
+// them change nothing.
+func TestThroughputIgnoresReaders(t *testing.T) {
+	run := func(readers int) []int64 {
+		var got []int64
+		synctest.Test(t, func(t *testing.T) {
+			c := NewSharedCounter()
+			nextWindow()
+			c.Sample()
 			for i := range 50 {
-				_ = reads.Wait(bg, int64(100*(i+1)))
-				_ = writes.Charge(int64(10 * (i + 1)))
-				if readEvery > 0 && i%readEvery == 0 {
-					_ = r.Throughput()
+				c.Add(int64(100*(i+1)), 0)
+				for range readers {
 					_, _ = c.Throughput()
 				}
-				time.Sleep(70 * time.Millisecond)
+				time.Sleep(100 * time.Millisecond)
 				if i%10 == 9 {
-					rb := r.Throughput()
-					in, out := c.Throughput()
-					got = append(got, reading{rb, in, out})
+					c.Sample()
+					in, _ := c.Throughput()
+					got = append(got, in)
 				}
 			}
 		})
 		return got
 	}
 	want := run(0)
-	for _, every := range []int{1, 3, 7} {
-		if got := run(every); len(got) != len(want) {
-			t.Fatalf("%d readings, want %d", len(got), len(want))
-		} else {
-			for i := range got {
-				if got[i] != want[i] {
-					t.Fatalf("reading every %d charges: reading %d = %+v, want %+v as without readers", every, i, got[i], want[i])
-				}
+	for _, readers := range []int{1, 3} {
+		got := run(readers)
+		for i := range want {
+			if got[i] != want[i] {
+				t.Fatalf("with %d readers: %v, want %v", readers, got, want)
 			}
-		}
-	}
-	for _, w := range want[1:] { // the first is read within the first window
-		if w.rate == 0 || w.rate != w.read || w.written != w.read/10 {
-			t.Fatalf("readings %+v: want the bytes of the last whole second", want)
 		}
 	}
 }
 
-// A Rate meters whether it is limited, unlimited or disabled; Enable starts
-// its meter over.
-func TestDisabledAndUnlimitedRatesMeter(t *testing.T) {
+// Refunds that outweigh a window report 0 and come off the next ones.
+func TestThroughputCarriesRefunds(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		limited, unlimited, disabled := NewRate(1<<20), NewRate(0), NewRate(1<<20)
-		disabled.Disable()
+		var c Counter
 		nextWindow()
-		for _, r := range []*Rate{limited, unlimited, disabled} {
-			_ = r.Wait(bg, 4000)
-		}
-		disabled.Refund(1000) // off its meter alone
+		c.Sample()
+		c.Add(1000, 0)
 		nextWindow()
-		for _, c := range []struct {
-			r    *Rate
-			want int64
-		}{{limited, 4000}, {unlimited, 4000}, {disabled, 3000}} {
-			if got := c.r.Throughput(); got != c.want {
-				t.Fatalf("Throughput() = %d, want %d", got, c.want)
-			}
+		c.Sample()
+		c.Add(-1500, 0)
+		nextWindow()
+		if in, _ := c.Throughput(); in != 0 {
+			t.Fatalf("Throughput() of a window of refunds = %d, want 0", in)
 		}
-		disabled.Enable()
-		if got := disabled.Throughput(); got != 0 {
-			t.Fatalf("Throughput() after Enable = %d, want 0", got)
+		c.Add(2000, 0)
+		nextWindow()
+		if in, _ := c.Throughput(); in != 500 {
+			t.Fatalf("Throughput() = %d, want 2000 less the 1500 carried", in)
 		}
 	})
 }
 
-// A refund of bytes charged in an earlier window, such as a canceled write,
-// comes off the following windows, through idle ones and ones that other
-// refunds netted to 0, rather than being dropped.
-func TestMeterCarriesRefunds(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		r := NewRate(0)
-		window := func() int64 { nextWindow(); return r.Throughput() }
-		nextWindow()
-		_ = r.Wait(bg, 1000)
-		if got := window(); got != 1000 {
-			t.Fatalf("window 1 = %d, want 1000", got)
-		}
-		r.Refund(1000) // never sent
-		_ = r.Wait(bg, 600)
-		if got := window(); got != 0 {
-			t.Fatalf("window 2 = %d, want 0", got)
-		}
-		_ = r.Wait(bg, 1000)
-		if got := window(); got != 600 {
-			t.Fatalf("window 3 = %d, want 600 after the rest of the refund", got)
-		}
-		window() // idle
-		r.Refund(500)
-		window() // idle, the refund carried
-		_ = r.Wait(bg, 100)
-		if got := window(); got != 0 {
-			t.Fatalf("window after an idle one = %d, want 0 with the refund carried", got)
-		}
-		_ = r.Wait(bg, 1000)
-		if got := window(); got != 600 {
-			t.Fatalf("next window = %d, want 600", got)
-		}
-	})
-}
-
-// Charges and refunds of the same bytes, racing with windows that close:
-// the windows together report what the refunds still carried take off.
-func TestMeterChargeRefundRace(t *testing.T) {
-	r := NewRate(0)
-	g := genOf(r)
-	// Windows far ahead of the charges' clock, so that only roll closes them.
-	at := nowNs() + int64(time.Hour)
-	roll := func() int64 {
-		at += sampleIntervalNs
-		return g.throughput(at)
-	}
-	roll()
-	var stop atomic.Bool
-	var wg sync.WaitGroup
-	for range 4 {
-		wg.Go(func() {
-			for !stop.Load() {
-				r.reserve(1000)
-				r.Refund(1000)
-				runtime.Gosched() // js/wasm does not preempt this loop
-			}
-		})
-	}
-	var reported int64
-	for range 10000 {
-		reported += roll()
-	}
-	stop.Store(true)
-	wg.Wait()
-	reported += roll()
-	if carried := g.meter.start[0] - g.total.Load(); reported != carried {
-		t.Fatalf("windows reported %d bytes of charges that were all refunded, with %d bytes of refunds carried", reported, carried)
-	}
-}
-
-// Add does not read the clock: its bytes count in the window that the next
-// timed count, or Throughput, closes. Restore and Set are not traffic.
+// Restore and Set are not traffic.
 func TestCounterThroughputOfAdds(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		var c Counter
 		if in, out := c.Throughput(); in != 0 || out != 0 {
 			t.Fatalf("Throughput() before any count = %d, %d; want 0, 0", in, out)
 		}
-		c.Restore(1<<30, 1<<20)
-		c.Add(3000, 1000)
 		nextWindow()
-		_ = c.Writes().Charge(500) // closes the window of the Adds
-		c.Set(5, 5)
+		c.Sample()
+		c.Restore(1<<30, 1<<20)
+		c.Add(0, 500)
+		c.Set(5, 5+500)
 		nextWindow()
 		if in, out := c.Throughput(); in != 0 || out != 500 {
-			t.Fatalf("Throughput() = %d, %d; want 0, 500: the Adds before, Set not counted", in, out)
-		}
-		c.Add(10<<30, -1)
-		nextWindow()
-		if in, out := c.Throughput(); in != 10<<30 || out != 0 {
-			t.Fatalf("Throughput() of 10 GiB read and a negative count written = %d, %d", in, out)
-		}
-		if in, out := c.Total(); in != 5+10<<30 || out != 5-1 {
-			t.Fatalf("Total() = %d, %d", in, out)
+			t.Fatalf("Throughput() = %d, %d; want 0, 500: Restore and Set not counted", in, out)
 		}
 	})
+}
+
+// fakeClock is a Clock that tests step by hand.
+type fakeClock struct {
+	mu  sync.Mutex
+	now time.Time
+}
+
+func (c *fakeClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
+
+func (c *fakeClock) advance(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.now = c.now.Add(d)
+}
+
+// A Counter samples on the Clock it is given.
+func TestCounterClock(t *testing.T) {
+	clk := &fakeClock{now: time.Unix(1000, 0)}
+	var c Counter
+	c.SetClock(clk)
+	c.Sample()
+	c.Add(700, 70)
+	clk.advance(time.Second)
+	if in, out := c.Throughput(); in != 700 || out != 70 {
+		t.Fatalf("Throughput() on a fake clock = %d, %d; want 700, 70", in, out)
+	}
+	clk.advance(time.Second)
+	if in, _ := c.Throughput(); in != 0 {
+		t.Fatalf("Throughput() after an idle fake second = %d, want 0", in)
+	}
 }
 
 // Set racing with Throughput moves the totals and the window's start
@@ -232,7 +179,7 @@ func TestCounterThroughputOfAdds(t *testing.T) {
 // replaced.
 func TestCounterSetRacesThroughput(t *testing.T) {
 	c := NewSharedCounter()
-	at := nowNs() + int64(time.Hour) // windows that only throughput closes
+	at := nowNs() + int64(time.Hour)
 	const adds = 1 << 15
 	var stop atomic.Bool
 	var wg sync.WaitGroup

@@ -45,3 +45,14 @@ func (r *Rate) stopCh() <-chan struct{} {
 	}
 	return r.gen.Load().waitCh(0)
 }
+
+// setRead and setWrite set one of g's Limiters, keeping the other.
+func setRead(g *Group, l Limiter) {
+	_, w := g.Limiters()
+	g.SetLimiters(l, w)
+}
+
+func setWrite(g *Group, l Limiter) {
+	r, _ := g.Limiters()
+	g.SetLimiters(r, l)
+}

@@ -56,7 +56,7 @@ func TestReadFromForwardsGrants(t *testing.T) {
 	budget := stopAfter(700_000)
 	rate := NewRate(1 << 40)
 	inner := &copyConn{}
-	c := NewConn(inner, NewHierarchy(rate, budget))
+	c := NewConn(inner, WithLimiter(NewHierarchy(rate, budget)))
 	n, err := io.Copy(c, zeroCopyFile{bytes.NewReader(data)})
 	if n != 700_000 || !errors.Is(err, ErrBudgetExhausted) {
 		t.Fatalf("io.Copy = %d, %v; want 700000 and ErrBudgetExhausted", n, err)
@@ -76,13 +76,13 @@ func TestReadFromForwardsGrants(t *testing.T) {
 	// A LimitedReader of the file is unwrapped and kept in step.
 	inner = &copyConn{}
 	lr := &io.LimitedReader{R: zeroCopyFile{bytes.NewReader(data)}, N: 300_000}
-	if n, err := NewConn(inner, NewRate(1<<40)).(io.ReaderFrom).ReadFrom(lr); n != 300_000 || err != nil || lr.N != 0 {
+	if n, err := any(NewConn(inner, WithLimiter(NewRate(1<<40)))).(io.ReaderFrom).ReadFrom(lr); n != 300_000 || err != nil || lr.N != 0 {
 		t.Fatalf("ReadFrom(LimitedReader) = %d, %v with %d left; want 300000, nil, 0", n, err, lr.N)
 	}
 
 	// Any other source goes through Write.
 	inner = &copyConn{}
-	if n, err := io.Copy(NewConn(inner, NewRate(1<<40)), strings.NewReader("hello")); n != 5 || err != nil || inner.writes == 0 || len(inner.chunks) != 0 {
+	if n, err := io.Copy(NewConn(inner, WithLimiter(NewRate(1<<40))), strings.NewReader("hello")); n != 5 || err != nil || inner.writes == 0 || len(inner.chunks) != 0 {
 		t.Fatalf("io.Copy of a strings.Reader = %d, %v in %d writes and %d chunks", n, err, inner.writes, len(inner.chunks))
 	}
 }
@@ -92,7 +92,7 @@ func TestReadFromForwardsGrants(t *testing.T) {
 func TestWriteToForwardsGrants(t *testing.T) {
 	data := bytes.Repeat([]byte("abcdefghij"), 100_000)
 	rate := NewRate(1 << 40)
-	src := NewReader(zeroCopyFile{bytes.NewReader(data)}, rate)
+	src := NewReader(zeroCopyFile{bytes.NewReader(data)}, WithLimiter(rate))
 	dst := &copyConn{}
 	if n, err := io.Copy(dst, src); n != int64(len(data)) || err != nil {
 		t.Fatalf("io.Copy = %d, %v; want %d, nil", n, err, len(data))
@@ -124,12 +124,12 @@ func TestZeroCopyOverTCP(t *testing.T) {
 	done := make(chan error, 1)
 	go func() {
 		// file -> limited -> client ... server -> limited -> relayIn ... relayOut
-		_, err := io.Copy(NewConn(client, write), f)
+		_, err := io.Copy(NewConn(client, WithLimiter(write)), f)
 		_ = client.(*net.TCPConn).CloseWrite()
 		done <- err
 	}()
 	go func() {
-		_, err := io.Copy(relayIn, NewConn(server, read))
+		_, err := io.Copy(relayIn, NewConn(server, WithLimiter(read)))
 		_ = relayIn.(*net.TCPConn).CloseWrite()
 		done <- err
 	}()
@@ -169,7 +169,7 @@ func udpPair(t *testing.T) (a, b *net.UDPConn) {
 func TestPacketConn(t *testing.T) {
 	a, b := udpPair(t)
 	rate := NewRate(1000) // a burst of 2000 bytes
-	pc := NewPacketConn(a, rate)
+	pc := NewPacketConn(a, WithLimiter(rate))
 	msg := make([]byte, 1000)
 	for range 2 {
 		if n, err := pc.WriteTo(msg, b.LocalAddr()); n != 1000 || err != nil {
@@ -185,7 +185,7 @@ func TestPacketConn(t *testing.T) {
 	}
 	_ = pc.SetWriteDeadline(time.Time{})
 
-	reader := NewPacketConn(b, NewRate(1<<30))
+	reader := NewPacketConn(b, WithLimiter(NewRate(1<<30)))
 	buf := make([]byte, 1500)
 	for range 2 {
 		if n, addr, err := reader.ReadFrom(buf); n != 1000 || err != nil || addr.String() != a.LocalAddr().String() {
@@ -200,7 +200,7 @@ func TestPacketConn(t *testing.T) {
 	if _, err := a.WriteTo(msg, b.LocalAddr()); err != nil {
 		t.Fatal(err)
 	}
-	if n, err := NewReader(b, tiny).Read(buf); n != 1000 || err != nil {
+	if n, err := NewReader(b, WithLimiter(tiny)).Read(buf); n != 1000 || err != nil {
 		t.Fatalf("Read of a datagram through NewReader = %d, %v; want it whole", n, err)
 	}
 
@@ -217,7 +217,7 @@ func TestPacketConn(t *testing.T) {
 func TestPacketConnDrop(t *testing.T) {
 	a, b := udpPair(t)
 	rate := NewRate(1000) // a burst of 2000 bytes
-	pc := NewPacketConn(a, rate, WithDrop())
+	pc := NewPacketConn(a, WithLimiter(rate), WithDrop())
 	msg := make([]byte, 1000)
 	for i := range 3 {
 		if n, err := pc.WriteTo(msg, b.LocalAddr()); n != 1000 || err != nil {
@@ -232,7 +232,7 @@ func TestPacketConnDrop(t *testing.T) {
 	}
 
 	readRate := NewRate(1000)
-	reader := NewPacketConn(b, readRate, WithDrop())
+	reader := NewPacketConn(b, WithLimiter(readRate), WithDrop())
 	buf := make([]byte, 1500)
 	for range 2 {
 		if n, _, err := reader.ReadFrom(buf); n != 1000 || err != nil {
@@ -251,7 +251,7 @@ func TestPacketConnDrop(t *testing.T) {
 	}
 
 	g := NewGroup(nil)
-	g.SetWriteLimiter(stopAfter(1500))
+	setWrite(g, stopAfter(1500))
 	gpc, err := g.OpenPacketConn(a, WithDrop())
 	if err != nil {
 		t.Fatal(err)
@@ -290,7 +290,7 @@ func TestGroupOpenPacketConn(t *testing.T) {
 // and closes what they wrap.
 func TestReaderAndWriter(t *testing.T) {
 	rate := NewRate(1 << 30)
-	r := NewReader(io.NopCloser(strings.NewReader("hello, world")), rate)
+	r := NewReader(io.NopCloser(strings.NewReader("hello, world")), WithLimiter(rate))
 	if got, err := io.ReadAll(r); string(got) != "hello, world" || err != nil {
 		t.Fatalf("ReadAll = %q, %v", got, err)
 	}
@@ -300,7 +300,7 @@ func TestReaderAndWriter(t *testing.T) {
 
 	slow := NewRate(1000)
 	var buf bytes.Buffer
-	w := NewWriter(&buf, slow)
+	w := NewWriter(&buf, WithLimiter(slow))
 	res := closeWhileBlocked(t, w, func() (int, error) { return w.Write(make([]byte, 5000)) }, slow.Disable)
 	if res.n == 0 || res.n >= 5000 || !errors.Is(res.err, net.ErrClosed) {
 		t.Fatalf("Write ended by Close = %d, %v; want part of it and net.ErrClosed", res.n, res.err)
@@ -310,12 +310,12 @@ func TestReaderAndWriter(t *testing.T) {
 	}
 
 	pr, pw := io.Pipe()
-	r = NewReader(pr, NewRate(1))
+	r = NewReader(pr, WithLimiter(NewRate(1)))
 	_ = r.Close()
 	if _, err := pw.Write([]byte("x")); !errors.Is(err, io.ErrClosedPipe) {
 		t.Fatalf("write to the pipe after the Reader's Close = %v, want io.ErrClosedPipe", err)
 	}
-	if n, err := NewReader(nil, NewRate(1)).Read(make([]byte, 1)); n != 0 || !errors.Is(err, ErrNilConn) {
+	if n, err := NewReader(nil, WithLimiter(NewRate(1))).Read(make([]byte, 1)); n != 0 || !errors.Is(err, ErrNilConn) {
 		t.Fatalf("Read of a nil reader = %d, %v; want ErrNilConn", n, err)
 	}
 }

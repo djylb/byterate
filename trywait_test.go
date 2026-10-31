@@ -44,15 +44,15 @@ func TestTryWaitChargesAllOrNothing(t *testing.T) {
 		name string
 		l    func() Limiter
 	}{
-		{"hierarchy", func() Limiter { return NewHierarchy(loose, other, NewRate(1000), c.Writes()) }},
+		{"hierarchy", func() Limiter { return NewHierarchy(loose, other, NewRate(1000), c.writes()) }},
 		{"budget", func() Limiter {
 			budget = NewBudget(Step{After: 0, Limit: NewRate(1000)}, Step{After: 10_000, Stop: true})
-			return NewHierarchy(loose, other, budget, c.Writes())
+			return NewHierarchy(loose, other, budget, c.writes())
 		}},
-		{"switch", func() Limiter { return NewHierarchy(loose, NewSwitch(NewRate(1000)), c.Writes()) }},
+		{"switch", func() Limiter { return NewHierarchy(loose, NewSwitch(NewRate(1000)), c.writes()) }},
 		{"group", func() Limiter {
 			g := NewGroup(nil)
-			g.SetWriteLimiter(NewRate(1000))
+			setWrite(g, NewRate(1000))
 			return NewHierarchy(loose, other, g.Writes())
 		}},
 	} {

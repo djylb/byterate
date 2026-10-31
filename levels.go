@@ -76,12 +76,12 @@ func classify(l Limiter) level {
 // isView reports whether lv is a view of a Counter, which never limits.
 func (lv *level) isView() bool { return lv.kind == kindCountReads || lv.kind == kindCountWrites }
 
-// count adds n bytes charged at now to the Counter of the view lv.
-func (lv *level) count(n, now int64) {
+// count adds n bytes to the Counter of the view lv.
+func (lv *level) count(n int64) {
 	if lv.kind == kindCountReads {
-		(*Counter)(lv.l.(*counterReads)).addAt(n, 0, now)
+		(*Counter)(lv.l.(*counterReads)).Add(n, 0)
 	} else {
-		(*Counter)(lv.l.(*counterWrites)).addAt(0, n, now)
+		(*Counter)(lv.l.(*counterWrites)).Add(0, n)
 	}
 }
 
@@ -360,7 +360,7 @@ func (v *levels) charge(n int64) error {
 		case kindBudget, kindOther:
 			err = lv.l.Charge(n)
 		case kindCountReads, kindCountWrites:
-			lv.count(n, now)
+			lv.count(n)
 		default:
 			err = chargeOn(v.lv[i:i+1], n)
 		}
@@ -369,7 +369,7 @@ func (v *levels) charge(n int64) error {
 		}
 	}
 	for i := range v.views {
-		v.views[i].count(n, now)
+		v.views[i].count(n)
 	}
 	return first
 }
@@ -422,14 +422,14 @@ func (v *levels) wait(ctx context.Context, t *waitTimer, size int64, whole bool,
 			if isCanceled(ctx, err) {
 				// It kept the charge, so the views count it, for a refund
 				// to take off.
-				rc.count(v.views, size, now)
+				rc.count(v.views, size)
 				return size, err
 			}
 			rc.refundFrom(m, size)
 			return 0, err
 		}
 	}
-	rc.count(v.views, size, now)
+	rc.count(v.views, size)
 	return size, waits.sleep(ctx, t, v.switchCh)
 }
 
@@ -444,7 +444,7 @@ func (v *levels) waitOthers(ctx context.Context, t *waitTimer, size, now int64, 
 		case kindNone, kindRate:
 		case kindCountReads, kindCountWrites:
 			// A view alone, as the levels of a hierarchy keep views apart.
-			lv.count(size, now)
+			lv.count(size)
 			rc.add(entry{l: lv.l})
 		case kindBudget:
 			err = lv.l.(*Budget).wait(ctx, t, size, rc)
@@ -507,10 +507,10 @@ func (v *levels) tryWait(size, now int64, rc *receipt) error {
 		}
 	}
 	if view >= 0 {
-		v.lv[view].count(size, now)
+		v.lv[view].count(size)
 		rc.add(entry{l: v.lv[view].l})
 	}
-	rc.count(v.views, size, now)
+	rc.count(v.views, size)
 	return nil
 }
 
@@ -695,9 +695,9 @@ func reaches(l Limiter, f func(Limiter) bool) bool {
 			// without building them, as configMu keeps them.
 			g := groupOf(lv.l)
 			for a := g; a != nil; a = a.parent.Load() {
-				own := a.ReadLimiter()
+				own := a.readLimiter()
 				if lv.kind == kindGroupWrites {
-					own = a.WriteLimiter()
+					own = a.writeLimiter()
 				}
 				if visit(own) {
 					return true

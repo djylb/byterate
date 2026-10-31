@@ -23,11 +23,11 @@ func TestNestedRefundsSkipRestartedRates(t *testing.T) {
 		},
 		"switch of hierarchy": func(r *Rate) setup {
 			var c Counter
-			return setup{l: NewHierarchy(NewRate(0), NewSwitch(NewHierarchy(r, c.Writes()))), count: &c}
+			return setup{l: NewHierarchy(NewRate(0), NewSwitch(NewHierarchy(r, c.writes()))), count: &c}
 		},
 		"group in hierarchy": func(r *Rate) setup {
 			g := NewGroup(nil)
-			g.SetWriteLimiter(r)
+			setWrite(g, r)
 			return setup{l: NewHierarchy(NewRate(0), g.Writes()), count: g.Traffic()}
 		},
 	}
@@ -35,7 +35,7 @@ func TestNestedRefundsSkipRestartedRates(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			r := NewRate(1000)
 			s := build(r)
-			c := NewReadWriteCloser(&changingWriteConn{change: func() { r.Reset(1000) }}, s.l)
+			c := NewStream(&changingWriteConn{change: func() { r.Reset(1000) }}, WithLimiter(s.l))
 			if _, err := c.Write(make([]byte, 500)); err == nil {
 				t.Fatal("Write through a failing connection succeeded")
 			}
@@ -81,10 +81,10 @@ func TestLimiterCyclesRefused(t *testing.T) {
 
 	root := NewGroup(nil)
 	child := NewGroup(root)
-	mustPanic("Group limited by a descendant's Writer", func() { root.SetWriteLimiter(child.Writes()) })
-	mustPanic("Group limited by its Reader through a Switch", func() { child.SetReadLimiter(NewSwitch(child.Reads())) })
+	mustPanic("Group limited by a descendant's Writer", func() { setWrite(root, child.Writes()) })
+	mustPanic("Group limited by its Reader through a Switch", func() { setRead(child, NewSwitch(child.Reads())) })
 	other := NewGroup(nil)
-	other.SetWriteLimiter(child.Writes()) // child's writes are not other's
+	setWrite(other, child.Writes()) // child's writes are not other's
 	if err := root.SetParent(other); !errors.Is(err, ErrGroupCycle) {
 		t.Fatalf("SetParent under a Group limited by a descendant's Writer = %v, want ErrGroupCycle", err)
 	}

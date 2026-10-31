@@ -63,6 +63,11 @@ func (s *Switch) Set(l Limiter) {
 	if reaches(l, func(x Limiter) bool { return x == Limiter(s) }) {
 		panic("byterate: Switch set to a Limiter that charges the Switch")
 	}
+	s.swap(l)
+}
+
+// swap makes s pass charges on to l, as Set does, without the check.
+func (s *Switch) swap(l Limiter) {
 	if old := s.st.Swap(s.newState(l)); old != nil {
 		close(old.changed)
 	}

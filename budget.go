@@ -58,6 +58,9 @@ type Budget struct {
 	expiry atomic.Pointer[budgetExpiry]
 	steps  atomic.Pointer[budgetSteps]
 	onStep atomic.Pointer[func(step int, used int64)]
+	clock  atomic.Pointer[clockBox] // set by SetClock, nil for the monotonic clock
+	// The wrappers' leases, whose unused bytes Used leaves out.
+	lessees lessees
 }
 
 // budgetExpiry is the time after which a Budget stops all bytes, as given
@@ -139,7 +142,7 @@ func (b *Budget) Used() int64 {
 	if b == nil {
 		return 0
 	}
-	return b.used.Load()
+	return b.usedExact()
 }
 
 // SetUsed makes n the bytes used in the period, such as the bytes persisted
@@ -204,7 +207,7 @@ func (b *Budget) Remaining() int64 {
 	if set.stopAt == maxI64 {
 		return maxI64
 	}
-	return max(set.stopAt-b.used.Load(), 0)
+	return max(set.stopAt-b.Used(), 0)
 }
 
 // OnStep makes b call f with the index of the step that a charge brought b
@@ -484,8 +487,17 @@ func (set *budgetSteps) at(used int64) (int, *budgetStep) {
 
 // expired reports whether b's expiry has passed.
 func (b *Budget) expired() bool {
+	if b == nil {
+		return false
+	}
 	e := b.expiry.Load()
-	return e != nil && nowNs() >= e.at
+	if e == nil {
+		return false
+	}
+	if c := b.clock.Load(); c != nil {
+		return !c.c.Now().Before(e.t)
+	}
+	return nowNs() >= e.at
 }
 
 // refund gives back up to n bytes to the step's Limit, no more than it is

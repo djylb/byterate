@@ -39,10 +39,13 @@ func (e *TooManyConnsError) Group() *Group { return e.g }
 // its ancestors, count in each one's Traffic and Conns, and each level can
 // cap its connections. A Group with a nil parent is a root.
 //
-// Open takes a connection slot and wraps a connection; Acquire and Release
-// take and give back a slot alone, and Reads and Writes return the
-// Limiters of a Group's reads and writes, for relays and wrappers of the
-// caller's choice. SetParent moves a Group and its connections under another
+// Open takes a connection slot and wraps a connection; a connection opened
+// so costs its reads and writes no more than counting while no level
+// limits it, as its Meter adds up into the Traffic of each level only when
+// that is read. Acquire and Release take and give back a slot alone, and
+// Reads and Writes return the Limiters of a Group's reads and writes, for
+// relays that call a hook per read and write, which count in Traffic as
+// they are charged. SetParent moves a Group and its connections under another
 // parent at any time: from then on, their bytes go to the new ancestors, as
 // do their slots, while the bytes counted before stay where they are.
 //
@@ -149,7 +152,7 @@ func (g *Group) SetParent(p *Group) error {
 		}
 	}
 	for a := p; a != nil; a = a.parent.Load() {
-		if a == g || g.chargedBy(a.ReadLimiter()) || g.chargedBy(a.WriteLimiter()) {
+		if a == g || g.chargedBy(a.readLimiter()) || g.chargedBy(a.writeLimiter()) {
 			return ErrGroupCycle
 		}
 	}
@@ -162,6 +165,20 @@ func (g *Group) SetParent(p *Group) error {
 		a.conns.Add(n)
 	}
 	g.parent.Store(p)
+	// The wrappers below g count in the new ancestors from now on, and the
+	// bytes they counted stay with the old ones.
+	ms := g.Traffic().meters()
+	for a := old; a != nil; a = a.parent.Load() {
+		for _, m := range ms {
+			a.Traffic().Detach(m)
+		}
+	}
+	for a := p; a != nil; a = a.parent.Load() {
+		for _, m := range ms {
+			a.Traffic().Attach(m)
+		}
+	}
+	g.update()
 	// The waiters of the old ancestors may now find a slot, or a chain
 	// without them; the chain of old does not change.
 	for a := old; a != nil; a = a.parent.Load() {
@@ -170,22 +187,14 @@ func (g *Group) SetParent(p *Group) error {
 	return nil
 }
 
-// SetReadLimiter sets the Limiter that g's own level charges the reads of
-// its connections to, on top of its ancestors' and descendants', or none for
-// nil. A Rate, a Budget or a NewHierarchy of them suits; the same Limiter as
-// the write one shares one limit between the two directions, and one set at
-// several levels is charged once. It applies from the next read. It panics
-// if l charges the Reads or Writes of g or of a descendant, which would
-// charge itself without end.
-func (g *Group) SetReadLimiter(l Limiter) { g.setLimiters(&l, nil) }
-
-// SetWriteLimiter sets the Limiter of the writes of g's connections, as
-// SetReadLimiter does for reads.
-func (g *Group) SetWriteLimiter(l Limiter) { g.setLimiters(nil, &l) }
-
-// SetLimiters sets both of g's own Limiters at once, as SetReadLimiter and
-// SetWriteLimiter do, so that no read or write is charged with one of them
-// changed and not the other.
+// SetLimiters sets the Limiters that g's own level charges the reads and
+// the writes of its connections to, on top of its ancestors' and
+// descendants', nil for none. A Rate, a Budget or a NewHierarchy of them
+// suits; the same Limiter for both directions shares one limit between
+// them, and one set at several levels is charged once. It applies from the
+// next read or write, also of the connections open in g and below. It
+// panics if a Limiter charges the Reads or Writes of g or of a descendant,
+// which would charge itself without end.
 func (g *Group) SetLimiters(read, write Limiter) { g.setLimiters(&read, &write) }
 
 // setLimiters sets the Limiters that read and write point to, leaving a
@@ -207,6 +216,7 @@ func (g *Group) setLimiters(read, write *Limiter) {
 		g.write.Store(&groupLimiter{l: *write})
 	}
 	g.epoch.Add(1)
+	g.update()
 }
 
 // chargedBy reports whether l charges the Reads or Writes of g or of one of
@@ -234,13 +244,13 @@ func groupOf(l Limiter) *Group {
 	return nil
 }
 
-// ReadLimiter returns the Limiter of g's own level for reads, as
-// SetReadLimiter set it, or nil.
-func (g *Group) ReadLimiter() Limiter { return loadLimiter(&g.read) }
+// Limiters returns the Limiters of g's own level, as SetLimiters set them.
+func (g *Group) Limiters() (read, write Limiter) {
+	return loadLimiter(&g.read), loadLimiter(&g.write)
+}
 
-// WriteLimiter returns the Limiter of g's own level for writes, as
-// SetWriteLimiter set it, or nil.
-func (g *Group) WriteLimiter() Limiter { return loadLimiter(&g.write) }
+func (g *Group) readLimiter() Limiter  { return loadLimiter(&g.read) }
+func (g *Group) writeLimiter() Limiter { return loadLimiter(&g.write) }
 
 func loadLimiter(p *atomic.Pointer[groupLimiter]) Limiter {
 	if l := p.Load(); l != nil {
@@ -250,10 +260,11 @@ func loadLimiter(p *atomic.Pointer[groupLimiter]) Limiter {
 }
 
 // Traffic returns the Counter of the bytes that the connections of g and its
-// descendants read and wrote. A moved connection's bytes count where it was
-// when they passed. Unless SetTraffic gives it another, it is a plain
-// Counter: a NewSharedCounter suits a level that many connections pass
-// through at once, such as a root.
+// descendants read and wrote, and their throughput. A moved connection's
+// bytes count where it was when they passed. Unless SetTraffic gives it
+// another, it is a plain Counter: the connections opened in the Group add
+// to it without contending anyway, and a NewSharedCounter suits a level
+// that many relays charge through Reads and Writes at once.
 func (g *Group) Traffic() *Counter {
 	if c := g.traffic.Load(); c != nil {
 		return c
@@ -271,6 +282,13 @@ func (g *Group) Traffic() *Counter {
 func (g *Group) SetTraffic(c *Counter) {
 	if c == nil {
 		c = &Counter{}
+	}
+	configMu.Lock()
+	defer configMu.Unlock()
+	old := g.Traffic()
+	for _, m := range old.meters() {
+		old.Detach(m)
+		c.Attach(m)
 	}
 	g.traffic.Store(c)
 	g.epoch.Add(1)
@@ -500,128 +518,69 @@ func (g *Group) Writes() Limiter {
 	return (*groupWrites)(g)
 }
 
-// OpenOption changes how the Open methods of a Group open a connection, and
-// WithDrop how NewPacketConn and NewDuplexPacketConn wrap one.
-type OpenOption struct {
-	read, write Limiter
-	limiters    bool
-	drop        bool
-	ctx         context.Context
-}
-
-// WithLimiters charges the reads and writes of the connection to read and
-// write as well as to the Group's levels, as limits of the connection's own
-// within the Group, such as a Rate per connection. A nil Limiter leaves its
-// direction to the Group's levels.
-func WithLimiters(read, write Limiter) OpenOption {
-	return OpenOption{read: read, write: write, limiters: true}
-}
-
-// WithWait makes Open wait for a connection slot, as AcquireContext does,
-// until ctx is done, instead of refusing it with a *TooManyConnsError.
-func WithWait(ctx context.Context) OpenOption {
-	return OpenOption{ctx: ctx}
-}
-
-// WithDrop makes a wrapped net.PacketConn drop the datagrams that its limit
-// does not let through at once, as TryWait decides, instead of waiting for
-// them: such a datagram is not charged, a WriteTo of it returns len(b) and
-// nil, as a UDP socket whose buffer is full does, and a ReadFrom discards it
-// and reads the next one. A limit that refuses a datagram, such as an
-// exhausted Budget, still ends the WriteTo or ReadFrom with its error. It
-// applies to NewPacketConn, NewDuplexPacketConn and OpenPacketConn alone.
-func WithDrop() OpenOption {
-	return OpenOption{drop: true}
-}
-
-// dropping reports whether opts has WithDrop.
-func dropping(opts []OpenOption) bool {
-	for _, o := range opts {
-		if o.drop {
-			return true
-		}
-	}
-	return false
-}
-
-// open takes a connection slot in g as opts say and returns the Limiters of
-// the connection's reads and writes.
-func (g *Group) open(opts []OpenOption) (read, write Limiter, err error) {
-	read, write = g.Reads(), g.Writes()
-	var ctx context.Context
-	for _, o := range opts {
-		if o.limiters {
-			read, write = NewHierarchy(o.read, read), NewHierarchy(o.write, write)
-		}
-		if o.ctx != nil {
-			ctx = o.ctx
-		}
-	}
-	if ctx != nil {
-		err = g.AcquireContext(ctx)
-	} else {
-		err = g.Acquire()
-	}
-	return read, write, err
-}
-
 // Open takes a connection slot in g, as Acquire does, and wraps c as
-// NewDuplexConn does with g's Reads and Writes; closing the result gives
-// the slot back. When a slot cannot be taken it returns nil and the error,
-// a *TooManyConnsError or, WithWait, the context's, leaving c open for the
-// caller to close; it returns ErrNilConn for a nil c.
-func (g *Group) Open(c net.Conn, opts ...OpenOption) (net.Conn, error) {
-	return g.openConn(c, isDatagramConn(c), opts)
-}
-
-// OpenDatagram is Open for a connection whose every Read and Write carries
-// one whole message, wrapped as NewDuplexDatagramConn does.
-func (g *Group) OpenDatagram(c net.Conn, opts ...OpenOption) (net.Conn, error) {
-	return g.openConn(c, true, opts)
-}
-
-func (g *Group) openConn(c net.Conn, datagram bool, opts []OpenOption) (net.Conn, error) {
+// NewConn does, limited by the Limiters of g and each of its ancestors, on
+// top of any WithLimiter of its own, and counted in their Traffic; closing
+// the result gives the slot back. Later changes to the levels, such as
+// SetLimiters or SetParent, apply to it as well. When a slot cannot be
+// taken it returns nil and the error, a *TooManyConnsError or, WithWait,
+// the context's, leaving c open for the caller to close; it returns
+// ErrNilConn for a nil c.
+func (g *Group) Open(c net.Conn, opts ...Option) (*Conn, error) {
 	if c == nil {
 		return nil, ErrNilConn
 	}
-	read, write, err := g.open(opts)
-	if err != nil {
+	o := mergeOptions(opts)
+	if err := g.acquireFor(o.ctx); err != nil {
 		return nil, err
 	}
-	nc := newRateNetConn(c, read, write, datagram)
-	nc.group = g
-	return nc, nil
+	return newConn(c, o, g), nil
 }
 
-// OpenPacketConn is Open for a net.PacketConn, wrapped as
-// NewDuplexPacketConn does.
-func (g *Group) OpenPacketConn(c net.PacketConn, opts ...OpenOption) (net.PacketConn, error) {
+// OpenPacketConn is Open for a net.PacketConn, wrapped as NewPacketConn
+// does.
+func (g *Group) OpenPacketConn(c net.PacketConn, opts ...Option) (*PacketConn, error) {
 	if c == nil {
 		return nil, ErrNilConn
 	}
-	read, write, err := g.open(opts)
-	if err != nil {
+	o := mergeOptions(opts)
+	if err := g.acquireFor(o.ctx); err != nil {
 		return nil, err
 	}
-	pc := newRatePacketConn(c, read, write, dropping(opts))
-	pc.s.group = g
-	return pc, nil
+	return newPacketConn(c, o, g), nil
 }
 
-// OpenReadWriteCloser is Open for an io.ReadWriteCloser, wrapped as
-// NewDuplexReadWriteCloser does.
-func (g *Group) OpenReadWriteCloser(rwc io.ReadWriteCloser, opts ...OpenOption) (io.ReadWriteCloser, error) {
+// OpenStream is Open for an io.ReadWriteCloser, wrapped as NewStream does.
+func (g *Group) OpenStream(rwc io.ReadWriteCloser, opts ...Option) (*Stream, error) {
 	if rwc == nil {
 		return nil, ErrNilConn
 	}
-	read, write, err := g.open(opts)
-	if err != nil {
+	o := mergeOptions(opts)
+	if err := g.acquireFor(o.ctx); err != nil {
 		return nil, err
 	}
-	s := &rateConn{}
-	s.init(rwc, rwc, rwc, read, write, isDatagramConn(rwc))
-	s.group = g
+	s := &Stream{}
+	s.init(rwc, rwc, rwc, withDatagram(o, rwc), g)
 	return s, nil
+}
+
+// acquireFor takes a slot for Open, waiting for it until ctx is done if
+// ctx is set.
+func (g *Group) acquireFor(ctx context.Context) error {
+	if ctx != nil {
+		return g.AcquireContext(ctx)
+	}
+	return g.Acquire()
+}
+
+// update gives the wrappers opened in g and its descendants the Limiters
+// of their levels as they are now. configMu must be held.
+func (g *Group) update() {
+	for _, m := range g.Traffic().meters() {
+		if m.owner != nil && m.owner.group != nil {
+			m.owner.applyLocked()
+		}
+	}
 }
 
 // groupLevels are the levels of both directions of a Group, as built from
@@ -672,11 +631,11 @@ func (g *Group) build() *groupLevels {
 		// The epoch first: a change after it makes the next charge build
 		// the levels again.
 		c.chain = append(c.chain, groupStamp{g: a, epoch: a.epoch.Load()})
-		c.read.add(a.ReadLimiter())
-		c.write.add(a.WriteLimiter())
+		c.read.add(a.readLimiter())
+		c.write.add(a.writeLimiter())
 		t := a.Traffic()
-		c.read.add(t.Reads())
-		c.write.add(t.Writes())
+		c.read.add(t.reads())
+		c.write.add(t.writes())
 	}
 	g.cache.Store(c)
 	return c

@@ -107,9 +107,6 @@ func TestNilRateSafety(t *testing.T) {
 	if got := r.Limit(); got != 0 {
 		t.Fatalf("nil Limit()=%d, want 0", got)
 	}
-	if got := r.Throughput(); got != 0 {
-		t.Fatalf("nil Throughput()=%d, want 0", got)
-	}
 }
 
 func TestRateCloneDetachesRuntimeState(t *testing.T) {
@@ -587,7 +584,7 @@ func TestRateSetBurst(t *testing.T) {
 			t.Fatalf("reserve(100) past the burst waits %v, want 100ms", time.Duration(wait))
 		}
 		inner := &dataConn{}
-		conn := NewConn(inner, r)
+		conn := NewConn(inner, WithLimiter(r))
 		time.Sleep(time.Second)
 		_, _ = conn.Write(make([]byte, 1000))
 		if largest := slices.Max(inner.runs); largest > 100 {

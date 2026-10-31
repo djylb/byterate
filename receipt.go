@@ -78,13 +78,13 @@ func (rc *receipt) at(i int) *entry {
 	return &rc.extra[i-len(rc.fixed)]
 }
 
-// count counts n bytes charged at now on views and records them.
-func (rc *receipt) count(views []level, n, now int64) {
+// count counts n bytes on views and records them.
+func (rc *receipt) count(views []level, n int64) {
 	if len(views) == 0 {
 		return
 	}
 	for i := range views {
-		views[i].count(n, now)
+		views[i].count(n)
 	}
 	if rc == nil {
 		return
@@ -135,7 +135,7 @@ func (e *entry) refund(size int64) {
 		l.mu.Lock()
 		defer l.mu.Unlock()
 		// An Enable that retired the generation cleared the charge; while
-		// disabled, only its meter counts.
+		// disabled, only its total counts.
 		if l.gen.Load() == e.gen {
 			l.refund(e.gen, size, e.aux != 0 && !l.disabled.Load())
 		}

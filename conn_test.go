@@ -43,7 +43,7 @@ func (c *scriptedConn) Close() error { return nil }
 
 func TestConnReadChargesActualBytes(t *testing.T) {
 	r := NewRate(1 << 20)
-	conn := NewReadWriteCloser(&scriptedConn{readBuf: []byte("ok")}, r)
+	conn := NewStream(&scriptedConn{readBuf: []byte("ok")}, WithLimiter(r))
 
 	buf := make([]byte, 4)
 	n, err := conn.Read(buf)
@@ -64,7 +64,7 @@ func TestConnReadChargesActualBytes(t *testing.T) {
 func TestConnWriteRefundsShortWrite(t *testing.T) {
 	r := NewRate(1 << 20)
 	wantErr := errors.New("short write")
-	conn := NewReadWriteCloser(&scriptedConn{writeN: 2, writeErr: wantErr}, r)
+	conn := NewStream(&scriptedConn{writeN: 2, writeErr: wantErr}, WithLimiter(r))
 
 	n, err := conn.Write([]byte("hello"))
 	if !errors.Is(err, wantErr) {
@@ -86,7 +86,7 @@ func (*negativeWriteConn) Write([]byte) (int, error) { return -1, errors.New("br
 // A writer reporting n < 0 must not get more than the charge refunded.
 func TestConnNegativeWriteRefundsTheChargeOnly(t *testing.T) {
 	r := NewRate(1000)
-	conn := NewReadWriteCloser(&negativeWriteConn{}, r)
+	conn := NewStream(&negativeWriteConn{}, WithLimiter(r))
 	_, _ = conn.Write(make([]byte, 1000))
 	if got := metered(r); got != 0 {
 		t.Fatalf("metered after a write reporting -1 = %d, want 0", got)
@@ -94,7 +94,7 @@ func TestConnNegativeWriteRefundsTheChargeOnly(t *testing.T) {
 }
 
 func TestConnNilConnectionReturnsError(t *testing.T) {
-	conn := NewReadWriteCloser(nil, NewRate(1024))
+	conn := NewStream(nil, WithLimiter(NewRate(1024)))
 	if _, err := conn.Read(make([]byte, 1)); !errors.Is(err, ErrNilConn) {
 		t.Fatalf("Read() error = %v, want %v", err, ErrNilConn)
 	}
@@ -161,7 +161,7 @@ func closeWhileBlocked(t *testing.T, conn io.Closer, op func() (int, error), sto
 
 func TestConnCloseWakesBlockedWrite(t *testing.T) {
 	r := NewRate(1024)
-	conn := NewReadWriteCloser(&scriptedConn{writeN: 64 << 10}, r)
+	conn := NewStream(&scriptedConn{writeN: 64 << 10}, WithLimiter(r))
 
 	// The burst goes out at once; the next grant waits until Close.
 	res := closeWhileBlocked(t, conn, func() (int, error) {
@@ -183,7 +183,7 @@ func TestConnCloseWakesBlockedRead(t *testing.T) {
 	r := NewRate(1024)
 	r.reserve(4096) // two seconds of debt, which a Read waits for before reading
 	src := &scriptedConn{readBuf: make([]byte, 64<<10)}
-	conn := NewReadWriteCloser(src, r)
+	conn := NewStream(src, WithLimiter(r))
 
 	res := closeWhileBlocked(t, conn, func() (int, error) {
 		return conn.Read(make([]byte, 64<<10))
@@ -200,7 +200,7 @@ func TestConnCloseWakesBlockedRead(t *testing.T) {
 func TestConnCloseWakesHierarchicalWrite(t *testing.T) {
 	first := NewRate(1024)
 	second := NewRate(1 << 20)
-	conn := NewReadWriteCloser(&scriptedConn{writeN: 64 << 10}, NewHierarchy(first, second))
+	conn := NewStream(&scriptedConn{writeN: 64 << 10}, WithLimiter(NewHierarchy(first, second)))
 
 	first.reserve(2048) // spend the burst, so that the first grant waits
 	second.reserve(2048)
@@ -220,7 +220,7 @@ func TestConnCloseWakesHierarchicalWrite(t *testing.T) {
 
 func TestConnPlainLimiter(t *testing.T) {
 	l := &plainLimiter{}
-	conn := NewReadWriteCloser(&scriptedConn{writeN: 5}, l)
+	conn := NewStream(&scriptedConn{writeN: 5}, WithLimiter(l))
 	if n, err := conn.Write([]byte("hello")); n != 5 || err != nil {
 		t.Fatalf("Write() = %d, %v; want 5, nil", n, err)
 	}
@@ -236,11 +236,11 @@ func TestConnKeepsNetConnBehavior(t *testing.T) {
 	client, server := net.Pipe()
 	defer func() { _ = server.Close() }()
 	r := NewRate(1 << 20)
-	conn := NewConn(client, r)
+	conn := NewConn(client, WithLimiter(r))
 	if conn.LocalAddr() != client.LocalAddr() || conn.RemoteAddr() != client.RemoteAddr() {
 		t.Fatalf("addresses = %v/%v, want %v/%v", conn.LocalAddr(), conn.RemoteAddr(), client.LocalAddr(), client.RemoteAddr())
 	}
-	if raw := conn.(interface{ RawConn() net.Conn }).RawConn(); raw != client {
+	if raw := any(conn).(interface{ RawConn() net.Conn }).RawConn(); raw != client {
 		t.Fatalf("RawConn() = %v, want wrapped conn", raw)
 	}
 	if err := conn.SetReadDeadline(time.Now().Add(-time.Second)); err != nil {
@@ -275,13 +275,10 @@ func TestConnNilArguments(t *testing.T) {
 	client, server := net.Pipe()
 	defer func() { _ = client.Close() }()
 	defer func() { _ = server.Close() }()
-	if got := NewConn(client, nil); got != client {
-		t.Fatalf("NewConn(c, nil) = %v, want c", got)
+	if got := NewConn(client, WithLimiter(nil)); got.RawConn() != client || got.write.state.Load() != 0 {
+		t.Fatalf("NewConn(c, WithLimiter(nil)) does not wrap c on the fast path")
 	}
-	if got := NewReadWriteCloser(client, nil); got != io.ReadWriteCloser(client) {
-		t.Fatalf("NewRateReadWriteCloser(c, nil) = %v, want c", got)
-	}
-	conn := NewConn(nil, NewRate(1024))
+	conn := NewConn(nil, WithLimiter(NewRate(1024)))
 	if conn.LocalAddr() != nil || conn.RemoteAddr() != nil {
 		t.Fatalf("nil conn addresses = %v/%v, want nil", conn.LocalAddr(), conn.RemoteAddr())
 	}
@@ -322,8 +319,8 @@ func tcpPair(t *testing.T) (client, server net.Conn) {
 func TestConnCloseWrite(t *testing.T) {
 	client, server := tcpPair(t)
 
-	limited := NewConn(client, NewRate(1<<20))
-	cw, ok := limited.(interface{ CloseWrite() error })
+	limited := NewConn(client, WithLimiter(NewRate(1<<20)))
+	cw, ok := any(limited).(interface{ CloseWrite() error })
 	if !ok {
 		t.Fatal("rate conn has no CloseWrite")
 	}
@@ -335,15 +332,15 @@ func TestConnCloseWrite(t *testing.T) {
 		t.Fatalf("peer Read() error = %v, want EOF after CloseWrite", err)
 	}
 
-	plain := NewReadWriteCloser(&scriptedConn{}, NewRate(1<<20))
-	if err := plain.(interface{ CloseWrite() error }).CloseWrite(); !errors.Is(err, errors.ErrUnsupported) {
+	plain := NewStream(&scriptedConn{}, WithLimiter(NewRate(1<<20)))
+	if err := any(plain).(interface{ CloseWrite() error }).CloseWrite(); !errors.Is(err, errors.ErrUnsupported) {
 		t.Fatalf("CloseWrite() without support error = %v, want %v", err, errors.ErrUnsupported)
 	}
 }
 
 func TestDuplexConnChargesEachDirection(t *testing.T) {
 	in, out := NewRate(1<<30), NewRate(1<<30)
-	conn := NewDuplexReadWriteCloser(&scriptedConn{readBuf: []byte("abc"), writeN: 64}, in, out)
+	conn := NewStream(&scriptedConn{readBuf: []byte("abc"), writeN: 64}, WithLimiters(in, out))
 	if _, err := conn.Read(make([]byte, 8)); err != nil {
 		t.Fatal(err)
 	}
@@ -358,7 +355,7 @@ func TestDuplexConnChargesEachDirection(t *testing.T) {
 	}
 
 	// One direction may be left unlimited.
-	conn = NewDuplexReadWriteCloser(&scriptedConn{readBuf: []byte("abc"), writeN: 64}, nil, out)
+	conn = NewStream(&scriptedConn{readBuf: []byte("abc"), writeN: 64}, WithLimiters(nil, out))
 	if _, err := conn.Read(make([]byte, 8)); err != nil {
 		t.Fatal(err)
 	}
@@ -369,12 +366,6 @@ func TestDuplexConnChargesEachDirection(t *testing.T) {
 		t.Fatalf("write limiter charged %d in total, want %d", got, want)
 	}
 
-	raw, peer := net.Pipe()
-	defer func() { _ = raw.Close() }()
-	defer func() { _ = peer.Close() }()
-	if c := NewDuplexConn(raw, nil, nil); c != raw {
-		t.Fatalf("NewDuplexConn(nil, nil) = %T, want the connection itself", c)
-	}
 }
 
 // drain reads from c until it fails.
@@ -394,9 +385,9 @@ func isTimeout(err error) bool {
 
 func TestConnWriteDeadlineEndsLimiterWait(t *testing.T) {
 	for name, wrap := range map[string]func(net.Conn, *Rate) net.Conn{
-		"Rate": func(c net.Conn, r *Rate) net.Conn { return NewConn(c, r) },
+		"Rate": func(c net.Conn, r *Rate) net.Conn { return NewConn(c, WithLimiter(r)) },
 		"Hierarchy": func(c net.Conn, r *Rate) net.Conn {
-			return NewDuplexConn(c, nil, NewHierarchy(NewRate(1<<30), r))
+			return NewConn(c, WithLimiters(nil, NewHierarchy(NewRate(1<<30), r)))
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -443,7 +434,7 @@ func TestConnReadDeadlineEndsLimiterWait(t *testing.T) {
 	defer func() { _ = server.Close() }()
 	r := NewRate(1024)
 	r.reserve(8 << 10) // 6s of debt, which a Read waits for before reading
-	conn := NewConn(client, r)
+	conn := NewConn(client, WithLimiter(r))
 	defer func() { _ = conn.Close() }()
 
 	done := make(chan ioResult, 1)
@@ -496,14 +487,14 @@ func TestConnDeadlineAfterClose(t *testing.T) {
 	client, server := net.Pipe()
 	defer func() { _ = server.Close() }()
 	r := NewRate(1024)
-	conn := NewConn(client, r)
+	conn := NewConn(client, WithLimiter(r))
 	if err := conn.SetDeadline(time.Now().Add(time.Hour)); err != nil {
 		t.Fatal(err)
 	}
 	if err := conn.Close(); err != nil {
 		t.Fatal(err)
 	}
-	for _, d := range []*direction{&conn.(*rateNetConn).read, &conn.(*rateNetConn).write} {
+	for _, d := range []*direction{&conn.read, &conn.write} {
 		if d.cancel.timer.t.Stop() {
 			t.Fatal("Close() left a deadline timer running")
 		}
@@ -521,7 +512,7 @@ func TestConnCloseAfterDeadline(t *testing.T) {
 	client, server := net.Pipe()
 	defer func() { _ = server.Close() }()
 	r := NewRate(1024)
-	conn := NewConn(client, r)
+	conn := NewConn(client, WithLimiter(r))
 	if err := conn.SetWriteDeadline(time.Now().Add(-time.Second)); err != nil {
 		t.Fatal(err)
 	}
@@ -581,7 +572,7 @@ func TestConnWaitContextStaysEnded(t *testing.T) {
 	defer func() { _ = server.Close() }()
 	go drain(server)
 	l := &gateLimiter{entered: make(chan context.Context), proceed: make(chan struct{})}
-	conn := NewConn(client, l)
+	conn := NewConn(client, WithLimiter(l))
 	defer func() { _ = conn.Close() }()
 
 	write := func() <-chan ioResult {
@@ -650,7 +641,7 @@ func TestConnDerivedContextAbortThenClear(t *testing.T) {
 	defer func() { _ = server.Close() }()
 	go drain(server)
 	l := derivingLimiter{entered: make(chan struct{})}
-	conn := NewConn(client, l)
+	conn := NewConn(client, WithLimiter(l))
 	defer func() { _ = conn.Close() }()
 
 	for i := range 1000 {
@@ -682,7 +673,7 @@ func TestConnAbortThenClearDeadline(t *testing.T) {
 	defer func() { _ = server.Close() }()
 	go drain(server)
 	r := NewRate(1024)
-	conn := NewConn(client, r)
+	conn := NewConn(client, WithLimiter(r))
 	defer func() { _ = conn.Close() }()
 
 	for i := range 50 {
@@ -712,21 +703,21 @@ func TestConnTypedNilLimiter(t *testing.T) {
 
 	var rate *Rate
 	var hier *hierarchy
-	for name, got := range map[string]any{
-		"NewConn(*Rate)":                          NewConn(client, rate),
-		"NewConn(*hierarchy)":                     NewConn(client, hier),
-		"NewDuplexConn":                           NewDuplexConn(client, rate, hier),
-		"NewRateReadWriteCloser(*Rate)":           NewReadWriteCloser(client, rate),
-		"NewDuplexRateReadWriteCloser(nil, hier)": NewDuplexReadWriteCloser(client, nil, hier),
+	for name, s := range map[string]*rateConn{
+		"*Rate":          &NewConn(client, WithLimiter(rate)).rateConn,
+		"*hierarchy":     &NewConn(client, WithLimiter(hier)).rateConn,
+		"duplex":         &NewConn(client, WithLimiters(rate, hier)).rateConn,
+		"stream":         &NewStream(client, WithLimiter(rate)).rateConn,
+		"stream(nil, h)": &NewStream(client, WithLimiters(nil, hier)).rateConn,
 	} {
-		if got != any(client) {
-			t.Errorf("%s = %T, want the *net.TCPConn itself", name, got)
+		if s.read.state.Load() != 0 || s.write.state.Load() != 0 {
+			t.Errorf("%s: directions limited, want the fast path for typed nil limiters", name)
 		}
 	}
 
-	conn := NewDuplexConn(client, rate, NewRate(1024)).(*rateNetConn)
-	if conn.read.limited() {
-		t.Fatalf("read direction limiter = %v, want none for a nil *Rate", conn.read.lim.limiter())
+	conn := NewConn(client, WithLimiters(rate, NewRate(1024)))
+	if conn.read.state.Load() != 0 || conn.write.state.Load() != dirLimited {
+		t.Fatalf("states = %d, %d; want a fast read and a limited write", conn.read.state.Load(), conn.write.state.Load())
 	}
 }
 
@@ -743,11 +734,11 @@ func (c *halfCloseConn) CloseRead() error {
 func TestConnCloseRead(t *testing.T) {
 	inner := &halfCloseConn{}
 	for _, conn := range []io.ReadWriteCloser{
-		NewReadWriteCloser(inner, NewRate(1<<20)),
-		NewDuplexReadWriteCloser(inner, nil, NewRate(1<<20)),
+		NewStream(inner, WithLimiter(NewRate(1<<20))),
+		NewStream(inner, WithLimiters(nil, NewRate(1<<20))),
 	} {
 		inner.closedRead = false
-		cr, ok := conn.(interface{ CloseRead() error })
+		cr, ok := any(conn).(interface{ CloseRead() error })
 		if !ok {
 			t.Fatalf("%T has no CloseRead", conn)
 		}
@@ -759,11 +750,11 @@ func TestConnCloseRead(t *testing.T) {
 	client, server := net.Pipe()
 	defer func() { _ = client.Close() }()
 	defer func() { _ = server.Close() }()
-	conn := NewDuplexConn(client, NewRate(1<<20), nil)
-	if err := conn.(interface{ CloseRead() error }).CloseRead(); !errors.Is(err, errors.ErrUnsupported) {
+	conn := NewConn(client, WithLimiters(NewRate(1<<20), nil))
+	if err := any(conn).(interface{ CloseRead() error }).CloseRead(); !errors.Is(err, errors.ErrUnsupported) {
 		t.Fatalf("CloseRead() without support error = %v, want %v", err, errors.ErrUnsupported)
 	}
-	if err := NewReadWriteCloser(nil, NewRate(1)).(interface{ CloseRead() error }).CloseRead(); !errors.Is(err, ErrNilConn) {
+	if err := any(NewStream(nil, WithLimiter(NewRate(1)))).(interface{ CloseRead() error }).CloseRead(); !errors.Is(err, ErrNilConn) {
 		t.Fatalf("CloseRead() on nil conn error = %v, want %v", err, ErrNilConn)
 	}
 }
@@ -794,7 +785,7 @@ func (l *errLimiter) Charge(n int64) error {
 func TestConnPassesLimiterError(t *testing.T) {
 	wantErr := errors.New("charge exceeds burst")
 	l := &errLimiter{err: wantErr}
-	conn := NewReadWriteCloser(&scriptedConn{readBuf: []byte("abc"), writeN: 64}, l)
+	conn := NewStream(&scriptedConn{readBuf: []byte("abc"), writeN: 64}, WithLimiter(l))
 
 	if n, err := conn.Write([]byte("hello")); n != 0 || !errors.Is(err, wantErr) {
 		t.Fatalf("Write() = %d, %v; want 0, %v", n, err, wantErr)
@@ -815,7 +806,7 @@ func TestConnDeadlineTimerReuse(t *testing.T) {
 	defer func() { _ = server.Close() }()
 	go drain(server)
 	r := NewRate(1024)
-	conn := NewConn(client, r)
+	conn := NewConn(client, WithLimiter(r))
 	defer func() { _ = conn.Close() }()
 
 	write := func() <-chan ioResult {
@@ -866,9 +857,9 @@ func TestConnDeadlineTimerReuse(t *testing.T) {
 func TestConnPendingDeadlineDoesNotPinConn(t *testing.T) {
 	collected := make(chan struct{})
 	func() {
-		conn := NewConn(&nopNetConn{}, NewRate(1024))
+		conn := NewConn(&nopNetConn{}, WithLimiter(NewRate(1024)))
 		_ = conn.SetDeadline(time.Now().Add(time.Hour))
-		runtime.AddCleanup(conn.(*rateNetConn), func(ch chan struct{}) { close(ch) }, collected)
+		runtime.AddCleanup(conn, func(ch chan struct{}) { close(ch) }, collected)
 	}()
 	for range 20 {
 		runtime.GC()
@@ -887,10 +878,10 @@ func TestConnPendingDeadlineDoesNotPinConn(t *testing.T) {
 func TestBubbleDeadlineOutlivesBubble(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		for range 2 {
-			c := NewConn(&nopNetConn{}, NewRate(1000))
+			c := NewConn(&nopNetConn{}, WithLimiter(NewRate(1000)))
 			_ = c.SetDeadline(time.Now().Add(time.Hour))
 		}
-		c := NewConn(&nopNetConn{}, NewRate(1000))
+		c := NewConn(&nopNetConn{}, WithLimiter(NewRate(1000)))
 		_ = c.SetDeadline(time.Now().Add(time.Hour))
 		_ = c.Close()
 	})
@@ -917,7 +908,7 @@ func TestConnDeadlineMovedLater(t *testing.T) {
 	defer func() { _ = server.Close() }()
 	go drain(server)
 	r := NewRate(1024)
-	conn := NewConn(client, r)
+	conn := NewConn(client, WithLimiter(r))
 	defer func() { _ = conn.Close() }()
 
 	r.reserve(2048) // spend the burst, so that the Write waits about 1s
@@ -957,7 +948,7 @@ func (*deadlineRejectingConn) SetWriteDeadline(time.Time) error { return errNoDe
 // A deadline the wrapped connection rejects must not bound the waits in the
 // limiters either: I/O on it would otherwise time out only when throttled.
 func TestConnRejectedDeadline(t *testing.T) {
-	conn := NewConn(&deadlineRejectingConn{}, NewRate(1024))
+	conn := NewConn(&deadlineRejectingConn{}, WithLimiter(NewRate(1024)))
 	past := time.Now().Add(-time.Second)
 	for name, set := range map[string]func(time.Time) error{
 		"SetDeadline":      conn.SetDeadline,
@@ -968,7 +959,7 @@ func TestConnRejectedDeadline(t *testing.T) {
 			t.Fatalf("%s() error = %v, want %v", name, err, errNoDeadline)
 		}
 	}
-	rc := conn.(*rateNetConn)
+	rc := conn
 	for _, d := range []*direction{&rc.read, &rc.write} {
 		if d.cancel.current().ended() {
 			t.Fatal("a rejected deadline ended the waits in the limiter")
@@ -982,7 +973,7 @@ func TestConnRejectedDeadline(t *testing.T) {
 func TestConnDeadlineAfterPeerClose(t *testing.T) {
 	client, server := net.Pipe()
 	r := NewRate(1024)
-	conn := NewConn(client, r)
+	conn := NewConn(client, WithLimiter(r))
 	defer func() { _ = conn.Close() }()
 
 	r.reserve(2048) // spend the burst, so that the Write waits about 8s
@@ -1015,14 +1006,14 @@ func TestConnWallClockDeadline(t *testing.T) {
 	defer func() { _ = server.Close() }()
 	go drain(server)
 	r := NewRate(1024)
-	conn := NewConn(client, r)
+	conn := NewConn(client, WithLimiter(r))
 	defer func() { _ = conn.Close() }()
 
 	r.reserve(2048) // spend the burst, so that the Write waits about 1s
 	start := time.Now()
 	deadline := start.Add(100 * time.Millisecond).Round(0) // wall clock only
 	_ = conn.SetWriteDeadline(deadline)
-	rc := conn.(*rateNetConn)
+	rc := conn
 	rc.write.cancel.timer.mu.Lock()
 	at := rc.write.cancel.timer.at
 	rc.write.cancel.timer.mu.Unlock()
@@ -1045,7 +1036,7 @@ func TestConnDropsRefundFromBeforeReset(t *testing.T) {
 	r := NewRate(1024)
 	r.reserve(2048) // spend the burst, so that the Write waits about 4s
 	wantErr := errors.New("connection reset")
-	conn := NewReadWriteCloser(&scriptedConn{writeErr: wantErr}, r)
+	conn := NewStream(&scriptedConn{writeErr: wantErr}, WithLimiter(r))
 	res := make(chan ioResult, 1)
 	go func() {
 		n, err := conn.Write(make([]byte, 4096))
@@ -1103,7 +1094,7 @@ func (c *recordingConn) maxWrite() int {
 func TestWriteProgressesUnderDeadline(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		r := NewRate(1000)
-		conn := NewConn(&recordingConn{}, r)
+		conn := NewConn(&recordingConn{}, WithLimiter(r))
 		defer func() { _ = conn.Close() }()
 		buf := make([]byte, 5000) // more than 1000 B/s × (1s + the 2s burst)
 		sent := 0
@@ -1127,7 +1118,7 @@ func TestWriteProgressesUnderDeadline(t *testing.T) {
 func TestWriteBurstsNoMoreThanItsCredit(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		inner := &recordingConn{}
-		conn := NewConn(inner, NewRate(1000))
+		conn := NewConn(inner, WithLimiter(NewRate(1000)))
 		start := time.Now()
 		if n, err := conn.Write(make([]byte, 10000)); n != 10000 || err != nil {
 			t.Fatalf("Write() = %d, %v", n, err)
@@ -1147,8 +1138,8 @@ func TestSharedLimitInterleavesWrites(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		shared := NewRate(1000)
 		shared.reserve(2000) // spend the burst
-		a := NewConn(&recordingConn{}, shared)
-		b := NewConn(&recordingConn{}, shared)
+		a := NewConn(&recordingConn{}, WithLimiter(shared))
+		b := NewConn(&recordingConn{}, WithLimiter(shared))
 		go func() { _, _ = a.Write(make([]byte, 20000)) }()
 		synctest.Wait()
 		start := time.Now()
@@ -1167,7 +1158,7 @@ func TestSharedLimitInterleavesWrites(t *testing.T) {
 func TestReadTakesAGrant(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		inner := &recordingConn{}
-		conn := NewConn(inner, NewRate(1000))
+		conn := NewConn(inner, WithLimiter(NewRate(1000)))
 		if n, err := conn.Read(make([]byte, 64<<10)); n != 2000 || err != nil {
 			t.Fatalf("first Read() = %d, %v; want the 2000 B burst", n, err)
 		}
@@ -1194,7 +1185,7 @@ func TestDatagramConnKeepsMessagesWhole(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		inner := &recordingConn{}
 		r := NewRate(1000)
-		conn := NewDatagramConn(inner, r)
+		conn := NewConn(inner, WithLimiter(r), WithDatagram())
 		if n, err := conn.Write(make([]byte, 10000)); n != 10000 || err != nil {
 			t.Fatalf("Write() = %d, %v", n, err)
 		}
@@ -1212,7 +1203,7 @@ func TestDatagramConnKeepsMessagesWhole(t *testing.T) {
 func TestDuplexDatagramConnSeparatesDirections(t *testing.T) {
 	inner := &recordingConn{}
 	var reads, writes Counter
-	conn := NewDuplexDatagramConn(inner, reads.Reads(), writes.Writes())
+	conn := NewConn(inner, WithLimiters(reads.reads(), writes.writes()), WithDatagram())
 	if n, err := conn.Write(make([]byte, 3000)); n != 3000 || err != nil {
 		t.Fatalf("Write() = %d, %v", n, err)
 	}
@@ -1238,12 +1229,12 @@ func TestDatagramSocketsDetected(t *testing.T) {
 		t.Skip(err)
 	}
 	defer func() { _ = udp.Close() }()
-	if c := NewConn(udp, NewRate(1000)).(*rateNetConn); !c.datagram {
+	if c := NewConn(udp, WithLimiter(NewRate(1000))); !c.datagram {
 		t.Fatal("a UDP socket was wrapped as a stream")
 	}
 	client, server := net.Pipe()
 	defer func() { _ = client.Close(); _ = server.Close() }()
-	if c := NewConn(client, NewRate(1000)).(*rateNetConn); c.datagram {
+	if c := NewConn(client, WithLimiter(NewRate(1000))); c.datagram {
 		t.Fatal("a stream was wrapped as a datagram connection")
 	}
 
@@ -1252,14 +1243,14 @@ func TestDatagramSocketsDetected(t *testing.T) {
 		defer func() { _ = ln.Close() }()
 		if uc, err := net.DialUnix("unix", nil, ln.Addr().(*net.UnixAddr)); err == nil {
 			defer func() { _ = uc.Close() }()
-			if c := NewConn(uc, NewRate(1000)).(*rateNetConn); c.datagram {
+			if c := NewConn(uc, WithLimiter(NewRate(1000))); c.datagram {
 				t.Fatal("a Unix stream socket was wrapped as a datagram connection")
 			}
 		}
 	}
 	if gc, err := net.ListenUnixgram("unixgram", &net.UnixAddr{Name: filepath.Join(dir, "g"), Net: "unixgram"}); err == nil {
 		defer func() { _ = gc.Close() }()
-		if c := NewConn(gc, NewRate(1000)).(*rateNetConn); !c.datagram {
+		if c := NewConn(gc, WithLimiter(NewRate(1000))); !c.datagram {
 			t.Fatal("a Unix datagram socket was wrapped as a stream")
 		}
 	}
@@ -1286,7 +1277,7 @@ func (c *dataConn) Write(b []byte) (int, error) {
 func TestConcurrentWritesDoNotInterleave(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		inner := &dataConn{}
-		conn := NewConn(inner, NewRate(1000))
+		conn := NewConn(inner, WithLimiter(NewRate(1000)))
 		var wg sync.WaitGroup
 		for _, c := range []byte{'a', 'b'} {
 			wg.Go(func() { _, _ = conn.Write(bytes.Repeat([]byte{c}, 5000)) })
@@ -1309,7 +1300,7 @@ func TestCloseEndsQueuedWrite(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		r := NewRate(1000)
 		r.reserve(2000) // spend the burst
-		conn := NewConn(&dataConn{}, r)
+		conn := NewConn(&dataConn{}, WithLimiter(r))
 		results := make(chan ioResult, 2)
 		for range 2 {
 			go func() {
@@ -1346,7 +1337,7 @@ func TestLostCreditQueuesAQuantum(t *testing.T) {
 				testHooks.charging.Store(&hook)
 				defer testHooks.charging.Store(nil)
 				inner := &dataConn{}
-				conn := NewConn(inner, wrap(r))
+				conn := NewConn(inner, WithLimiter(wrap(r)))
 				if _, err := conn.Write(make([]byte, 64<<10)); err != nil {
 					t.Fatal(err)
 				}
@@ -1362,7 +1353,7 @@ func TestLostCreditQueuesAQuantum(t *testing.T) {
 // deadlines still make progress.
 func TestSlowLimitWriteProgresses(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		conn := NewConn(&dataConn{}, NewRate(100))
+		conn := NewConn(&dataConn{}, WithLimiter(NewRate(100)))
 		sent := 0
 		for range 60 {
 			_ = conn.SetWriteDeadline(time.Now().Add(time.Second))
@@ -1376,7 +1367,7 @@ func TestSlowLimitWriteProgresses(t *testing.T) {
 }
 
 func TestTypedNilUnixConn(t *testing.T) {
-	if c := NewConn((*net.UnixConn)(nil), NewRate(1000)); c == nil {
+	if c := NewConn((*net.UnixConn)(nil), WithLimiter(NewRate(1000))); c == nil {
 		t.Fatal("NewConn returned nil")
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"time"
 
 	"github.com/djylb/byterate"
 )
@@ -14,7 +15,7 @@ import (
 func ExampleNewConn() {
 	client, server := net.Pipe()
 	defer func() { _ = server.Close() }()
-	conn := byterate.NewConn(client, byterate.NewRate(1<<20))
+	conn := byterate.NewConn(client, byterate.WithLimiter(byterate.NewRate(1<<20)))
 	defer func() { _ = conn.Close() }()
 
 	go func() { _, _ = conn.Write([]byte("hello")) }()
@@ -24,32 +25,30 @@ func ExampleNewConn() {
 	// Output: hello pipe
 }
 
-// Nest a connection's limit within its user's and a global one. Every level
-// meters the traffic and reports its own throughput, and a limit changed
-// later applies to open connections too.
+// Nest a connection's limit within its user's and a global one. A limit
+// changed later applies to open connections too.
 func ExampleNewHierarchy() {
-	global := byterate.NewRate(0)     // unlimited, kept for its throughput
+	global := byterate.NewRate(0)     // unlimited for now
 	user := byterate.NewRate(8 << 20) // 8 MiB/s across the user's connections
 
 	client, server := net.Pipe()
 	defer func() { _ = server.Close() }()
-	conn := byterate.NewConn(client, byterate.NewHierarchy(byterate.NewRate(1<<20), user, global))
+	conn := byterate.NewConn(client, byterate.WithLimiter(byterate.NewHierarchy(byterate.NewRate(1<<20), user, global)))
 	defer func() { _ = conn.Close() }()
 	go func() { _, _ = conn.Write(make([]byte, 4096)) }()
 	_, _ = io.ReadFull(server, make([]byte, 4096))
 
 	fmt.Println(global.Limit(), user.Limit())
-	_ = global.Throughput()    // bytes per second over the last second
 	global.SetLimit(100 << 20) // now limits the open connection too
 	// Output: 0 8388608
 }
 
 // Limit downloads and uploads apart, each metered on its own.
-func ExampleNewDuplexConn() {
+func ExampleWithLimiters() {
 	download, upload := byterate.NewRate(4<<20), byterate.NewRate(1<<20)
 	client, server := net.Pipe()
 	defer func() { _ = server.Close() }()
-	conn := byterate.NewDuplexConn(client, download, upload)
+	conn := byterate.NewConn(client, byterate.WithLimiters(download, upload))
 	defer func() { _ = conn.Close() }()
 	go func() { _, _ = conn.Write([]byte("up")) }()
 	_, _ = io.ReadFull(server, make([]byte, 2))
@@ -85,7 +84,7 @@ func ExampleSwitch() {
 	sw := byterate.NewSwitch(oldUser)
 	client, server := net.Pipe()
 	defer func() { _ = server.Close() }()
-	conn := byterate.NewConn(client, sw)
+	conn := byterate.NewConn(client, byterate.WithLimiter(sw))
 	defer func() { _ = conn.Close() }()
 
 	sw.Set(newUser) // charges, and waits in progress, move to newUser
@@ -111,13 +110,13 @@ func ExampleRate_Ready() {
 	// Output: 102400
 }
 
-// Count exactly what a connection's reads and writes take.
-func ExampleCounter_Reads() {
+// Count a connection's bytes in a Counter shared with others.
+func ExampleWithCounter() {
 	client, server := net.Pipe()
 	defer func() { _ = server.Close() }()
 	go func() { _, _ = server.Write([]byte("hello")) }()
 	var traffic byterate.Counter
-	conn := byterate.NewDuplexConn(client, traffic.Reads(), traffic.Writes())
+	conn := byterate.NewConn(client, byterate.WithCounter(&traffic))
 	defer func() { _ = conn.Close() }()
 
 	_, _ = io.ReadFull(conn, make([]byte, 5))
@@ -132,7 +131,7 @@ func ExampleBudget() {
 	defer func() { _ = server.Close() }()
 	go func() { _, _ = io.Copy(io.Discard, server) }()
 	budget := byterate.NewBudget(byterate.Step{After: 1000, Stop: true})
-	conn := byterate.NewConn(client, byterate.NewHierarchy(byterate.NewRate(1<<20), budget))
+	conn := byterate.NewConn(client, byterate.WithLimiter(byterate.NewHierarchy(byterate.NewRate(1<<20), budget)))
 	defer func() { _ = conn.Close() }()
 
 	n, err := conn.Write(make([]byte, 4000))
@@ -244,4 +243,53 @@ func ExampleRate_TryWait() {
 	fmt.Println(sent, dropped)
 	// Output:
 	// 3 2
+}
+
+// Count a connection without limiting it, and limit it later: it passes
+// straight through until a limit applies.
+func ExampleConn_SetLimiters() {
+	client, server := net.Pipe()
+	defer func() { _ = server.Close() }()
+	go func() { _, _ = io.Copy(io.Discard, server) }()
+	conn := byterate.NewConn(client)
+	defer func() { _ = conn.Close() }()
+
+	_, _ = conn.Write(make([]byte, 1000))
+	conn.SetLimiters(nil, byterate.NewRate(1<<20)) // from now on, writes at 1 MiB/s
+	_, _ = conn.Write(make([]byte, 500))
+	fmt.Println(conn.Meter().Total())
+	// Output: 0 1500
+}
+
+// Report throughput every second from one ticker of the application's, for
+// all its Counters: counting itself never reads the clock.
+func ExampleCounter_Sample() {
+	var users []*byterate.Counter // such as each user Group's Traffic
+	users = append(users, new(byterate.Counter))
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	report := func() {
+		for _, c := range users {
+			c.Sample()
+			in, out := c.Throughput() // bytes per second of the last second
+			_, _ = in, out
+		}
+	}
+	report() // on every tick: for range ticker.C { report() }
+	fmt.Println(len(users))
+	// Output: 1
+}
+
+// Lease bytes of a Budget for a transfer of one's own, and give back what
+// it did not use.
+func ExampleBudget_Lease() {
+	quota := byterate.NewBudget(byterate.Step{After: 10_000, Stop: true})
+	lease, err := quota.Lease(4096)
+	if err != nil {
+		return // byterate.ErrBudgetExhausted
+	}
+	sent := int64(1000) // pass up to lease.Bytes bytes here
+	quota.Settle(lease, sent)
+	fmt.Println(lease.Bytes, quota.Used(), quota.Remaining())
+	// Output: 4096 1000 9000
 }

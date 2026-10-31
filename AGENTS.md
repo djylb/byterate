@@ -6,8 +6,13 @@
 - Standard library only, also for tests.
 - Charge paths (Limiter methods, wrapper reads and writes) stay
   allocation-free and lock-free.
-- Wrappers never let I/O bypass the limiter: no raw socket access, zero-copy
-  forwarding only in granted amounts, and datagrams are never split.
+- A wrapper direction with nothing to charge reads no clock and writes
+  nothing shared: one atomic load and its own Meter's add. The fast and the
+  limited paths must give the same results; the feature-combination tests
+  cover them.
+- Wrappers never let I/O bypass the limiter or the leases: no raw socket
+  access, zero-copy forwarding only in granted or leased chunks, and
+  datagrams are never split.
 - Refunds go through the receipt of the charge and never reach a Rate that
   was reset since.
 - A Limiter must never charge itself, directly or through other Limiters.

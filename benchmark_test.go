@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -18,7 +19,7 @@ func BenchmarkConnWrite(b *testing.B) {
 			for i := range rates {
 				rates[i] = NewRate(benchLimit)
 			}
-			c := NewConn(&nopNetConn{}, NewHierarchy(limiters(rates...)...))
+			c := NewConn(&nopNetConn{}, WithLimiter(NewHierarchy(limiters(rates...)...)))
 			defer func() { _ = c.Close() }()
 			buf := make([]byte, 32<<10)
 			b.ReportAllocs()
@@ -36,7 +37,7 @@ func BenchmarkConnRead(b *testing.B) {
 			for i := range rates {
 				rates[i] = NewRate(benchLimit)
 			}
-			c := NewConn(&recordingConn{}, NewHierarchy(limiters(rates...)...))
+			c := NewConn(&recordingConn{}, WithLimiter(NewHierarchy(limiters(rates...)...)))
 			defer func() { _ = c.Close() }()
 			buf := make([]byte, 32<<10)
 			b.ReportAllocs()
@@ -130,10 +131,10 @@ func BenchmarkHierarchyWait(b *testing.B) {
 	})
 }
 
-func BenchmarkRateThroughput(b *testing.B) {
-	r := NewRate(benchLimit)
+func BenchmarkCounterThroughput(b *testing.B) {
+	var c Counter
 	for b.Loop() {
-		_ = r.Throughput()
+		_, _ = c.Throughput()
 	}
 }
 
@@ -141,14 +142,14 @@ func BenchmarkNewConn(b *testing.B) {
 	c, r := &nopNetConn{}, NewRate(benchLimit)
 	b.ReportAllocs()
 	for b.Loop() {
-		_ = NewConn(c, r)
+		_ = NewConn(c, WithLimiter(r))
 	}
 }
 
 // BenchmarkConnSetDeadline sets a deadline before every operation, as
 // servers with idle timeouts do.
 func BenchmarkConnSetDeadline(b *testing.B) {
-	c := NewConn(&nopNetConn{}, NewRate(benchLimit))
+	c := NewConn(&nopNetConn{}, WithLimiter(NewRate(benchLimit)))
 	b.ReportAllocs()
 	for b.Loop() {
 		_ = c.SetReadDeadline(time.Now().Add(time.Minute))
@@ -171,7 +172,7 @@ func BenchmarkConnWriteShared(b *testing.B) {
 			b.ReportAllocs()
 			b.RunParallel(func(pb *testing.PB) {
 				user := users[next.Add(1)%int64(len(users))]
-				c := NewConn(&nopNetConn{}, NewHierarchy(NewRate(limit), user, global))
+				c := NewConn(&nopNetConn{}, WithLimiter(NewHierarchy(NewRate(limit), user, global)))
 				defer func() { _ = c.Close() }()
 				buf := make([]byte, 1500)
 				for pb.Next() {
@@ -188,8 +189,8 @@ func BenchmarkGroupWrite(b *testing.B) {
 	_, user, client, tunnel := tree()
 	root := user.Parent()
 	for _, g := range []*Group{root, user, client, tunnel} {
-		g.SetReadLimiter(NewRate(benchLimit))
-		g.SetWriteLimiter(NewRate(benchLimit))
+		setRead(g, NewRate(benchLimit))
+		setWrite(g, NewRate(benchLimit))
 	}
 	c, err := tunnel.Open(&nopNetConn{})
 	if err != nil {
@@ -209,7 +210,7 @@ func BenchmarkGroupWrite(b *testing.B) {
 func BenchmarkConnWriteNested(b *testing.B) {
 	budget := NewBudget(Step{After: 0, Limit: NewRate(benchLimit)})
 	sw := NewSwitch(NewRate(benchLimit))
-	c := NewConn(&nopNetConn{}, NewHierarchy(NewRate(benchLimit), budget, sw))
+	c := NewConn(&nopNetConn{}, WithLimiter(NewHierarchy(NewRate(benchLimit), budget, sw)))
 	defer func() { _ = c.Close() }()
 	buf := make([]byte, 32<<10)
 	b.ReportAllocs()
@@ -246,7 +247,7 @@ func BenchmarkGroupOpenWrite(b *testing.B) {
 	b.ReportAllocs()
 	b.RunParallel(func(pb *testing.PB) {
 		user := NewGroup(root)
-		user.SetWriteLimiter(NewRate(benchLimit))
+		setWrite(user, NewRate(benchLimit))
 		c, err := user.Open(&nopNetConn{})
 		if err != nil {
 			b.Error(err)
@@ -274,7 +275,7 @@ func (*sinkConn) ReadFrom(r io.Reader) (int64, error) {
 // BenchmarkConnReadFrom measures what a wrapper adds to each grant of a
 // zero-copy io.Copy, 64 grants per ReadFrom.
 func BenchmarkConnReadFrom(b *testing.B) {
-	rf := NewConn(&sinkConn{}, NewRate(benchLimit)).(io.ReaderFrom)
+	rf := any(NewConn(&sinkConn{}, WithLimiter(NewRate(benchLimit)))).(io.ReaderFrom)
 	src := &io.LimitedReader{R: zeroCopyFile{bytes.NewReader(nil)}}
 	b.ReportAllocs()
 	for b.Loop() {
@@ -299,6 +300,96 @@ func BenchmarkTryWait(b *testing.B) {
 		b.ReportAllocs()
 		for b.Loop() {
 			_ = l.TryWait(1500)
+		}
+	})
+}
+
+// BenchmarkMeterWrite writes 512 B through a connection without a limit,
+// as most connections are, so that only the Meter counts: raw is the
+// wrapped connection alone, for comparison.
+func BenchmarkMeterWrite(b *testing.B) {
+	buf := make([]byte, 512)
+	b.Run("raw", func(b *testing.B) {
+		var c net.Conn = &nopNetConn{}
+		b.ReportAllocs()
+		for b.Loop() {
+			_, _ = c.Write(buf)
+		}
+	})
+	b.Run("meter", func(b *testing.B) {
+		var c net.Conn = NewConn(&nopNetConn{})
+		b.ReportAllocs()
+		for b.Loop() {
+			_, _ = c.Write(buf)
+		}
+	})
+	b.Run("group", func(b *testing.B) {
+		_, _, _, tunnel := tree()
+		c, err := tunnel.Open(&nopNetConn{})
+		if err != nil {
+			b.Fatal(err)
+		}
+		defer func() { _ = c.Close() }()
+		b.ReportAllocs()
+		for b.Loop() {
+			_, _ = c.Write(buf)
+		}
+	})
+	b.Run("budget", func(b *testing.B) {
+		c := NewConn(&nopNetConn{}, WithLimiter(NewBudget(Step{After: 1 << 62, Stop: true})))
+		defer func() { _ = c.Close() }()
+		b.ReportAllocs()
+		for b.Loop() {
+			_, _ = c.Write(buf)
+		}
+	})
+	b.Run("limited", func(b *testing.B) {
+		c := NewConn(&nopNetConn{}, WithLimiter(NewRate(1<<50)))
+		defer func() { _ = c.Close() }()
+		b.ReportAllocs()
+		for b.Loop() {
+			_, _ = c.Write(buf)
+		}
+	})
+}
+
+// BenchmarkMeterWriteParallel writes through a connection per goroutine,
+// all in one Group tree and one shared Budget, as the users of a server do:
+// counting must not slow down with the processors.
+func BenchmarkMeterWriteParallel(b *testing.B) {
+	_, _, _, tunnel := tree()
+	budget := NewBudget(Step{After: 1 << 62, Stop: true})
+	setWrite(tunnel, budget)
+	b.ReportAllocs()
+	b.RunParallel(func(pb *testing.PB) {
+		c, err := tunnel.Open(&nopNetConn{})
+		if err != nil {
+			b.Error(err)
+			return
+		}
+		defer func() { _ = c.Close() }()
+		buf := make([]byte, 512)
+		for pb.Next() {
+			_, _ = c.Write(buf)
+		}
+	})
+}
+
+// BenchmarkMeterWriteParallelUnlimited is BenchmarkMeterWriteParallel
+// without the Budget.
+func BenchmarkMeterWriteParallelUnlimited(b *testing.B) {
+	_, _, _, tunnel := tree()
+	b.ReportAllocs()
+	b.RunParallel(func(pb *testing.PB) {
+		c, err := tunnel.Open(&nopNetConn{})
+		if err != nil {
+			b.Error(err)
+			return
+		}
+		defer func() { _ = c.Close() }()
+		buf := make([]byte, 512)
+		for pb.Next() {
+			_, _ = c.Write(buf)
 		}
 	})
 }

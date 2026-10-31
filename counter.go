@@ -18,7 +18,9 @@ import (
 // suits a counter that few goroutines add to at once, such as one per
 // connection. NewSharedCounter spreads the Adds of many goroutines, such as
 // all the connections of a user, over counters per processor. Add costs an
-// atomic add per direction and does not read the clock.
+// atomic add per direction and does not read the clock. Attach adds up the
+// Meters of connections instead, which costs their reads and writes nothing
+// at all.
 //
 // All methods are safe for concurrent use and on a nil *Counter. A Counter
 // must not be copied after first use.
@@ -29,6 +31,13 @@ type Counter struct {
 
 	mu      sync.Mutex // serializes Load, Swap, Restore and Set
 	swapped [2]int64   // totals at the last Swap
+
+	clock atomic.Pointer[clockBox] // SetClock's, nil for the monotonic clock
+
+	// The Meters added up in the totals, with their totals when attached.
+	srcMu sync.Mutex
+	srcs  map[*Meter][2]int64
+	nsrc  atomic.Int32 // len(srcs), so that totals skips srcMu without any
 }
 
 // counterShard is one of the counter pairs of a shared Counter, on a cache
@@ -47,10 +56,7 @@ func NewSharedCounter() *Counter {
 }
 
 // Add adds read bytes read and written bytes written; negative counts
-// subtract. It does not read the clock, so for Throughput the bytes count in
-// the sampling window that is open when the next count through one of c's
-// views, or Throughput, closes it; the views count with the time of each
-// charge.
+// subtract. It does not read the clock: Throughput samples the totals.
 func (c *Counter) Add(read, written int64) {
 	if c == nil {
 		return
@@ -66,16 +72,6 @@ func (c *Counter) Add(read, written int64) {
 	if written != 0 {
 		cw.Add(written)
 	}
-}
-
-// addAt is Add at now, as nowNs returns it: it closes the sampling window
-// before counting once now is past it, so that the bytes count in now's.
-func (c *Counter) addAt(read, written, now int64) {
-	if c.meter.due(now) && c.meter.mu.TryLock() {
-		c.meter.roll(now, c.totals())
-		c.meter.mu.Unlock()
-	}
-	c.Add(read, written)
 }
 
 // Total returns the bytes read and written since c began, which Swap does
@@ -132,19 +128,16 @@ func (c *Counter) shift(v [2]int64, to bool) {
 	}
 }
 
-// Reads returns a Limiter that never limits and counts the bytes charged to
-// it as c's bytes read, refunds taken off. Put it in a NewHierarchy with the
-// limiters of the reads it counts, such as the read Limiter of
-// NewDuplexConn, so that c counts what the reads take, also through a
-// Switch.
-func (c *Counter) Reads() Limiter { return (*counterReads)(c) }
+// reads returns a Limiter that never limits and counts the bytes charged to
+// it as c's bytes read, refunds taken off, for the Reads of a Group.
+func (c *Counter) reads() Limiter { return (*counterReads)(c) }
 
-// Writes returns a Limiter that counts the bytes charged to it as c's bytes
-// written, as Reads does for bytes read.
-func (c *Counter) Writes() Limiter { return (*counterWrites)(c) }
+// writes returns a Limiter that counts the bytes charged to it as c's bytes
+// written, as reads does for bytes read.
+func (c *Counter) writes() Limiter { return (*counterWrites)(c) }
 
 // counterReads and counterWrites are the Limiter views of a Counter. They
-// count with the time of each charge, for Throughput.
+// add as Add does, without reading the clock.
 type (
 	counterReads  Counter
 	counterWrites Counter
@@ -158,13 +151,13 @@ func (c *counterReads) Ready(_ context.Context, n int64) (int64, error) {
 
 func (c *counterReads) Refund(n int64) {
 	if c != nil && n > 0 {
-		(*Counter)(c).addAt(-n, 0, nowNs())
+		(*Counter)(c).Add(-n, 0)
 	}
 }
 
 func (c *counterReads) Charge(n int64) error {
 	if c != nil && n > 0 {
-		(*Counter)(c).addAt(n, 0, nowNs())
+		(*Counter)(c).Add(n, 0)
 	}
 	return nil
 }
@@ -177,23 +170,34 @@ func (c *counterWrites) Ready(_ context.Context, n int64) (int64, error) {
 
 func (c *counterWrites) Refund(n int64) {
 	if c != nil && n > 0 {
-		(*Counter)(c).addAt(0, -n, nowNs())
+		(*Counter)(c).Add(0, -n)
 	}
 }
 
 func (c *counterWrites) Charge(n int64) error {
 	if c != nil && n > 0 {
-		(*Counter)(c).addAt(0, n, nowNs())
+		(*Counter)(c).Add(0, n)
 	}
 	return nil
 }
 
 // totals returns the bytes read and written since c began.
 func (c *Counter) totals() [2]int64 {
+	if c.nsrc.Load() > 0 {
+		// Under srcMu, so that a Detach that moves a Meter's bytes into
+		// the totals is seen whole or not at all.
+		c.srcMu.Lock()
+		defer c.srcMu.Unlock()
+	}
 	t := [2]int64{c.read.Load(), c.written.Load()}
 	for i := range c.shards {
 		t[0] += c.shards[i].read.Load()
 		t[1] += c.shards[i].written.Load()
+	}
+	for m, base := range c.srcs {
+		r, w := m.Total()
+		t[0] += r - base[0]
+		t[1] += w - base[1]
 	}
 	return t
 }
@@ -227,23 +231,54 @@ func (c *Counter) Swap() (read, written int64) {
 }
 
 // Throughput returns the bytes per second read and written in the last whole
-// second, in the sampling windows that Rate.Throughput has: one-second
-// slices of a clock that every Rate and Counter shares, of which it reports
-// the one before the current one, so that what it reports depends on when
-// the bytes passed and not on how often or by how many callers it is
-// called. Bytes counted through c's views count in the window of their
-// charge; those of Add, which does not read the clock, in the window open
-// when the next count through a view, or a call of Throughput, closes it,
-// so a Counter that only Add feeds and Throughput reads every N seconds
-// reports N seconds of bytes as one. Bytes added before c's first window
-// count in no window. A window in which more was refunded than counted
-// reports 0 and takes the rest off the following ones.
+// second. Counting never reads the clock: the totals are sampled when a
+// whole second of c's clock has passed since the last sample, by Throughput
+// itself or by Sample, and the bytes between two samples count evenly over
+// the seconds between them. Called at least once a second, as a ticker of
+// the caller's does with Sample, it reports each second on its own; called
+// every N seconds, the average of those N seconds. The windows are whole
+// seconds of c's clock, the same for every reader, so what it reports does
+// not depend on how many callers read it. Bytes counted before c's first
+// sample count in no window. A window in which more was refunded than
+// counted reports 0 and takes the rest off the following ones.
 func (c *Counter) Throughput() (readBps, writtenBps int64) {
 	if c == nil {
 		return 0, 0
 	}
-	t := c.throughput(nowNs())
+	t := c.throughput(c.now())
 	return t[0], t[1]
+}
+
+// Sample samples c's totals for Throughput if a second has passed since the
+// last sample. A caller that wants the throughput of every second, however
+// rarely it reads it, calls Sample once a second, such as from a ticker
+// shared by all its Counters; it costs a lock and a read of the clock.
+func (c *Counter) Sample() {
+	if c != nil {
+		c.throughput(c.now())
+	}
+}
+
+// SetClock makes c read the time of its throughput samples from clk, such
+// as a timeshim.Fake in a test; nil goes back to the monotonic clock. Set it
+// before the first sample.
+func (c *Counter) SetClock(clk Clock) {
+	if c == nil {
+		return
+	}
+	if clk == nil {
+		c.clock.Store(nil)
+		return
+	}
+	c.clock.Store(&clockBox{c: clk})
+}
+
+// now returns the time of c's clock in nanoseconds.
+func (c *Counter) now() int64 {
+	if b := c.clock.Load(); b != nil {
+		return b.c.Now().UnixNano()
+	}
+	return nowNs()
 }
 
 // throughput is Throughput at now.
@@ -252,6 +287,59 @@ func (c *Counter) throughput(now int64) [2]int64 {
 	defer c.meter.mu.Unlock()
 	c.meter.roll(now, c.totals())
 	return c.meter.last()
+}
+
+// Attach adds m's bytes from now on to c's totals, without counting them
+// on every read and write: c adds up its Meters when it is read, so that a
+// Counter shared by many connections, such as a user's, costs their reads
+// and writes nothing. The bytes m counted before stay out of c. Detach
+// ends it, keeping the bytes in c; attaching m again does nothing.
+func (c *Counter) Attach(m *Meter) {
+	if c == nil || m == nil {
+		return
+	}
+	c.srcMu.Lock()
+	defer c.srcMu.Unlock()
+	if _, ok := c.srcs[m]; ok {
+		return
+	}
+	if c.srcs == nil {
+		c.srcs = make(map[*Meter][2]int64)
+	}
+	r, w := m.Total()
+	c.srcs[m] = [2]int64{r, w}
+	c.nsrc.Store(int32(len(c.srcs)))
+}
+
+// Detach stops adding m's bytes to c, keeping those it added so far as if
+// they had been counted by Add.
+func (c *Counter) Detach(m *Meter) {
+	if c == nil || m == nil {
+		return
+	}
+	c.srcMu.Lock()
+	defer c.srcMu.Unlock()
+	base, ok := c.srcs[m]
+	if !ok {
+		return
+	}
+	r, w := m.Total()
+	// Added before the Meter leaves, so that totals never misses it.
+	c.read.Add(r - base[0])
+	c.written.Add(w - base[1])
+	delete(c.srcs, m)
+	c.nsrc.Store(int32(len(c.srcs)))
+}
+
+// meters returns the Meters attached to c.
+func (c *Counter) meters() []*Meter {
+	c.srcMu.Lock()
+	defer c.srcMu.Unlock()
+	ms := make([]*Meter, 0, len(c.srcs))
+	for m := range c.srcs {
+		ms = append(ms, m)
+	}
+	return ms
 }
 
 // shardKey spreads goroutines over the shards of a shared Counter by where

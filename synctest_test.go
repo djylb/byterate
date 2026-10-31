@@ -50,7 +50,7 @@ func TestConnReusesWaitTimer(t *testing.T) {
 				if hierarchical {
 					l = NewHierarchy(r, other, NewRate(0))
 				}
-				c := NewConn(&nopNetConn{}, l)
+				c := NewConn(&nopNetConn{}, WithLimiter(l))
 				buf := make([]byte, 16<<10)
 				_, _ = c.Write(buf) // makes the timer and the generation's Done channel
 				allocs := testing.AllocsPerRun(100, func() {

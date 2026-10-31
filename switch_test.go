@@ -38,7 +38,7 @@ func TestConnFollowsSwitch(t *testing.T) {
 		slow, fast := NewRate(1000), NewRate(1<<20)
 		s := NewSwitch(slow)
 		inner := &dataConn{}
-		conn := NewConn(inner, s)
+		conn := NewConn(inner, WithLimiter(s))
 		done := make(chan time.Duration, 1)
 		start := time.Now()
 		go func() {
@@ -84,7 +84,7 @@ func TestNestedSwitchRefundsWhereItCharged(t *testing.T) {
 		a, b := NewBudget(), NewBudget()
 		s := NewSwitch(a)
 		failed := errors.New("write failed")
-		conn := NewReadWriteCloser(&scriptedConn{writeErr: failed}, NewHierarchy(r, s))
+		conn := NewStream(&scriptedConn{writeErr: failed}, WithLimiter(NewHierarchy(r, s)))
 		done := make(chan error, 1)
 		go func() {
 			_, err := conn.Write(make([]byte, 100))

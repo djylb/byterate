@@ -67,7 +67,7 @@ func TestGroupConnSlots(t *testing.T) {
 func TestGroupOpenLimitsAndCounts(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		root, user, client, tunnel := tree()
-		user.SetWriteLimiter(NewRate(1000)) // 1000 B/s of writes for the user
+		setWrite(user, NewRate(1000)) // 1000 B/s of writes for the user
 		conn, err := tunnel.Open(&recordingConn{})
 		if err != nil {
 			t.Fatal(err)
@@ -109,7 +109,7 @@ func TestGroupSetParentMovesConnections(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		root := NewGroup(nil)
 		a, b := NewGroup(root), NewGroup(root)
-		b.SetWriteLimiter(NewRate(1000))
+		setWrite(b, NewRate(1000))
 		client := NewGroup(a)
 		c1, _ := client.Open(&recordingConn{})
 		c2, _ := client.Open(&recordingConn{})
@@ -159,7 +159,7 @@ func TestGroupSetParentMovesConnections(t *testing.T) {
 func TestGroupRelayHooks(t *testing.T) {
 	root := NewGroup(nil)
 	user := NewGroup(root)
-	user.SetReadLimiter(NewBudget(Step{After: 1000, Stop: true}))
+	setRead(user, NewBudget(Step{After: 1000, Stop: true}))
 	reader := user.Reads()
 	sent := int64(0)
 	var err error
@@ -376,7 +376,7 @@ func TestGroupAcquireContextLosesNoWakeup(t *testing.T) {
 
 // Open can wait for a slot and charge limiters of the connection's own
 // within the Group.
-func TestGroupOpenOptions(t *testing.T) {
+func TestGroupOptions(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		g := NewGroup(nil)
 		g.SetMaxConns(1)
@@ -422,14 +422,14 @@ func TestGroupAllocatesNothing(t *testing.T) {
 		t.Skip("time.Sleep allocates on js")
 	}
 	leaf := NewGroup(nil)
-	leaf.SetWriteLimiter(NewRate(0))
+	setWrite(leaf, NewRate(0))
 	for range 7 {
 		leaf = NewGroup(leaf)
-		leaf.SetWriteLimiter(NewRate(0)) // metering
+		setWrite(leaf, NewRate(0)) // metering
 	}
 	slow := NewRate(1 << 20)
 	slow.reserve(2 << 20) // spend the burst, so that each Write below waits
-	leaf.Parent().SetWriteLimiter(slow)
+	setWrite(leaf.Parent(), slow)
 	conn, err := leaf.Open(&nopNetConn{})
 	if err != nil {
 		t.Fatal(err)
@@ -446,11 +446,11 @@ func TestGroupAllocatesNothing(t *testing.T) {
 func TestGroupCanceledWaitKeepsCount(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		g := NewGroup(nil)
-		g.SetWriteLimiter(NewBudget(Step{Limit: NewRate(100)}))
+		setWrite(g, NewBudget(Step{Limit: NewRate(100)}))
 		var c Counter
 		for name, l := range map[string]Limiter{
 			"group":     g.Writes(),
-			"hierarchy": NewHierarchy(c.Writes(), NewBudget(Step{Limit: NewRate(100)})),
+			"hierarchy": NewHierarchy(c.writes(), NewBudget(Step{Limit: NewRate(100)})),
 		} {
 			ctx, cancel := context.WithTimeout(bg, 20*time.Millisecond)
 			err := l.Wait(ctx, 1000)
@@ -474,7 +474,7 @@ func TestGroupCanceledWaitKeepsCount(t *testing.T) {
 func TestGroupRefusalsAndSwitchesCountOnce(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		stopped := NewGroup(nil)
-		stopped.SetWriteLimiter(NewBudget(Step{Stop: true}))
+		setWrite(stopped, NewBudget(Step{Stop: true}))
 		if err := stopped.Writes().Wait(bg, 100); !errors.Is(err, ErrBudgetExhausted) {
 			t.Fatalf("Wait under a stopped Budget = %v, want ErrBudgetExhausted", err)
 		}
@@ -485,7 +485,7 @@ func TestGroupRefusalsAndSwitchesCountOnce(t *testing.T) {
 		a, b := NewGroup(nil), NewGroup(nil)
 		slow := NewRate(100)
 		slow.reserve(1000) // so that a Wait under a blocks
-		a.SetWriteLimiter(slow)
+		setWrite(a, slow)
 		sw := NewSwitch(a.Writes())
 		done := make(chan error)
 		go func() { done <- sw.Wait(bg, 100) }()
@@ -510,7 +510,7 @@ func TestGroupSharedLevelsChargeOnce(t *testing.T) {
 	budget := NewBudget()
 	var traffic Counter
 	for _, g := range []*Group{user, tunnel} {
-		g.SetWriteLimiter(budget)
+		setWrite(g, budget)
 		g.SetTraffic(&traffic)
 	}
 	if err := tunnel.Writes().Charge(100); err != nil {
@@ -525,7 +525,7 @@ func TestGroupSharedLevelsChargeOnce(t *testing.T) {
 	if _, out := fresh.Load(); out != 10 {
 		t.Fatalf("the new Counter counted %d B, want 10", out)
 	}
-	if user.WriteLimiter() != budget || user.ReadLimiter() != nil {
+	if user.writeLimiter() != budget || user.readLimiter() != nil {
 		t.Fatal("ReadLimiter and WriteLimiter do not return what was set")
 	}
 }
@@ -536,7 +536,7 @@ func TestGroupChangesRebuildOnlyBelow(t *testing.T) {
 	other := NewGroup(root)
 	_ = tunnel.Writes().Charge(1)
 	built := tunnel.cache.Load()
-	other.SetWriteLimiter(NewRate(1000))
+	setWrite(other, NewRate(1000))
 	other.SetTraffic(nil)
 	_ = tunnel.Writes().Charge(1)
 	if tunnel.cache.Load() != built {
@@ -544,7 +544,7 @@ func TestGroupChangesRebuildOnlyBelow(t *testing.T) {
 	}
 	for _, change := range []func(){
 		func() { _ = user.SetParent(NewGroup(nil)) }, // a parent as unchanged as the root
-		func() { user.SetWriteLimiter(NewRate(1000)) },
+		func() { setWrite(user, NewRate(1000)) },
 		func() { _ = user.SetParent(root) },
 		func() { root.SetTraffic(nil) },
 		func() { _ = root.SetParent(NewGroup(nil)) }, // a new ancestor past the chain
@@ -579,7 +579,7 @@ func TestGroupChangesRaceCharges(t *testing.T) {
 	}
 	for i := range 1000 {
 		if i%2 == 0 {
-			root.SetWriteLimiter(NewRate(0))
+			setWrite(root, NewRate(0))
 		} else {
 			c := &Counter{}
 			mu.Lock()
@@ -609,19 +609,19 @@ func TestGroupOpenVariants(t *testing.T) {
 		if c, err := g.Open(nil); c != nil || !errors.Is(err, ErrNilConn) || g.Conns() != 0 {
 			t.Fatalf("Open(nil) = %v, %v with %d slots taken; want nil, ErrNilConn, 0", c, err, g.Conns())
 		}
-		if _, err := g.OpenReadWriteCloser(nil); !errors.Is(err, ErrNilConn) || g.Conns() != 0 {
-			t.Fatalf("OpenReadWriteCloser(nil) = %v with %d slots taken", err, g.Conns())
+		if _, err := g.OpenStream(nil); !errors.Is(err, ErrNilConn) || g.Conns() != 0 {
+			t.Fatalf("OpenStream(nil) = %v with %d slots taken", err, g.Conns())
 		}
-		g.SetWriteLimiter(NewRate(1000))
+		setWrite(g, NewRate(1000))
 		rc := &recordingConn{}
-		dc, err := g.OpenDatagram(rc)
+		dc, err := g.Open(rc, WithDatagram())
 		if err != nil {
 			t.Fatal(err)
 		}
 		if n, err := dc.Write(make([]byte, 3000)); n != 3000 || err != nil || rc.maxWrite() != 3000 {
 			t.Fatalf("datagram Write = %d, %v, largest write %d; want 3000 whole", n, err, rc.maxWrite())
 		}
-		rwc, err := g.OpenReadWriteCloser(&recordingConn{})
+		rwc, err := g.OpenStream(&recordingConn{})
 		if err != nil || g.Conns() != 2 {
 			t.Fatalf("OpenReadWriteCloser = %v with %d slots taken, want 2", err, g.Conns())
 		}

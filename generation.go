@@ -7,27 +7,27 @@ import (
 )
 
 // generation is the state of a Rate from one Enable that clears it to the
-// next: its debt, its meter and the channels that Disable closes. Enable
+// next: its debt and the channels that Disable closes. Enable
 // replaces the generation instead of clearing it in place, and a new one is
-// complete before it is published, so a charge, a refund and a sampling
-// window each act on the one generation they loaded, and one that an Enable
-// retired keeps its effects to itself.
+// complete before it is published, so a charge and a refund each act on the
+// one generation they loaded, and one that an Enable retired keeps its
+// effects to itself.
 //
 // It fills two cache lines of its size class exactly: the first is read by
-// every charge and written once per sampling window, the second written by
-// every charge.
+// every charge, the second written by every charge.
 type generation struct {
 	generationRead
-	_     [cacheLineSize - unsafe.Sizeof(generationRead{})]byte
-	tat   atomic.Int64 // theoretical arrival time (ns since epoch), can be negative
-	total atomic.Int64 // bytes charged, net of refunds, for meter
+	_   [cacheLineSize - unsafe.Sizeof(generationRead{})]byte
+	tat atomic.Int64 // theoretical arrival time (ns since epoch), can be negative
+	// total is the bytes charged, net of refunds: the line is written by
+	// every charge anyway, so it costs a charge nothing more.
+	total atomic.Int64
 	_     [cacheLineSize - 16]byte
 }
 
 // generationRead are the fields of a generation that every charge reads.
 type generationRead struct {
-	stop  atomic.Pointer[stopSet] // made by the first waiter
-	meter window                  // over total
+	stop atomic.Pointer[stopSet] // made by the first waiter
 }
 
 // stopSet holds the channels of a generation that Disable closes. Waiters
@@ -68,8 +68,7 @@ var (
 	closedStop = &stopChan{ch: closedChan}
 )
 
-// newGeneration returns a generation with a full burst at now and an empty
-// meter.
+// newGeneration returns a generation with a full burst at now.
 func newGeneration(now, burstNs int64) *generation {
 	g := &generation{}
 	g.tat.Store(subSat(now, burstNs))
@@ -125,22 +124,4 @@ func (g *generation) closeStop() {
 			}
 		}
 	}
-}
-
-// count meters size bytes charged at now, a negative size for a refund.
-func (g *generation) count(size, now int64) {
-	if g.meter.due(now) && g.meter.mu.TryLock() {
-		g.meter.roll(now, [2]int64{g.total.Load()})
-		g.meter.mu.Unlock()
-	}
-	g.total.Add(size)
-}
-
-// throughput returns the bytes per second metered in the window before
-// now's.
-func (g *generation) throughput(now int64) int64 {
-	g.meter.mu.Lock()
-	defer g.meter.mu.Unlock()
-	g.meter.roll(now, [2]int64{g.total.Load()})
-	return g.meter.last()[0]
 }

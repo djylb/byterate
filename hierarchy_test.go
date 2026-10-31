@@ -64,7 +64,7 @@ func TestHierarchyRefundsAllChildrenOnShortWrite(t *testing.T) {
 	}
 
 	wantErr := errors.New("short write")
-	conn := NewReadWriteCloser(&scriptedConn{writeN: 2, writeErr: wantErr}, limiter)
+	conn := NewStream(&scriptedConn{writeN: 2, writeErr: wantErr}, WithLimiter(limiter))
 	n, err := conn.Write([]byte("hello"))
 	if !errors.Is(err, wantErr) {
 		t.Fatalf("Write() error = %v, want %v", err, wantErr)
@@ -94,11 +94,11 @@ func TestHierarchyDisableEndsOnlyThatLevelsWait(t *testing.T) {
 			return l.Wait(context.Background(), 1000)
 		}, 6 * time.Second},
 		"Read": {func(l Limiter) error {
-			_, err := NewConn(&nopNetConn{}, l).Read(make([]byte, 1000))
+			_, err := NewConn(&nopNetConn{}, WithLimiter(l)).Read(make([]byte, 1000))
 			return err
 		}, 5 * time.Second},
 		"Write": {func(l Limiter) error {
-			_, err := NewConn(&nopNetConn{}, l).Write(make([]byte, 1000))
+			_, err := NewConn(&nopNetConn{}, WithLimiter(l)).Write(make([]byte, 1000))
 			return err
 		}, 6 * time.Second},
 	}
@@ -296,7 +296,7 @@ func TestHierarchyRefundSkipsRestartedLevels(t *testing.T) {
 	conn, user := NewRate(1000), NewRate(1000)
 	l := NewHierarchy(conn, user).(*hierarchy)
 	user.Disable()
-	c := NewReadWriteCloser(&changingWriteConn{change: user.Enable}, l)
+	c := NewStream(&changingWriteConn{change: user.Enable}, WithLimiter(l))
 	_, _ = c.Write(make([]byte, 500))
 	if got := metered(conn); got != 0 {
 		t.Fatalf("metered of the charged level after the refund = %d, want 0", got)

@@ -23,7 +23,7 @@ func TestWriteReceiptRefundsEveryLevel(t *testing.T) {
 					rates[i].Disable()
 				}
 			}
-			c := NewReadWriteCloser(&scriptedConn{writeN: 50}, NewHierarchy(limiters(rates...)...))
+			c := NewStream(&scriptedConn{writeN: 50}, WithLimiter(NewHierarchy(limiters(rates...)...)))
 			_, _ = c.Write(make([]byte, 200))
 			for i, r := range rates {
 				if got := metered(r); got != 50 {
@@ -57,13 +57,13 @@ func TestUnlimitedWriteRefundPreservesOtherDebt(t *testing.T) {
 					r.reserve(10000)
 					r.SetLimit(0)
 				}
-				c := NewReadWriteCloser(&changingWriteConn{change: func() {
+				c := NewStream(&changingWriteConn{change: func() {
 					r.SetLimit(1000)
 					if !temporary {
 						_ = r.Wait(bg, 2000)
 						r.reserve(10000)
 					}
-				}}, r)
+				}}, WithLimiter(r))
 				_, _ = c.Write(make([]byte, 10000))
 				if wait := time.Duration(r.reserve(1)); wait < 10*time.Second {
 					t.Fatalf("unlimited write's refund erased another charge: wait = %v, want >=10s", wait)
@@ -83,13 +83,13 @@ func TestHierarchyWriteReceipts(t *testing.T) {
 		}
 		rates[2].Disable()
 		l := NewHierarchy(limiters(rates...)...)
-		c := NewReadWriteCloser(&changingWriteConn{change: func() {
+		c := NewStream(&changingWriteConn{change: func() {
 			for _, r := range rates {
 				r.Reset(1000)
 				_ = r.Wait(bg, 2000)
 				r.reserve(10000)
 			}
-		}}, l)
+		}}, WithLimiter(l))
 		_, _ = c.Write(make([]byte, 500))
 		for i, r := range rates {
 			if got := metered(r); got != 12000 {
@@ -116,7 +116,7 @@ func TestHierarchyResetBeforeLevelCharge(t *testing.T) {
 		}
 		testHooks.reserved.Store(&hook)
 		defer testHooks.reserved.Store(nil)
-		c := NewReadWriteCloser(&scriptedConn{writeErr: errors.New("failed")}, NewHierarchy(first, second))
+		c := NewStream(&scriptedConn{writeErr: errors.New("failed")}, WithLimiter(NewHierarchy(first, second)))
 		_, _ = c.Write(make([]byte, 4))
 		if got := metered(second); got != 0 {
 			t.Fatalf("refund of new-generation charge lost: meter=%d", got)
@@ -161,19 +161,19 @@ func TestChargeAfterConcurrentReset(t *testing.T) {
 			return NewHierarchy(NewRate(0), r).Wait(bg, 4000)
 		}, 2 * time.Second, 4000, 2 * time.Second},
 		"Read": {func(r *Rate) error {
-			_, err := NewConn(&nopNetConn{}, r).Read(make([]byte, 4000))
+			_, err := NewConn(&nopNetConn{}, WithLimiter(r)).Read(make([]byte, 4000))
 			return err
 		}, 0, 512, 512 * time.Millisecond},
 		"Write": {func(r *Rate) error {
-			_, err := NewConn(&nopNetConn{}, r).Write(make([]byte, 4000))
+			_, err := NewConn(&nopNetConn{}, WithLimiter(r)).Write(make([]byte, 4000))
 			return err
 		}, 2 * time.Second, -1, 2 * time.Second},
 		"HierarchicalWrite": {func(r *Rate) error {
-			_, err := NewConn(&nopNetConn{}, NewHierarchy(NewRate(0), r)).Write(make([]byte, 4000))
+			_, err := NewConn(&nopNetConn{}, WithLimiter(NewHierarchy(NewRate(0), r))).Write(make([]byte, 4000))
 			return err
 		}, 2 * time.Second, -1, 2 * time.Second},
 		"FailedWrite": {func(r *Rate) error {
-			_, err := NewReadWriteCloser(&scriptedConn{writeErr: failed}, r).Write(make([]byte, 4000))
+			_, err := NewStream(&scriptedConn{writeErr: failed}, WithLimiter(r)).Write(make([]byte, 4000))
 			if !errors.Is(err, failed) {
 				return err
 			}
@@ -287,7 +287,7 @@ func TestDisableWakesEveryWaiter(t *testing.T) {
 		r.reserve(2000) // spend the burst
 		var wg sync.WaitGroup
 		for range 200 {
-			c := NewConn(&nopNetConn{}, r)
+			c := NewConn(&nopNetConn{}, WithLimiter(r))
 			wg.Go(func() { _, _ = c.Write(make([]byte, 1000)) })
 			wg.Go(func() { _ = r.Wait(bg, 1000) })
 		}
@@ -323,7 +323,7 @@ func TestPrivateRateKeepsSmallStopSet(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		r := NewRate(1000)
 		r.reserve(2000) // spend the burst
-		c := NewConn(&nopNetConn{}, r)
+		c := NewConn(&nopNetConn{}, WithLimiter(r))
 		var wg sync.WaitGroup
 		for range 50 {
 			wg.Go(func() { _, _ = c.Write(make([]byte, 100)) })
