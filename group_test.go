@@ -696,9 +696,10 @@ func TestGroupSetTrafficCountsEveryByte(t *testing.T) {
 			n += int64(w)
 		}
 	}()
-	cs := [2]*Counter{{}, {}}
+	// The first writes may count in g's first Counter, before any swap.
+	cs := [2]*Counter{g.Traffic(), {}}
 	for i := range 2000 {
-		g.SetTraffic(cs[i%2])
+		g.SetTraffic(cs[(i+1)%2])
 	}
 	close(stop)
 	n := <-done
