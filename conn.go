@@ -499,10 +499,17 @@ func (d *direction) allow(size int64, whole bool, rv *reservation) (int64, error
 			if rv == nil {
 				return n, nil
 			}
-			if d.side.total.CompareAndSwap(t, t+n) {
+			if !d.side.total.CompareAndSwap(t, t+n) {
+				continue
+			}
+			// Counted, then checked once more, as cut expects: a Budget
+			// that took the lease back between the check above and the
+			// count did not see the bytes and may have lent them out.
+			if t+n <= d.side.end.Load() {
 				*rv = reservation{n: n}
 				return n, nil
 			}
+			d.leases.unreserve(n)
 			continue
 		}
 		b, err := d.leases.refill(want, need)
