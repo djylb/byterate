@@ -4,6 +4,7 @@ import (
 	"errors"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -339,5 +340,42 @@ func TestSharedTrafficCounter(t *testing.T) {
 	write()
 	if _, w := shared.Total(); w != 240 {
 		t.Fatalf("shared Counter counted %d after g2 left it, want 240", w)
+	}
+}
+
+// A Write that starts after SetUsed at the stop returned passes nothing,
+// also while other writes of the connection race the cut-off.
+func TestBudgetCutoffConcurrentWrites(t *testing.T) {
+	for r := range 50 {
+		const stop = 64 << 20
+		b := stopAfter(stop)
+		w := NewWriter(&recordingConn{}, WithLimiter(b))
+		var cut atomic.Bool
+		var after atomic.Int64
+		var wg sync.WaitGroup
+		for range 4 {
+			wg.Go(func() {
+				for range 3000 {
+					c := cut.Load()
+					n, err := w.Write(make([]byte, 100))
+					if c {
+						after.Add(int64(n))
+					}
+					if err != nil {
+						return
+					}
+				}
+			})
+		}
+		time.Sleep(time.Millisecond)
+		b.SetUsed(stop)
+		cut.Store(true)
+		wg.Wait()
+		_ = w.Close()
+		// A write admitted before the cut-off, or one that failed as it
+		// came, may still count; one at most per writer.
+		if after.Load() != 0 || b.Used() > stop+4*100 {
+			t.Fatalf("round %d: %d B written after the cut-off, Used %d", r, after.Load(), b.Used())
+		}
 	}
 }

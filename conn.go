@@ -1,6 +1,7 @@
 package byterate
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -8,10 +9,12 @@ import (
 	"io/fs"
 	"net"
 	"runtime"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unsafe"
 	"weak"
 )
 
@@ -548,21 +551,41 @@ func (d *direction) sentReserved(rv reservation, m int64) {
 	if rv.n == 0 {
 		d.count(m)
 	} else if m = min(max(m, 0), rv.n); m != rv.n {
-		d.side.unreserve(rv.n-m, rv.resets)
+		d.leases.unreserve(rv.n-m, rv.resets)
 	}
 }
 
 // unreserve takes n bytes that a write reserved and did not send off the
-// count, reserved when the leases had been reset resets times. While the
-// leases stay in their periods, the bytes go back to them as unused. A
-// lease reset since then, which settled the count as it was, took them as
-// passed: they stay in the count that leases see, and charged, and go to
-// unsent, which the Meter leaves out, instead.
-func (s *meterSide) unreserve(n int64, resets uint64) {
-	s.total.Add(-n)
-	if s.resets.Load() != resets {
-		s.total.Add(n)
-		s.unsent.Add(n)
+// count, reserved when the leases had been reset resets times. It holds
+// the locks of the leases' Budgets, which every reset holds too, so that
+// no lease is reset while it decides. While the leases stay in their
+// periods, the bytes go back to them as unused. A lease reset since then,
+// which settled the count as it was, took them as passed: they stay in the
+// count that leases see, and charged, and go to unsent, which the Meter
+// leaves out, instead.
+func (s *leaseSet) unreserve(n int64, resets uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	bs := make([]*Budget, 0, len(s.ls))
+	for _, l := range s.ls {
+		if !slices.Contains(bs, l.b) {
+			bs = append(bs, l.b)
+		}
+	}
+	// In address order, as another direction may lock the same Budgets.
+	slices.SortFunc(bs, func(x, y *Budget) int {
+		return cmp.Compare(uintptr(unsafe.Pointer(x)), uintptr(unsafe.Pointer(y)))
+	})
+	for _, b := range bs {
+		b.lessees.mu.Lock()
+	}
+	if s.side.resets.Load() == resets {
+		s.side.total.Add(-n)
+	} else {
+		s.side.unsent.Add(n)
+	}
+	for _, b := range bs {
+		b.lessees.mu.Unlock()
 	}
 }
 
@@ -640,7 +663,7 @@ func (s *rateConn) Write(b []byte) (int, error) {
 			}
 			// Another write of the connection, or a Budget taking the
 			// lease back, came first.
-			side.unreserve(size, resets)
+			d.leases.unreserve(size, resets)
 		}
 	}
 	return s.writeSlow(b)
