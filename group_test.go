@@ -633,3 +633,94 @@ func TestGroupOpenVariants(t *testing.T) {
 		}
 	})
 }
+
+// Moving a Group back and forth while its connections write loses no byte
+// in any level: the ancestors that stay keep counting, and each moved byte
+// counts in the old chain or in the new one.
+func TestGroupSetParentCountsEveryByte(t *testing.T) {
+	root := NewGroup(nil)
+	a, b := NewGroup(root), NewGroup(root)
+	client := NewGroup(a)
+	c, _ := client.Open(&recordingConn{})
+	defer func() { _ = c.Close() }()
+	done := make(chan int64)
+	stop := make(chan struct{})
+	go func() {
+		var n int64
+		buf := make([]byte, 64)
+		for {
+			select {
+			case <-stop:
+				done <- n
+				return
+			default:
+			}
+			w, _ := c.Write(buf)
+			n += int64(w)
+		}
+	}()
+	for i := range 2000 {
+		if err := client.SetParent([]*Group{a, b}[(i+1)%2]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	close(stop)
+	n := <-done
+	_, ra := a.Traffic().Total()
+	_, rb := b.Traffic().Total()
+	_, rr := root.Traffic().Total()
+	if rr != n || ra+rb != n {
+		t.Fatalf("wrote %d B; root counted %d, a+b %d", n, rr, ra+rb)
+	}
+}
+
+// Swapping a Group's Counter while its connections write loses no byte:
+// each counts in the old Counter or in the new one.
+func TestGroupSetTrafficCountsEveryByte(t *testing.T) {
+	g := NewGroup(nil)
+	c, _ := g.Open(&recordingConn{})
+	defer func() { _ = c.Close() }()
+	done := make(chan int64)
+	stop := make(chan struct{})
+	go func() {
+		var n int64
+		buf := make([]byte, 64)
+		for {
+			select {
+			case <-stop:
+				done <- n
+				return
+			default:
+			}
+			w, _ := c.Write(buf)
+			n += int64(w)
+		}
+	}()
+	cs := [2]*Counter{{}, {}}
+	for i := range 2000 {
+		g.SetTraffic(cs[i%2])
+	}
+	close(stop)
+	n := <-done
+	_, w0 := cs[0].Total()
+	_, w1 := cs[1].Total()
+	if w0+w1 != n {
+		t.Fatalf("wrote %d B; the Counters counted %d", n, w0+w1)
+	}
+}
+
+// A Release without its Acquire panics and leaves the counts as they are.
+func TestGroupReleaseWithoutAcquirePanics(t *testing.T) {
+	root := NewGroup(nil)
+	g := NewGroup(root)
+	_ = root.Acquire()
+	defer func() {
+		if recover() == nil {
+			t.Fatal("Release without Acquire did not panic")
+		}
+		if g.Conns() != 0 || root.Conns() != 1 {
+			t.Fatalf("Conns() after the panic: g %d, root %d; want 0, 1", g.Conns(), root.Conns())
+		}
+	}()
+	g.Release()
+}

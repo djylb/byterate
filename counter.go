@@ -231,12 +231,14 @@ func (c *Counter) Swap() (read, written int64) {
 }
 
 // Throughput returns the bytes per second read and written in the last whole
-// second. Counting never reads the clock: the totals are sampled when a
+// second, or 0s until a second sample. Counting never reads the clock: the totals are sampled when a
 // whole second of c's clock has passed since the last sample, by Throughput
 // itself or by Sample, and the bytes between two samples count evenly over
 // the seconds between them. Called at least once a second, as a ticker of
 // the caller's does with Sample, it reports each second on its own; called
-// every N seconds, the average of those N seconds. The windows are whole
+// every N seconds, the average of those N seconds; without Sample, the
+// first call only takes the first sample, and a call after a long pause
+// reports the average of the whole pause. The windows are whole
 // seconds of c's clock, the same for every reader, so what it reports does
 // not depend on how many callers read it. Bytes counted before c's first
 // sample count in no window. A window in which more was refunded than
@@ -302,6 +304,12 @@ func (c *Counter) Attach(m *Meter) {
 	}
 	c.srcMu.Lock()
 	defer c.srcMu.Unlock()
+	r, w := m.Total()
+	c.attachLocked(m, [2]int64{r, w})
+}
+
+// attachLocked attaches m with tot as its totals now. c.srcMu must be held.
+func (c *Counter) attachLocked(m *Meter, tot [2]int64) {
 	if src, ok := c.srcs[m]; ok {
 		src.refs++
 		return
@@ -309,8 +317,7 @@ func (c *Counter) Attach(m *Meter) {
 	if c.srcs == nil {
 		c.srcs = make(map[*Meter]*meterSrc)
 	}
-	r, w := m.Total()
-	c.srcs[m] = &meterSrc{base: [2]int64{r, w}, refs: 1}
+	c.srcs[m] = &meterSrc{base: tot, refs: 1}
 	c.nsrc.Store(int32(len(c.srcs)))
 }
 
@@ -329,6 +336,12 @@ func (c *Counter) Detach(m *Meter) {
 	}
 	c.srcMu.Lock()
 	defer c.srcMu.Unlock()
+	r, w := m.Total()
+	c.detachLocked(m, [2]int64{r, w})
+}
+
+// detachLocked detaches m with tot as its totals now. c.srcMu must be held.
+func (c *Counter) detachLocked(m *Meter, tot [2]int64) {
 	src, ok := c.srcs[m]
 	if !ok {
 		return
@@ -336,12 +349,58 @@ func (c *Counter) Detach(m *Meter) {
 	if src.refs--; src.refs > 0 {
 		return
 	}
-	r, w := m.Total()
 	// Added before the Meter leaves, so that totals never misses it.
-	c.read.Add(r - src.base[0])
-	c.written.Add(w - src.base[1])
+	c.read.Add(tot[0] - src.base[0])
+	c.written.Add(tot[1] - src.base[1])
 	delete(c.srcs, m)
 	c.nsrc.Store(int32(len(c.srcs)))
+}
+
+// moveMeters detaches ms from each Counter of from and attaches them to
+// each of to, with one reading of each Meter's totals for both, so that
+// every byte counts in from or in to. It holds all their srcMus while it
+// reads, so that no reader sees a Meter's bytes in both or in neither. A
+// Counter listed in from as often as in to stays as it is. configMu must
+// be held: it orders the locking of several Counters.
+func moveMeters(from, to []*Counter, ms []*Meter) {
+	net := make(map[*Counter]int)
+	for _, c := range from {
+		net[c]--
+	}
+	for _, c := range to {
+		net[c]++
+	}
+	var cs []*Counter
+	for c, d := range net {
+		if d != 0 {
+			cs = append(cs, c)
+		}
+	}
+	if len(cs) == 0 || len(ms) == 0 {
+		return
+	}
+	for _, c := range cs {
+		c.srcMu.Lock()
+	}
+	defer func() {
+		for _, c := range cs {
+			c.srcMu.Unlock()
+		}
+	}()
+	for _, m := range ms {
+		r, w := m.Total()
+		tot := [2]int64{r, w}
+		for _, c := range cs {
+			for d := net[c]; d < 0; d++ {
+				c.detachLocked(m, tot)
+			}
+		}
+		for _, c := range cs {
+			for d := net[c]; d > 0; d-- {
+				c.attachLocked(m, tot)
+			}
+		}
+	}
 }
 
 // shardKey spreads goroutines over the shards of a shared Counter by where

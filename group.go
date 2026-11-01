@@ -171,22 +171,37 @@ func (g *Group) SetParent(p *Group) error {
 	}
 	g.parent.Store(p)
 	// The wrappers below g count in the new ancestors from now on, and the
-	// bytes they counted stay with the old ones.
+	// bytes they counted stay with the old ones. The ancestors in both
+	// chains, such as the root of a move within a tree, keep them as they
+	// are.
+	stay := make(map[*Group]bool)
 	for a := old; a != nil; a = a.parent.Load() {
-		for k, m := range g.members {
-			a.Traffic().Detach(m)
-			delete(a.members, k)
-		}
+		stay[a] = true
 	}
+	var left, joined []*Counter
 	for a := p; a != nil; a = a.parent.Load() {
+		if stay[a] {
+			stay[a] = false // in both chains
+			continue
+		}
+		joined = append(joined, a.Traffic())
+		if a.members == nil {
+			a.members = make(map[weak.Pointer[rateConn]]*Meter)
+		}
 		for k, m := range g.members {
-			a.Traffic().Attach(m)
-			if a.members == nil {
-				a.members = make(map[weak.Pointer[rateConn]]*Meter)
-			}
 			a.members[k] = m
 		}
 	}
+	for a := old; a != nil; a = a.parent.Load() {
+		if !stay[a] {
+			continue
+		}
+		left = append(left, a.Traffic())
+		for k := range g.members {
+			delete(a.members, k)
+		}
+	}
+	moveMeters(left, joined, g.meters())
 	g.update()
 	// The waiters of the old ancestors may now find a slot, or a chain
 	// without them; the chain of old does not change.
@@ -299,10 +314,7 @@ func (g *Group) SetTraffic(c *Counter) {
 		return
 	}
 	// Only the wrappers of g's subtree move; others that share old stay.
-	for _, m := range g.members {
-		old.Detach(m)
-		c.Attach(m)
-	}
+	moveMeters([]*Counter{old}, []*Counter{c}, g.meters())
 	g.traffic.Store(c)
 	g.epoch.Add(1)
 }
@@ -404,10 +416,15 @@ func (g *Group) take() bool {
 }
 
 // Release gives back a connection slot that Acquire took, in g and in each
-// of its ancestors now.
+// of its ancestors now. It panics, and gives back nothing, when g holds no
+// slot, as a Release without its Acquire finds: the slot of the caller
+// keeps g's count above zero whatever else runs.
 func (g *Group) Release() {
 	r := g.lockTree()
 	defer r.tree.RUnlock()
+	if g.conns.Load() < 1 {
+		panic("byterate: Group.Release without Acquire")
+	}
 	for a := g; a != nil; a = a.parent.Load() {
 		a.give()
 	}
@@ -584,6 +601,16 @@ func (g *Group) acquireFor(ctx context.Context) error {
 		return g.AcquireContext(ctx)
 	}
 	return g.Acquire()
+}
+
+// meters returns the Meters of the wrappers opened in g and its
+// descendants. configMu must be held.
+func (g *Group) meters() []*Meter {
+	ms := make([]*Meter, 0, len(g.members))
+	for _, m := range g.members {
+		ms = append(ms, m)
+	}
+	return ms
 }
 
 // update gives the wrappers opened in g and its descendants the Limiters
