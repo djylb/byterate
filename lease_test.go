@@ -194,7 +194,7 @@ func TestBudgetLeasesUnderChanges(t *testing.T) {
 	b := stopAfter(1 << 40)
 	conns := make([]*Stream, writers)
 	for i := range conns {
-		conns[i] = NewWriter(&recordingConn{}, WithLimiter(b))
+		conns[i] = NewWriter(&nopNetConn{}, WithLimiter(b))
 	}
 	stop := make(chan struct{})
 	var wg sync.WaitGroup
@@ -207,6 +207,7 @@ func TestBudgetLeasesUnderChanges(t *testing.T) {
 				default:
 				}
 				_, _ = c.Write(make([]byte, 1+(i*977+j*131)%5000))
+				runtime.Gosched() // js/wasm does not preempt
 			}
 		})
 	}
