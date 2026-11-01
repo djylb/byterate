@@ -4,8 +4,8 @@ import "time"
 
 // Clock is the time source of the parts of this package that read time off
 // the charge path: the throughput of a Counter and the expiry of a Budget.
-// Any type with a Now method fits, such as a timeshim.Clock or its Fake, so
-// that tests can step time by hand.
+// Any type with a Now method fits, such as a fake clock that tests step by
+// hand.
 //
 // A Rate keeps the monotonic clock, which a testing/synctest bubble fakes.
 type Clock interface {
@@ -21,9 +21,13 @@ func (b *Budget) SetClock(c Clock) {
 	if b == nil {
 		return
 	}
-	if c == nil {
-		b.clock.Store(nil)
-		return
+	var box *clockBox
+	if c != nil {
+		box = &clockBox{c: c}
 	}
-	b.clock.Store(&clockBox{c: c})
+	b.lessees.mu.Lock()
+	defer b.lessees.mu.Unlock()
+	b.clock.Store(box)
+	b.scheduleLocked()
+	b.revokeLocked()
 }

@@ -144,8 +144,10 @@ daily.Settle(lease, sent)          // give back what was not used
 **Counting.** Every wrapper counts its bytes in its `Meter`. A `Counter`
 adds up bytes: those of `Add`, and those of the Meters attached to it, by
 `WithCounter` or `Attach`, which cost the connections' reads and writes
-nothing, since the Counter adds them up when read; a wrapper stays attached,
-and so referenced, until its `Close`. `Swap` takes the totals
+nothing, since the Counter adds them up when read. A wrapper stays attached
+until its `Close`; one dropped without `Close` is detached, keeping its
+bytes, once the garbage collector finds it, which can be much later, so close
+every wrapper for timely accounting. `Swap` takes the totals
 since the last `Swap`, so that each byte is reported once, and `Total` the
 running totals, to persist or report as snapshots; `Restore` adds persisted
 totals back after a restart and `Set` replaces the totals, neither counting
@@ -163,7 +165,9 @@ whole second. Counting never reads the clock: the totals are sampled once a
 second of the Counter's clock has passed, by `Throughput` itself or by
 `Sample`. For the throughput of every second, call `Sample` once a second,
 such as from one ticker for all Counters; read more rarely, `Throughput`
-reports the average since the last sample:
+reports the average since the last sample. Limiters, such as a `Rate` in a
+`NewHierarchy`, measure no throughput: give the connection a `Counter` with
+`WithCounter`, or open it in a `Group`, whose `Traffic` counts it:
 
 ```go
 for range time.Tick(time.Second) {
@@ -301,9 +305,12 @@ transferred, keeps them on every level and returns the refusal.
 
 **Budgets.** A `Budget` never blocks by itself; the `Limit` of its step does.
 Once the usage reaches a `Stop` step, it refuses everything until the next
-period. Neither writes nor reads take the usage past it: a `Write` sends
-what fits and fails, a `Read` reads no more than is left and the next one
-fails; a datagram, read whole, can pass it by its size. Steps apply from their `After`. The bytes used count everything
+period. Writes never take the usage past it, even concurrent ones: a
+`Write` sends what fits and fails. A `Read` reads no more than is left and
+the next one fails; a read counts what arrived, so a datagram, read whole,
+and a read in progress when its lease is taken back can pass the stop by
+what they read, which counts as used. Steps apply from their `After`. The
+bytes used count everything
 charged to the `Budget`, whichever step applied, and a step's `Limit` only
 the bytes of its step; a `Limit` adds to the other limits, so it can only
 slow traffic down. For steps that also speed it up, leave the base speed out
@@ -311,17 +318,34 @@ of the hierarchy and give the first step, at `After: 0`, a `Limit` as well.
 
 **Leases.** A wrapper leases about half of what a Budget has left, between
 16 KiB and 1 MiB, never past the next step or the stop, and passes that
-many bytes without asking the Budget again; while a step's `Limit` applies,
-it charges the Budget at every read and write instead. Leased bytes count as
-used when leased, so connections that share a Budget never pass its stop
-together, and `Used` and `Remaining` leave out what the wrappers' leases hold
-unused, so they report the bytes that passed. Bounds of what leasing can
-change: `OnStep` reports a step when a lease reaches it, at most one lease
-before its bytes pass; concurrent reads or writes on one direction of one
-connection can each pass the lease by their own size, which is then counted
-as used; a lease taken before a `Reset` passes its rest in no period, at most
-one lease per direction; and a change of `SetSteps` applies from each
-connection's next lease. `Close` gives back what a lease did not use.
+many bytes without asking the Budget again; with less than 16 KiB of its
+lease left, a read or write leases more first, so that it is not split.
+While a step's `Limit` applies, or while a Budget with an expiry reads a
+clock of `SetClock`, the wrapper charges the Budget at every read and write
+instead, and leases again once a change, such as a `Reset`, ends that.
+Leased bytes count as used when leased, so connections that share a Budget
+never pass its stop together, and `Used` and `Remaining` leave out what the
+leases hold unused, so they report the bytes that passed. A Budget takes
+back what the other connections' leases hold unused before it refuses
+bytes, so any one connection can use it up to its stop.
+
+`Reset`, `SetUsed`, `SetSteps`, `SetExpiry` and the expiry itself take
+every lease back at once: the next read or write leases under the change,
+and what passes after a `Reset` counts in the new period. The bounds that
+remain:
+
+- a read counts what arrived after it, so concurrent reads on one
+  direction of a connection, and a read in progress when its lease is taken
+  back, can pass the lease by what each reads, which then counts as used;
+- a write that fails or is cut short just as its lease is taken back by one
+  of these changes keeps its unsent bytes charged;
+- the expiry takes leases back when its timer fires, so a read or write
+  already admitted then completes;
+- `OnStep` reports a step when a lease reaches it, before its bytes pass,
+  and a step applies from its `After` in each connection's leases.
+
+`Close` gives back what a lease did not use; a wrapper dropped without
+`Close` gives it back once the garbage collector finds it.
 
 `Reset`, `SetUsed` and `SetSteps` take effect from the next read or write,
 without ending connections; a slowed connection gets its full speed back
@@ -400,20 +424,3 @@ data; a change of limit applies from the next chunk. Other copies go through
 `Rate`, `Budget` and `Counter` work inside `testing/synctest` bubbles, on the
 bubble's clock. Create them inside the bubble that uses them. A `Counter`
 and a `Budget` also take a clock of their own with `SetClock`.
-
-## Changes from earlier versions
-
-- `NewDuplexConn`, `NewDatagramConn`, `NewDuplexDatagramConn`,
-  `NewDuplexPacketConn`, `NewReadWriteCloser` and `NewDuplexReadWriteCloser`
-  became options of `NewConn`, `NewPacketConn` and `NewStream`:
-  `WithLimiters`, `WithDatagram`. The wrappers always wrap, so that they
-  count, and return their own types, with `SetLimiters` and `Meter`.
-- `Group.OpenDatagram` and `OpenReadWriteCloser` are `Open` with
-  `WithDatagram` and `OpenStream`; `SetReadLimiter`, `SetWriteLimiter`,
-  `ReadLimiter` and `WriteLimiter` are `SetLimiters` and `Limiters`.
-- `Rate.Throughput` is gone: throughput is a Counter's, which a connection
-  feeds through `WithCounter` and a Group through its `Traffic`, without a
-  charge per read and write.
-- `Counter.Reads` and `Counter.Writes`, views that counted through the
-  limiter path, are superseded by `WithCounter` and `Attach` for wrappers and
-  `Add` for code of one's own.

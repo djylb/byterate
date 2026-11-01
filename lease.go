@@ -1,6 +1,7 @@
 package byterate
 
 import (
+	"errors"
 	"sync"
 	"sync/atomic"
 )
@@ -8,16 +9,18 @@ import (
 // Lease is a part of a Budget's usage taken ahead of the traffic: Budget.Lease
 // adds its Bytes to the usage at once, the holder passes up to that many
 // bytes without asking the Budget again, and Return or Settle gives back what
-// it did not use. A Lease taken before a Reset or SetUsed gives back nothing,
-// as the period it was taken in is over.
+// it did not use. A Lease belongs to the period it was taken in: once a
+// Reset or SetUsed ends that period, Return and Settle change nothing.
 type Lease struct {
 	// Bytes is the number of bytes the lease allows.
-	Bytes  int64
-	period uint64
+	Bytes int64
+	per   *budgetPeriod
 }
 
 // The wrappers lease about half of what a Budget has left, within these
-// bounds, so that leases shrink as the Budget runs out.
+// bounds, so that leases shrink as the Budget runs out. A Read or Write
+// with less credit left than minLease leases more first, so that small
+// remainders do not split the I/O.
 const (
 	minLease = int64(16 << 10)
 	maxLease = int64(1 << 20)
@@ -31,28 +34,38 @@ const (
 // nothing.
 //
 // Leased bytes count as used from the moment they are leased, so that the
-// holders of leases together never take the usage past a Stop: a Budget
-// shared by many connections is overshot by nothing, and the bytes that open
-// leases hold are only kept from the other holders until given back. OnStep
-// reports a step when a lease reaches it, before its bytes pass. Leases
-// never span a step, so a step's Limit applies from its After.
+// holders of leases together never take the usage past a Stop. Before it
+// refuses, b takes back what the wrappers' leases hold unused, so that the
+// bytes they hold never keep anyone else from the Budget. OnStep reports a
+// step when a lease reaches it, before its bytes pass. Leases never span a
+// step, so a step's Limit applies from its After.
 //
 // The wrappers of this package lease from the Budgets among their levels by
-// themselves, and Used and Remaining leave out what their leases hold unused.
+// themselves, and Used and Remaining leave out what their leases hold
+// unused. Reset, SetUsed, SetSteps, SetExpiry and the expiry itself take
+// those leases back at once; a Lease taken here stays with its holder.
 func (b *Budget) Lease(n int64) (Lease, error) {
 	if b.expired() {
 		return Lease{}, ErrBudgetExhausted
 	}
-	l, set, from, err := b.lease(n)
-	if err == nil && b != nil {
+	if b == nil || n <= 0 {
+		l, _, _, err := b.leaseLocked(n, nil)
+		return l, err
+	}
+	b.lessees.mu.Lock()
+	l, set, from, err := b.leaseLocked(n, nil)
+	b.lessees.mu.Unlock()
+	if err == nil {
 		b.report(set, from, addSat(from, l.Bytes))
 	}
 	return l, err
 }
 
-// lease is Lease without the check of the expiry, which reads the Clock,
-// and the OnStep report, which it returns the arguments of.
-func (b *Budget) lease(n int64) (Lease, *budgetSteps, int64, error) {
+// leaseLocked is Lease without the check of the expiry, which reads the
+// Clock, and the OnStep report, which it returns the arguments of. Refused,
+// it takes back the unused bytes of the wrappers' leases other than self
+// and tries once more. b.lessees.mu must be held.
+func (b *Budget) leaseLocked(n int64, self *budgetLease) (Lease, *budgetSteps, int64, error) {
 	if n <= 0 {
 		return Lease{}, nil, 0, nil
 	}
@@ -60,18 +73,28 @@ func (b *Budget) lease(n int64) (Lease, *budgetSteps, int64, error) {
 		return Lease{Bytes: n}, nil, 0, nil
 	}
 	set := b.stepSet()
-	period := b.period.Load()
+	p := b.per()
+	reclaimed := false
 	for {
-		used := b.used.Load()
+		used := p.used.Load()
+		var err error
 		if used >= set.stopAt {
-			return Lease{}, nil, 0, ErrBudgetExhausted
+			err = ErrBudgetExhausted
+		} else if _, s := set.at(used); s != nil && s.Limit != nil {
+			err = ErrWouldWait
 		}
-		if _, s := set.at(used); s != nil && s.Limit != nil {
-			return Lease{}, nil, 0, ErrWouldWait
+		if err != nil {
+			if !reclaimed {
+				reclaimed = true
+				if b.reclaimLocked(p, self) > 0 {
+					continue
+				}
+			}
+			return Lease{}, nil, 0, err
 		}
 		take := min(n, set.stopAt-used, set.nextAfter(used)-used)
-		if b.used.CompareAndSwap(used, used+take) {
-			return Lease{Bytes: take, period: period}, set, used, nil
+		if p.used.CompareAndSwap(used, used+take) {
+			return Lease{Bytes: take, per: p}, set, used, nil
 		}
 	}
 }
@@ -89,106 +112,223 @@ func (set *budgetSteps) nextAfter(used int64) int64 {
 // Return gives back n unused bytes of l to b's usage, at most l.Bytes,
 // unless a Reset or SetUsed since ended the period l was taken in.
 func (b *Budget) Return(l Lease, n int64) {
-	if b == nil || n <= 0 {
+	if b == nil || n <= 0 || l.per == nil {
 		return
 	}
-	b.release(min(n, l.Bytes), l.period)
+	l.per.sub(min(n, l.Bytes))
 }
 
 // Settle ends l after used of its bytes were transferred, giving back the
 // rest as Return does. A used beyond l.Bytes, such as the overshoot of
-// concurrent transfers that shared the lease, is added to the usage.
+// concurrent transfers that shared the lease, is added to the usage of l's
+// period.
 func (b *Budget) Settle(l Lease, used int64) {
-	if b == nil {
+	if b == nil || l.per == nil {
 		return
 	}
 	used = max(used, 0)
 	if used > l.Bytes {
-		if b.period.Load() == l.period {
-			b.add(used - l.Bytes)
-		}
+		l.per.add(used - l.Bytes)
 		return
 	}
 	b.Return(l, l.Bytes-used)
 }
 
-// budgetLease is what a wrapper's direction holds of one Budget: the leases
-// of the current period, added up.
+// budgetLease is what a wrapper's direction holds of one Budget. Every byte
+// the direction counted up to end is accounted for in the Budget: leased
+// ahead, or charged once it passed. The bytes from the count to end are
+// leased in per and unused; bytes counted past end, by I/O that a change
+// overtook, are charged by the next lease or settlement.
 type budgetLease struct {
-	b     *Budget
-	total *atomic.Int64 // the direction's count of bytes
-	end   atomic.Int64  // the count at which the leases run out
-	held  Lease         // the leases of the period, under b.lessees.mu
-	base  int64         // the count when the period's first lease was taken
+	b   *Budget
+	set *leaseSet    // the direction's leases, whose end follows this one's
+	end atomic.Int64 // written under b.lessees.mu
+	// Under b.lessees.mu: the period of the unused bytes, nil for none,
+	// and whether the Budget is charged as a Limiter instead, while a
+	// step's Limit applies, which leaves end out of use.
+	per     *budgetPeriod
+	charged bool
 }
 
-// unused returns the bytes l holds and has not passed, negative for bytes
-// passed past it, of b's period. b.lessees.mu must be held.
-func (l *budgetLease) unused() int64 {
-	if l.held.Bytes == 0 || l.held.period != l.b.period.Load() {
-		return 0
-	}
-	return l.end.Load() - l.total.Load()
-}
+// total returns the count of the direction's bytes, as leases see it.
+func (l *budgetLease) total() int64 { return l.set.side.total.Load() }
 
-// lessees are the budgetLeases that hold leases of a Budget, for Used and
-// Remaining to leave out their unused bytes.
+// settled records, after reading the count, that l's lease was settled
+// against it and left its period, so that a write that reserved bytes in
+// the count before keeps them counted: they were taken as passed.
+func (l *budgetLease) settled() { l.set.side.resets.Add(1) }
+
+// lessees are the budgetLeases of a Budget's wrappers, for Used and
+// Remaining to leave out their unused bytes and for changes of the Budget
+// to take them back.
 type lessees struct {
 	mu sync.Mutex
 	m  map[*budgetLease]struct{}
 	n  atomic.Int32
 }
 
-// usedExact returns the usage less what the wrappers' leases hold unused.
+// usedExact returns the usage less what the wrappers' leases hold unused,
+// plus what they passed beyond them and is not charged yet.
 func (b *Budget) usedExact() int64 {
+	p := b.per()
 	if b.lessees.n.Load() == 0 {
-		return b.used.Load()
+		return p.used.Load()
 	}
 	b.lessees.mu.Lock()
 	defer b.lessees.mu.Unlock()
-	n := b.used.Load()
+	p = b.per()
+	n := p.used.Load()
 	for l := range b.lessees.m {
-		n -= l.unused()
+		if !l.charged && (l.per == p || l.per == nil) {
+			n -= l.end.Load() - l.total()
+		}
 	}
 	return max(n, 0)
 }
 
-// leaseSet is a direction's leases, of each of its Budgets.
-type leaseSet struct {
-	end atomic.Int64 // the count at which the first lease runs out, maxI64 without
-	mu  sync.Mutex
-	ls  []*budgetLease
+// reclaimLocked takes back the unused bytes of the leases of p other than
+// self and returns how many. b.lessees.mu must be held.
+func (b *Budget) reclaimLocked(p *budgetPeriod, self *budgetLease) int64 {
+	var got int64
+	for l := range b.lessees.m {
+		if l == self || l.charged || l.per != p {
+			continue
+		}
+		if u := l.cut(); u > 0 {
+			p.sub(u)
+			got += u
+		}
+	}
+	return got
 }
 
-// set makes bs the Budgets that lease to the direction counted in total,
-// keeping the leases of those it already had and settling the others.
-func (s *leaseSet) set(bs []*Budget, total *atomic.Int64) {
+// cut lowers l's end to its direction's count, and returns the unused bytes
+// it took. A write counts its bytes before it checks the end once more, so
+// cut looks at the count again after lowering the end: if it moved, a write
+// may have checked the old end, and cut keeps what that write counted. A
+// read counts after it passed, so one in progress can still pass the new
+// end by what it reads. b.lessees.mu must be held.
+func (l *budgetLease) cut() int64 {
+	e := l.end.Load()
+	for {
+		t := l.total()
+		if t >= e {
+			l.end.Store(e)
+			return 0
+		}
+		l.end.Store(t)
+		l.set.lower(t)
+		if l.total() == t {
+			return e - t
+		}
+	}
+}
+
+// reclaim takes back the unused bytes of the wrappers' leases and reports
+// whether there were any, for a charge that b would refuse otherwise.
+func (b *Budget) reclaim() bool {
+	if b.lessees.n.Load() == 0 {
+		return false
+	}
+	b.lessees.mu.Lock()
+	defer b.lessees.mu.Unlock()
+	return b.reclaimLocked(b.per(), nil) > 0
+}
+
+// revokeLocked takes back the wrappers' leases, so that their next I/O
+// leases again under what b is now, and makes the directions that charge b
+// as a Limiter look again whether they may lease. b.lessees.mu must be
+// held.
+func (b *Budget) revokeLocked() {
+	for l := range b.lessees.m {
+		if !l.charged {
+			if u := l.cut(); l.per != nil && u > 0 {
+				l.per.sub(u)
+			}
+			l.per = nil
+			l.settled()
+			// The next I/O leases again, under what b is now.
+			l.set.lower(min(l.end.Load(), l.total()))
+		}
+		l.set.recheck.Store(true)
+	}
+}
+
+// revoke is revokeLocked under b.lessees.mu.
+func (b *Budget) revoke() {
+	b.lessees.mu.Lock()
+	defer b.lessees.mu.Unlock()
+	b.revokeLocked()
+}
+
+// settleLocked gives back what l holds unused and charges what its
+// direction passed beyond it, in b's period. b.lessees.mu must be held.
+func (l *budgetLease) settleLocked() {
+	t, e := l.total(), l.end.Load()
+	defer l.settled()
+	switch {
+	case l.per != nil && e > t:
+		l.per.sub(e - t)
+	case e < t:
+		l.b.per().add(t - e)
+	}
+	l.end.Store(t)
+	l.per = nil
+}
+
+// leaseSet is a direction's leases, of each of its Budgets.
+type leaseSet struct {
+	side *meterSide // the direction's count, and the end of its leases
+	// recheck is set when a Budget that the direction charges as a
+	// Limiter changes, for the direction to lease from it again.
+	recheck atomic.Bool
+	mu      sync.Mutex
+	ls      []*budgetLease
+}
+
+// set makes bs the Budgets that lease to the direction, and charged those
+// that it charges as Limiters, keeping the leases of those it already had
+// and settling the others.
+func (s *leaseSet) set(bs, charged []*Budget) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	keep := make([]*budgetLease, 0, len(bs))
-	for _, b := range bs {
+	keep := make([]*budgetLease, 0, len(bs)+len(charged))
+	for i, b := range append(bs[:len(bs):len(bs)], charged...) {
 		var found *budgetLease
 		for _, l := range s.ls {
 			if l.b == b {
 				found = l
 			}
 		}
+		if containsLease(keep, found) {
+			continue
+		}
+		b.lessees.mu.Lock()
 		if found == nil {
-			found = &budgetLease{b: b, total: total}
-			found.end.Store(total.Load())
-			b.lessees.mu.Lock()
+			found = &budgetLease{b: b, set: s}
+			found.end.Store(found.total())
+			found.settled()
 			if b.lessees.m == nil {
 				b.lessees.m = make(map[*budgetLease]struct{})
 			}
 			b.lessees.m[found] = struct{}{}
 			b.lessees.n.Store(int32(len(b.lessees.m)))
-			b.lessees.mu.Unlock()
 		}
+		switch c := i >= len(bs); {
+		case c && !found.charged:
+			found.settleLocked()
+		case !c && found.charged:
+			// What passed while b was charged as a Limiter is charged.
+			found.end.Store(found.total())
+			found.settled()
+		}
+		found.charged = i >= len(bs)
+		b.lessees.mu.Unlock()
 		keep = append(keep, found)
 	}
 	for _, l := range s.ls {
 		if !containsLease(keep, l) {
-			l.settle()
+			l.release()
 		}
 	}
 	s.ls = keep
@@ -204,31 +344,59 @@ func containsLease(ls []*budgetLease, l *budgetLease) bool {
 	return false
 }
 
-// settle gives back what l holds unused and stops counting it as a lessee.
-func (l *budgetLease) settle() {
+// release settles l and stops counting it as a lessee.
+func (l *budgetLease) release() {
 	b := l.b
 	b.lessees.mu.Lock()
 	defer b.lessees.mu.Unlock()
-	if l.held.Bytes > 0 {
-		b.Settle(l.held, l.total.Load()-l.base)
+	if !l.charged {
+		l.settleLocked()
 	}
-	l.held = Lease{}
 	delete(b.lessees.m, l)
 	b.lessees.n.Store(int32(len(b.lessees.m)))
 }
 
-// recompute sets s.end from its leases. s.mu must be held.
-func (s *leaseSet) recompute() {
-	end := maxI64
-	for _, l := range s.ls {
-		end = min(end, l.end.Load())
+// lower lowers the end of s's leases to at most e, for a lease that a
+// Budget took back.
+func (s *leaseSet) lower(e int64) {
+	for {
+		cur := s.side.end.Load()
+		if cur <= e || s.side.end.CompareAndSwap(cur, e) {
+			return
+		}
 	}
-	s.end.Store(end)
 }
 
-// refill leases more from each Budget whose leases cover fewer than need
-// bytes past total. On a refusal it returns the Budget and its error.
-func (s *leaseSet) refill(total *atomic.Int64, need int64) (*Budget, error) {
+// recompute sets the end of s's leases from them. A Budget that lowers a
+// lease's end meanwhile lowers s's after it, and recompute looks again
+// after storing, so that the end it stores never stays above a lease's.
+// s.mu must be held.
+func (s *leaseSet) recompute() {
+	for {
+		end := s.minEnd()
+		s.side.end.Store(end)
+		if s.minEnd() >= end {
+			return
+		}
+	}
+}
+
+// minEnd returns the least end of s's leases, maxI64 for none. s.mu must
+// be held.
+func (s *leaseSet) minEnd() int64 {
+	end := maxI64
+	for _, l := range s.ls {
+		if !l.charged {
+			end = min(end, l.end.Load())
+		}
+	}
+	return end
+}
+
+// refill leases more from each Budget whose leases cover fewer than want
+// bytes past the count, and returns once they cover at least need. On a
+// refusal before that it returns the Budget and its error.
+func (s *leaseSet) refill(want, need int64) (*Budget, error) {
 	var reports []stepReport
 	defer func() {
 		// OnStep runs under no lock.
@@ -240,14 +408,20 @@ func (s *leaseSet) refill(total *atomic.Int64, need int64) (*Budget, error) {
 	defer s.mu.Unlock()
 	defer s.recompute()
 	for _, l := range s.ls {
+		if l.charged {
+			continue
+		}
 		for {
-			t := total.Load()
-			short := need - (l.end.Load() - t)
-			if short <= 0 {
+			t := l.total()
+			credit := l.end.Load() - t
+			if credit >= want {
 				break
 			}
-			r, err := l.extend(t, short)
+			r, err := l.extend(t, want-credit)
 			if err != nil {
+				if credit >= need {
+					break // what is left serves this I/O
+				}
 				return l.b, err
 			}
 			reports = append(reports, r)
@@ -264,26 +438,39 @@ type stepReport struct {
 }
 
 // extend leases at least short more bytes, as far as the Budget has them,
-// at the count t, and returns the OnStep report to make.
+// at the count t, and returns the OnStep report to make. A Budget whose
+// expiry only its Clock can tell refuses with ErrWouldWait, so that it is
+// charged, and its expiry checked, at every read and write.
 func (l *budgetLease) extend(t, short int64) (stepReport, error) {
 	b := l.b
-	if b.expired() {
-		return stepReport{}, ErrBudgetExhausted
-	}
-	size := max(short, min(max(subSat(b.stepSet().stopAt, b.used.Load())/2, minLease), maxLease))
+	expired := b.expired()
 	b.lessees.mu.Lock()
-	got, set, from, err := b.lease(size)
+	defer b.lessees.mu.Unlock()
+	if !expired && b.clock.Load() != nil && b.expiry.Load() != nil {
+		return stepReport{}, ErrWouldWait
+	}
+	var (
+		got  Lease
+		set  *budgetSteps
+		from int64
+		err  = ErrBudgetExhausted
+	)
+	if !expired {
+		left := subSat(b.stepSet().stopAt, b.per().used.Load())
+		size := max(short, min(max(left/2, minLease), maxLease))
+		got, set, from, err = b.leaseLocked(size, l)
+	}
 	if err == nil {
-		if l.held.Bytes == 0 || got.period != l.held.period {
-			// The first lease of a period: what was left of the last one
-			// went with it.
-			l.held, l.base = got, t
-			l.end.Store(t + got.Bytes)
-		} else {
-			l.held.Bytes += got.Bytes
-			l.end.Add(got.Bytes)
+		l.per = got.per
+		l.end.Add(got.Bytes)
+		return stepReport{b: b, set: set, from: from, to: addSat(from, got.Bytes)}, nil
+	}
+	if errors.Is(err, ErrBudgetExhausted) {
+		// The bytes passed beyond the leases count all the same.
+		if e := l.end.Load(); e < t {
+			b.per().add(t - e)
+			l.end.Store(t)
 		}
 	}
-	b.lessees.mu.Unlock()
-	return stepReport{b: b, set: set, from: from, to: addSat(from, got.Bytes)}, err
+	return stepReport{}, err
 }

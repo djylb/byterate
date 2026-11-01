@@ -10,8 +10,9 @@ import (
 var ErrWouldWait = errors.New("byterate: limit would wait")
 
 // Limiter charges and refunds byte budgets. *Rate, *Budget, *Switch, the
-// result of NewHierarchy and the Reads and Writes of a Group implement it, and the connection wrappers take any implementation.
-// Most code combines those and never implements Limiter itself.
+// result of NewHierarchy and the Reads and Writes of a Group implement it,
+// and the connection wrappers take any implementation. Most code combines
+// those and never implements Limiter itself.
 //
 // A transfer is charged one of three ways. Wait charges the bytes before they
 // are sent and blocks until the limit allows them, as a Write does. TryWait

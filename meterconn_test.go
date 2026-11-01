@@ -136,11 +136,11 @@ func TestConnBudgetCloseReturnsLease(t *testing.T) {
 	b := stopAfter(10 << 20)
 	c := NewConn(&recordingConn{}, WithLimiter(b))
 	_, _ = c.Write(make([]byte, 10))
-	if raw := b.used.Load(); raw <= 10 {
+	if raw := b.per().used.Load(); raw <= 10 {
 		t.Fatalf("raw usage %d, want a lease taken ahead", raw)
 	}
 	_ = c.Close()
-	if raw := b.used.Load(); raw != 10 {
+	if raw := b.per().used.Load(); raw != 10 {
 		t.Fatalf("raw usage after Close = %d, want 10", raw)
 	}
 }
@@ -266,19 +266,26 @@ func (*scriptedPacketConn) Close() error { return nil }
 
 // The fast and the limited paths, alone and together, give the same
 // results: what arrives, what each Meter, Counter, Group and Budget counts,
-// also when the limit changes mid-transfer and through the zero-copy paths
-// between sockets.
+// also when the limit changes mid-transfer, when the Budget takes its
+// leases back and lends them to another connection meanwhile, and through
+// the zero-copy paths between sockets.
 func TestConnFeatureCombinations(t *testing.T) {
 	const size = 1<<20 + 12345
 	for _, limited := range []bool{false, true} {
 		for _, budget := range []bool{false, true} {
 			for _, group := range []bool{false, true} {
 				for _, swap := range []bool{false, true} {
-					for _, how := range []string{"Write", "ReadFrom", "WriteTo"} {
-						name := fmt.Sprintf("limited=%v/budget=%v/group=%v/swap=%v/%s", limited, budget, group, swap, how)
-						t.Run(name, func(t *testing.T) {
-							combination(t, size, limited, budget, group, swap, how)
-						})
+					for _, revoke := range []bool{false, true} {
+						if revoke && !budget {
+							continue
+						}
+						for _, how := range []string{"Write", "ReadFrom", "WriteTo"} {
+							name := fmt.Sprintf("limited=%v/budget=%v/group=%v/swap=%v/revoke=%v/%s",
+								limited, budget, group, swap, revoke, how)
+							t.Run(name, func(t *testing.T) {
+								combination(t, size, limited, budget, group, swap, revoke, how)
+							})
+						}
 					}
 				}
 			}
@@ -286,7 +293,7 @@ func TestConnFeatureCombinations(t *testing.T) {
 	}
 }
 
-func combination(t *testing.T, size int, limited, budget, group, swap bool, how string) {
+func combination(t *testing.T, size int, limited, budget, group, swap, revoke bool, how string) {
 	client, server := tcpPair(t)
 	var levels []Limiter
 	if limited {
@@ -317,6 +324,28 @@ func combination(t *testing.T, size int, limited, budget, group, swap bool, how 
 		got <- b
 	}()
 	var swapper sync.WaitGroup
+	other := int64(0) // what another connection of the Budget wrote
+	if revoke {
+		// Another connection takes leases of the Budget, which takes them
+		// back, and those of c, at every change of its steps and expiry.
+		o := NewConn(&recordingConn{}, WithLimiter(b))
+		defer func() { _ = o.Close() }()
+		swapper.Go(func() {
+			steps := b.Steps()
+			for i := range 200 {
+				switch i % 3 {
+				case 0:
+					b.SetSteps(steps...)
+				case 1:
+					b.SetExpiry(time.Now().Add(time.Hour))
+				default:
+					b.SetExpiry(time.Time{})
+				}
+				m, _ := o.Write(make([]byte, 100))
+				other += int64(m)
+			}
+		})
+	}
 	if swap {
 		swapper.Go(func() {
 			for i := range 20 {
@@ -396,8 +425,8 @@ func combination(t *testing.T, size int, limited, budget, group, swap bool, how 
 		}
 	}
 	_ = c.Close()
-	if b != nil && b.Used() != int64(size) {
-		t.Fatalf("Budget used %d, want %d", b.Used(), size)
+	if b != nil && b.Used() != int64(size)+other {
+		t.Fatalf("Budget used %d, want %d", b.Used(), int64(size)+other)
 	}
 }
 
@@ -483,8 +512,8 @@ func TestConnCloseLeavesNothing(t *testing.T) {
 	if traffic.nsrc.Load() != 0 || b.lessees.n.Load() != 0 {
 		t.Fatalf("%d Meters attached, %d lessees left", traffic.nsrc.Load(), b.lessees.n.Load())
 	}
-	if b.used.Load() != 50_000 {
-		t.Fatalf("raw usage %d, want the 50000 B written and no lease kept", b.used.Load())
+	if b.per().used.Load() != 50_000 {
+		t.Fatalf("raw usage %d, want the 50000 B written and no lease kept", b.per().used.Load())
 	}
 	deadline := time.Now().Add(5 * time.Second)
 	for runtime.NumGoroutine() > before && time.Now().Before(deadline) {

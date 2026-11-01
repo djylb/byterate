@@ -8,6 +8,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"unsafe"
+	"weak"
 )
 
 var (
@@ -76,6 +77,10 @@ type groupLinks struct {
 	// the Group or an ancestor changes, so that charges walk no tree and
 	// allocate nothing.
 	cache atomic.Pointer[groupLevels]
+	// The wrappers opened in the Group and its descendants, and their
+	// Meters, under configMu: the Group's own record of them, as Traffic
+	// may be shared with other Groups or wrappers.
+	members map[weak.Pointer[rateConn]]*Meter
 }
 
 // groupSlots are the fields of a Group that Acquire and Release write.
@@ -167,15 +172,19 @@ func (g *Group) SetParent(p *Group) error {
 	g.parent.Store(p)
 	// The wrappers below g count in the new ancestors from now on, and the
 	// bytes they counted stay with the old ones.
-	ms := g.Traffic().meters()
 	for a := old; a != nil; a = a.parent.Load() {
-		for _, m := range ms {
+		for k, m := range g.members {
 			a.Traffic().Detach(m)
+			delete(a.members, k)
 		}
 	}
 	for a := p; a != nil; a = a.parent.Load() {
-		for _, m := range ms {
+		for k, m := range g.members {
 			a.Traffic().Attach(m)
+			if a.members == nil {
+				a.members = make(map[weak.Pointer[rateConn]]*Meter)
+			}
+			a.members[k] = m
 		}
 	}
 	g.update()
@@ -286,7 +295,11 @@ func (g *Group) SetTraffic(c *Counter) {
 	configMu.Lock()
 	defer configMu.Unlock()
 	old := g.Traffic()
-	for _, m := range old.meters() {
+	if old == c {
+		return
+	}
+	// Only the wrappers of g's subtree move; others that share old stay.
+	for _, m := range g.members {
 		old.Detach(m)
 		c.Attach(m)
 	}
@@ -576,15 +589,20 @@ func (g *Group) acquireFor(ctx context.Context) error {
 // update gives the wrappers opened in g and its descendants the Limiters
 // of their levels as they are now. configMu must be held.
 func (g *Group) update() {
-	for _, m := range g.Traffic().meters() {
-		if m.owner != nil && m.owner.group != nil {
-			m.owner.applyLocked()
+	for k := range g.members {
+		if s := k.Value(); s != nil {
+			s.applyLocked()
 		}
 	}
 }
 
 // groupLevels are the levels of both directions of a Group, as built from
 // the Groups of chain.
+//
+// A Group counts in two ways on purpose: the wrappers opened in it add their
+// Meters to each level's Traffic, which costs their reads and writes nothing,
+// while the hook-style relays that charge Reads and Writes have no Meter and
+// count through the Counter views among these levels.
 type groupLevels struct {
 	chain       []groupStamp
 	read, write hierarchy

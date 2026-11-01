@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+	"weak"
 )
 
 // spliceSockets reports whether the ReadFrom of a socket splices from
@@ -48,8 +49,8 @@ func WithLimiters(read, write Limiter) Option {
 	return Option{read: read, write: write, limiters: true}
 }
 
-// WithCounter adds the bytes of the wrapper to c, as Counter.Attach does, until
-// it is closed. It may be given more than once.
+// WithCounter adds the bytes of the wrapper to c, as Counter.Attach does,
+// until it is closed. It may be given more than once.
 func WithCounter(c *Counter) Option { return Option{counters: []*Counter{c}} }
 
 // WithDatagram treats every Read and Write as one whole message, which is
@@ -100,12 +101,38 @@ func mergeOptions(opts []Option) options {
 // of its own, so counting costs an uncontended atomic add. Counter.Attach
 // adds a Meter's bytes to a Counter shared by many wrappers without any
 // cost to their reads and writes.
+//
+// A wrapper's Meter, with its leases, is kept apart from the wrapper, so
+// that the Counters and Budgets that hold it do not keep the wrapper: one
+// that is dropped without Close is settled once it is collected.
 type Meter struct {
-	read    atomic.Int64
-	_       [cacheLineSize - 8]byte
-	written atomic.Int64
-	_       [cacheLineSize - 8]byte
-	owner   *rateConn // the wrapper, for its Group to update it
+	read    meterSide
+	written meterSide
+	leases  [2]leaseSet // of reads and writes
+}
+
+// meterSide is the count of one direction of a Meter and the count at which
+// the direction's leases run out, maxI64 without any, on a cache line of
+// their own.
+type meterSide struct {
+	total atomic.Int64
+	end   atomic.Int64
+	// resets counts the settlements of the direction's leases against
+	// total that end their periods, and unsent the bytes that writes
+	// reserved in total and did not send.
+	resets atomic.Uint64
+	unsent atomic.Int64
+	_      [cacheLineSize - 32]byte
+}
+
+// newMeter returns the Meter of a wrapper, without leases.
+func newMeter() *Meter {
+	m := &Meter{}
+	for i, side := range [2]*meterSide{&m.read, &m.written} {
+		side.end.Store(maxI64)
+		m.leases[i].side = side
+	}
+	return m
 }
 
 // Total returns the bytes read and written so far.
@@ -113,26 +140,42 @@ func (m *Meter) Total() (read, written int64) {
 	if m == nil {
 		return 0, 0
 	}
-	return m.read.Load(), m.written.Load()
+	return m.read.count(), m.written.count()
+}
+
+// count returns the bytes of the direction.
+func (s *meterSide) count() int64 {
+	// unsent first, so that a write that moves its bytes to unsent
+	// meanwhile is not left out twice.
+	u := s.unsent.Load()
+	return s.total.Load() - u
 }
 
 // rateConn is the core of every wrapper: it counts the bytes of each
 // direction in its Meter, and charges them to the direction's limiter and
 // leases while it has any.
 type rateConn struct {
-	meter       Meter
+	meter       *Meter
 	r           io.Reader // nil for a wrapper of writes alone
 	w           io.Writer // nil for a wrapper of reads alone
 	c           io.Closer // what Close closes, if anything
 	read, write direction
 	datagram    bool // every Read and Write carries one whole message
-	closed      atomic.Bool
 
-	// Under configMu: the Limiters of the wrapper's own, its Group and
-	// the Counters it was attached to by WithCounter.
-	own      [2]Limiter
+	own     [2]Limiter // the wrapper's own Limiters, under configMu
+	reg     *connReg
+	cleanup runtime.Cleanup // runs reg.finish if the wrapper is dropped
+}
+
+// connReg is where a wrapper is registered: its Meter in Counters, and its
+// Group. It holds no reference to the wrapper, so that it can settle the
+// wrapper's accounts once a wrapper dropped without Close is collected.
+type connReg struct {
+	meter    *Meter
+	counters []*Counter // given by WithCounter
 	group    *Group
-	counters []*Counter
+	key      weak.Pointer[rateConn] // the wrapper in its Group's members
+	done     atomic.Bool
 }
 
 // Direction states: with none set, a direction passes its I/O straight
@@ -145,27 +188,26 @@ const (
 // direction holds the limiting of one direction of a rateConn.
 type direction struct {
 	state  atomic.Uint32
-	total  *atomic.Int64 // the Meter's count of the direction
-	sw     Switch        // the limiter, replaced by apply
-	lim    target        // sw, prepared for charging
-	cancel waitCancel    // ended by Close and the deadlines
-	timer  waitTimer     // reused by the waits of every Rate it charges
+	side   *meterSide // the Meter's count of the direction, and leases' end
+	sw     Switch     // the limiter, replaced by apply
+	lim    target     // sw, prepared for charging
+	cancel waitCancel // ended by Close and the deadlines
+	timer  waitTimer  // reused by the waits of every Rate it charges
 	// writing holds a token while a limited Write sends its grants, so
 	// that the grants of concurrent Writes do not interleave, as the
 	// writes of a *net.TCPConn do not. Made for the writes of a stream.
 	writing chan struct{}
-	leases  leaseSet
+	leases  *leaseSet // in the Meter
 	// src is the Limiter apply was given; charged lists the Budgets taken
 	// out of leasing because a step's Limit applies. Under configMu.
 	src     Limiter
 	charged []*Budget
 }
 
-func (d *direction) init(total *atomic.Int64) {
-	d.total = total
+func (d *direction) init(side *meterSide, leases *leaseSet) {
+	d.side, d.leases = side, leases
 	d.lim.init(&d.sw)
 	d.cancel.init()
-	d.leases.end.Store(maxI64)
 }
 
 // SetLimiters replaces the Limiters of the wrapper's reads and writes, as
@@ -180,13 +222,13 @@ func (s *rateConn) SetLimiters(read, write Limiter) {
 }
 
 // Meter returns the Meter of the wrapper's bytes.
-func (s *rateConn) Meter() *Meter { return &s.meter }
+func (s *rateConn) Meter() *Meter { return s.meter }
 
 // applyLocked gives each direction its Limiter: its own, within those of
 // its Group's levels. configMu must be held.
 func (s *rateConn) applyLocked() {
 	read, write := s.own[0], s.own[1]
-	for a := s.group; a != nil; a = a.parent.Load() {
+	for a := s.reg.group; a != nil; a = a.parent.Load() {
 		read, write = NewHierarchy(read, a.readLimiter()), NewHierarchy(write, a.writeLimiter())
 	}
 	s.read.apply(read)
@@ -211,7 +253,7 @@ func (d *direction) apply(l Limiter) {
 		}
 		rest.add(lv.l)
 	}
-	d.leases.set(lease, d.total)
+	d.leases.set(lease, d.charged)
 	lim := Limiter(nil)
 	switch len(rest.lv) + len(rest.views) {
 	case 0:
@@ -244,6 +286,22 @@ func (d *direction) charge(b *Budget) {
 	defer configMu.Unlock()
 	if !containsBudget(d.charged, b) {
 		d.charged = append(d.charged, b)
+		d.apply(d.src)
+	}
+}
+
+// recheck gives the Budgets that the direction charges as Limiters back to
+// its leases once one of them changed, such as by a Reset that left the
+// step whose Limit applied: the next lease finds out whether they may
+// lease again.
+func (d *direction) recheck() {
+	if !d.leases.recheck.Load() || !d.leases.recheck.Swap(false) {
+		return
+	}
+	configMu.Lock()
+	defer configMu.Unlock()
+	if len(d.charged) > 0 {
+		d.charged = nil
 		d.apply(d.src)
 	}
 }
@@ -285,19 +343,25 @@ func (h *hierarchy) levelLimiters() []Limiter {
 	return out
 }
 
-// finish settles the leases, takes the Meter out of the Counters and gives
-// back the Group's slot, once, when the wrapper is closed.
-func (s *rateConn) finish() {
+// finish settles the leases, takes the Meter out of the Counters and the
+// wrapper out of its Group and gives back the Group's slot, once: when the
+// wrapper is closed, or collected without being closed.
+func (r *connReg) finish() {
+	if !r.done.CompareAndSwap(false, true) {
+		return
+	}
 	configMu.Lock()
-	g := s.group
-	for _, c := range s.counters {
-		c.Detach(&s.meter)
+	g := r.group
+	for _, c := range r.counters {
+		c.Detach(r.meter)
 	}
 	for a := g; a != nil; a = a.parent.Load() {
-		a.Traffic().Detach(&s.meter)
+		a.Traffic().Detach(r.meter)
+		delete(a.members, r.key)
 	}
-	s.read.leases.set(nil, s.read.total)
-	s.write.leases.set(nil, s.write.total)
+	for i := range r.meter.leases {
+		r.meter.leases[i].set(nil, nil)
+	}
 	configMu.Unlock()
 	if g != nil {
 		g.Release()
@@ -418,29 +482,46 @@ func (d *direction) received(n int64, err error) error {
 }
 
 // allow returns how many of size bytes d's leases let pass now, all of
-// them when whole, leasing more where needed. With a step's Limit applying
-// to a Budget, it moves the Budget to d's limiter and returns errRecheck.
-func (d *direction) allow(size int64, whole bool) (int64, error) {
-	need := int64(1)
+// them when whole, leasing more where needed: up to minLease ahead, so that
+// a small credit left does not split the I/O, and at least one byte. With
+// rv, as for a write, it counts them at once and records them in rv, so
+// that neither another write nor a Budget taking back unused bytes can take
+// them; sentReserved corrects the count by what was not sent. With a step's
+// Limit applying to a Budget, it moves the Budget to d's limiter and
+// returns errRecheck.
+func (d *direction) allow(size int64, whole bool, rv *reservation) (int64, error) {
+	need, want := int64(1), min(size, minLease)
 	if whole {
-		need = size
+		need, want = size, size
 	}
 	for {
-		credit := d.leases.end.Load() - d.total.Load()
-		if credit >= need {
-			if whole {
-				return size, nil
+		resets := d.side.resets.Load()
+		t := d.side.total.Load()
+		if credit := d.side.end.Load() - t; credit >= want {
+			n := size
+			if !whole {
+				n = min(size, credit)
 			}
-			return min(size, credit), nil
+			if rv == nil {
+				return n, nil
+			}
+			if d.side.total.CompareAndSwap(t, t+n) {
+				*rv = reservation{n: n, resets: resets}
+				return n, nil
+			}
+			continue
 		}
-		b, err := d.leases.refill(d.total, need)
+		b, err := d.leases.refill(want, need)
+		if err == nil {
+			// The leases cover need now, if not want.
+			want = need
+			continue
+		}
 		if errors.Is(err, ErrWouldWait) {
 			d.charge(b)
 			return 0, errRecheck
 		}
-		if err != nil {
-			return 0, err
-		}
+		return 0, err
 	}
 }
 
@@ -450,7 +531,38 @@ var errRecheck = errors.New("byterate: direction changed")
 // count adds n bytes, if positive, to d's Meter.
 func (d *direction) count(n int64) {
 	if n > 0 {
-		d.total.Add(n)
+		d.side.total.Add(n)
+	}
+}
+
+// reservation is what allow counted ahead of a write: n bytes, when the
+// direction's leases had been reset resets times.
+type reservation struct {
+	n      int64
+	resets uint64
+}
+
+// sentReserved corrects d's Meter for a write of which rv reserved bytes
+// and m were sent, and with none reserved counts m.
+func (d *direction) sentReserved(rv reservation, m int64) {
+	if rv.n == 0 {
+		d.count(m)
+	} else if m = min(max(m, 0), rv.n); m != rv.n {
+		d.side.unreserve(rv.n-m, rv.resets)
+	}
+}
+
+// unreserve takes n bytes that a write reserved and did not send off the
+// count, reserved when the leases had been reset resets times. While the
+// leases stay in their periods, the bytes go back to them as unused. A
+// lease reset since then, which settled the count as it was, took them as
+// passed: they stay in the count that leases see, and charged, and go to
+// unsent, which the Meter leaves out, instead.
+func (s *meterSide) unreserve(n int64, resets uint64) {
+	s.total.Add(-n)
+	if s.resets.Load() != resets {
+		s.total.Add(n)
+		s.unsent.Add(n)
 	}
 }
 
@@ -460,7 +572,7 @@ func (s *rateConn) Read(b []byte) (int, error) {
 	}
 	d := &s.read
 	if st := d.state.Load(); st == 0 || len(b) == 0 ||
-		st == dirLeased && d.leases.end.Load()-d.total.Load() >= int64(len(b)) {
+		st == dirLeased && d.side.end.Load()-d.side.total.Load() >= int64(len(b)) {
 		n, err := s.r.Read(b)
 		d.count(int64(n))
 		return n, err
@@ -472,10 +584,11 @@ func (s *rateConn) Read(b []byte) (int, error) {
 func (s *rateConn) readSlow(b []byte) (int, error) {
 	d := &s.read
 	for {
+		d.recheck()
 		st := d.state.Load()
 		size := int64(len(b))
 		if st&dirLeased != 0 {
-			allowed, err := d.allow(size, false)
+			allowed, err := d.allow(size, false, nil)
 			if errors.Is(err, errRecheck) {
 				continue
 			}
@@ -506,12 +619,29 @@ func (s *rateConn) Write(b []byte) (int, error) {
 		return 0, ErrNilConn
 	}
 	d := &s.write
-	if st := d.state.Load(); st == 0 || len(b) == 0 ||
-		st == dirLeased && d.leases.end.Load()-d.total.Load() >= int64(len(b)) {
-		// No limit, or leases that cover the write.
+	st := d.state.Load()
+	if st == 0 || len(b) == 0 {
 		n, err := s.w.Write(b)
 		d.count(int64(n))
 		return n, err
+	}
+	if st == dirLeased {
+		// Leases that cover the write: its bytes are counted first, so
+		// that no other write or reclaim can take them meanwhile.
+		side, size := d.side, int64(len(b))
+		resets := side.resets.Load()
+		if side.end.Load()-side.total.Load() >= size {
+			if side.total.Add(size) <= side.end.Load() {
+				n, err := s.w.Write(b)
+				if n != len(b) {
+					d.sentReserved(reservation{n: size, resets: resets}, int64(n))
+				}
+				return n, err
+			}
+			// Another write of the connection, or a Budget taking the
+			// lease back, came first.
+			side.unreserve(size, resets)
+		}
 	}
 	return s.writeSlow(b)
 }
@@ -527,10 +657,12 @@ func (s *rateConn) writeSlow(b []byte) (n int, err error) {
 	}()
 	var rc receipt
 	for n < len(b) {
+		d.recheck()
 		st := d.state.Load()
 		size := int64(len(b) - n)
+		var reserved reservation
 		if st&dirLeased != 0 {
-			if size, err = d.allow(size, s.datagram); errors.Is(err, errRecheck) {
+			if size, err = d.allow(size, s.datagram, &reserved); errors.Is(err, errRecheck) {
 				continue
 			} else if err != nil {
 				return n, err
@@ -540,6 +672,7 @@ func (s *rateConn) writeSlow(b []byte) (n int, err error) {
 		if st&dirLimited != 0 {
 			if !locked && d.writing != nil {
 				if err := d.lockWrite(); err != nil {
+					d.sentReserved(reserved, 0)
 					return n, err
 				}
 				locked = true
@@ -547,12 +680,13 @@ func (s *rateConn) writeSlow(b []byte) (n int, err error) {
 			r = &rc
 			if size, err = d.grantWrite(size, s.datagram, r); err != nil {
 				r.refund(size)
+				d.sentReserved(reserved, 0)
 				return n, err
 			}
 		}
 		m, err := s.w.Write(b[n : n+int(size)])
 		m, err = r.sent(size, m, err)
-		d.count(int64(m))
+		d.sentReserved(reserved, int64(m))
 		n += m
 		if err != nil {
 			return n, err
@@ -597,6 +731,7 @@ func (s *rateConn) ReadFrom(r io.Reader) (int64, error) {
 	chunk := &io.LimitedReader{R: src}
 	var n int64
 	for {
+		d.recheck()
 		size := int64(copyChunk)
 		if outer {
 			if lr.N <= 0 {
@@ -606,8 +741,9 @@ func (s *rateConn) ReadFrom(r io.Reader) (int64, error) {
 		}
 		st := d.state.Load()
 		var err error
+		var reserved reservation
 		if st&dirLeased != 0 {
-			if size, err = d.allow(size, false); errors.Is(err, errRecheck) {
+			if size, err = d.allow(size, false, &reserved); errors.Is(err, errRecheck) {
 				continue
 			} else if err != nil {
 				return n, err
@@ -617,12 +753,14 @@ func (s *rateConn) ReadFrom(r io.Reader) (int64, error) {
 		if limited {
 			if !locked {
 				if err := d.lockWrite(); err != nil {
+					d.sentReserved(reserved, 0)
 					return n, err
 				}
 				locked = true
 			}
 			if size, err = d.grantWrite(size, false, &rc); err != nil {
 				rc.refund(size)
+				d.sentReserved(reserved, 0)
 				return n, err
 			}
 		}
@@ -632,7 +770,7 @@ func (s *rateConn) ReadFrom(r io.Reader) (int64, error) {
 		if limited && m < size {
 			rc.refund(size - m)
 		}
-		d.count(m)
+		d.sentReserved(reserved, m)
 		n += m
 		if outer {
 			lr.N -= m
@@ -661,11 +799,12 @@ func (s *rateConn) WriteTo(w io.Writer) (int64, error) {
 	chunk := &io.LimitedReader{R: s.r}
 	var n int64
 	for {
+		d.recheck()
 		size := int64(copyChunk)
 		st := d.state.Load()
 		var err error
 		if st&dirLeased != 0 {
-			if size, err = d.allow(size, false); errors.Is(err, errRecheck) {
+			if size, err = d.allow(size, false, nil); errors.Is(err, errRecheck) {
 				continue
 			} else if err != nil {
 				return n, err
@@ -778,8 +917,9 @@ func (s *rateConn) Close() error {
 	}
 	s.read.cancel.close()
 	s.write.cancel.close()
-	if s.closed.CompareAndSwap(false, true) {
-		s.finish()
+	if !s.reg.done.Load() {
+		s.cleanup.Stop()
+		s.reg.finish()
 	}
 	if s.c == nil {
 		return nil
@@ -851,10 +991,19 @@ type Conn struct {
 // read together when it is repaid, up to a grant each.
 //
 // A Budget among the levels leases bytes to the connection instead of being
-// charged at each read and write, as Budget.Lease describes: a Write sends
-// what the leases cover and a Read reads no more, so a Budget is never
-// passed, and while a step's Limit applies the Budget is charged at every
-// read and write as a Limiter.
+// charged at each read and write, as Budget.Lease describes, and while a
+// step's Limit applies it is charged at every read and write as a Limiter.
+// A Write counts its bytes before it sends them, so writes, also concurrent
+// ones, never pass a Budget's Stop; a Write that fails or is cut short just
+// as a change of the Budget takes its lease back keeps its unsent bytes
+// charged. A Read reads no more than the leases cover and counts what
+// arrived, so concurrent Reads, and a Read in progress when its lease is
+// taken back, can pass the leases by what each reads, which counts as used.
+//
+// Close settles the wrapper: it gives back what its leases hold unused and
+// takes it out of its Counters and Group. A wrapper dropped without Close
+// is settled once the garbage collector finds it, which can be much later,
+// so close every wrapper for timely accounting.
 //
 // The result keeps the zero-copy paths of c: io.Copy to it, through its
 // ReadFrom, and from it, through its WriteTo, hands c, and the connection
@@ -897,24 +1046,32 @@ func newConn(c net.Conn, o options, g *Group) *Conn {
 func (s *rateConn) init(r io.Reader, w io.Writer, c io.Closer, o options, g *Group) {
 	s.r, s.w, s.c = r, w, c
 	s.datagram = o.datagram
-	s.meter.owner = s
-	s.read.init(&s.meter.read)
-	s.write.init(&s.meter.written)
+	m := newMeter()
+	s.meter = m
+	s.read.init(&m.read, &m.leases[0])
+	s.write.init(&m.written, &m.leases[1])
 	if !s.datagram {
 		s.write.writing = make(chan struct{}, 1)
 	}
+	reg := &connReg{meter: m, counters: o.counters, group: g, key: weak.Make(s)}
+	s.reg = reg
 	configMu.Lock()
 	defer configMu.Unlock()
 	s.own = [2]Limiter{o.read, o.write}
-	s.counters = o.counters
-	s.group = g
-	for _, c := range s.counters {
-		c.Attach(&s.meter)
+	for _, c := range reg.counters {
+		c.Attach(m)
 	}
 	for a := g; a != nil; a = a.parent.Load() {
-		a.Traffic().Attach(&s.meter)
+		a.Traffic().Attach(m)
+		if a.members == nil {
+			a.members = make(map[weak.Pointer[rateConn]]*Meter)
+		}
+		a.members[reg.key] = m
 	}
 	s.applyLocked()
+	// A wrapper dropped without Close is settled once collected, so that
+	// its Counters, Budgets and Group do not keep it, nor its leases.
+	s.cleanup = runtime.AddCleanup(s, (*connReg).finish, reg)
 }
 
 // isDatagramConn reports whether c is a socket whose every Read and Write
@@ -1003,7 +1160,7 @@ func newPacketConn(c net.PacketConn, o options, g *Group) *PacketConn {
 func (c *PacketConn) SetLimiters(read, write Limiter) { c.s.SetLimiters(read, write) }
 
 // Meter returns the Meter of the datagrams' bytes.
-func (c *PacketConn) Meter() *Meter { return &c.s.meter }
+func (c *PacketConn) Meter() *Meter { return c.s.meter }
 
 // admit charges size bytes to d's limiter, recording the charge in rc, if
 // it lets them through at once, as TryWait does, and otherwise charges
@@ -1024,9 +1181,10 @@ func (c *PacketConn) ReadFrom(b []byte) (int, net.Addr, error) {
 		return n, addr, err
 	}
 	for {
+		d.recheck()
 		st := d.state.Load()
 		if st&dirLeased != 0 {
-			if _, err := d.allow(1, false); errors.Is(err, errRecheck) {
+			if _, err := d.allow(1, false, nil); errors.Is(err, errRecheck) {
 				continue
 			} else if err != nil {
 				return 0, nil, err
@@ -1085,9 +1243,11 @@ func (c *PacketConn) WriteTo(b []byte, addr net.Addr) (int, error) {
 	}
 	size := int64(len(b))
 	for {
+		d.recheck()
 		st := d.state.Load()
+		var reserved reservation
 		if st&dirLeased != 0 {
-			if _, err := d.allow(size, true); errors.Is(err, errRecheck) {
+			if _, err := d.allow(size, true, &reserved); errors.Is(err, errRecheck) {
 				continue
 			} else if err != nil {
 				return 0, err
@@ -1099,21 +1259,25 @@ func (c *PacketConn) WriteTo(b []byte, addr net.Addr) (int, error) {
 			r = &rc
 			if c.drop {
 				if g := d.cancel.current(); g.ended() {
+					d.sentReserved(reserved, 0)
 					return 0, g.cause()
 				}
 				if err := d.admit(size, r); errors.Is(err, ErrWouldWait) {
+					d.sentReserved(reserved, 0)
 					return len(b), nil // dropped, as a full socket buffer drops it
 				} else if err != nil {
+					d.sentReserved(reserved, 0)
 					return 0, err
 				}
 			} else if _, err := d.grantWrite(size, true, r); err != nil {
 				r.refund(size)
+				d.sentReserved(reserved, 0)
 				return 0, err
 			}
 		}
 		m, err := c.pc.WriteTo(b, addr)
 		m, err = r.sent(size, m, err)
-		d.count(int64(m))
+		d.sentReserved(reserved, int64(m))
 		return m, err
 	}
 }

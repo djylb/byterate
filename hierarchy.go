@@ -6,8 +6,9 @@ import "context"
 // a connection's Rate within its user's Rate and Budget within a global
 // Rate. It charges every level and waits until every one allows the bytes,
 // so the strictest sets the pace. A limit set on any of them later applies
-// to the next charge, also an unlimited Rate's. Disable on a Rate ends the wait it imposes, and the others still
-// apply; a disabled Rate limits nothing until Enable.
+// to the next charge, also an unlimited Rate's. Disable on a Rate ends the
+// wait it imposes, and the others still apply; a disabled Rate limits
+// nothing until Enable.
 //
 // The levels of a hierarchy given as a level take its place. Nil limiters,
 // also nil pointers of this package's types, are left out, and so are

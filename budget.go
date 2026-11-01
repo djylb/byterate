@@ -7,6 +7,7 @@ import (
 	"slices"
 	"sync/atomic"
 	"time"
+	"weak"
 )
 
 // ErrBudgetExhausted is returned for bytes that a Budget stops: once its
@@ -47,20 +48,38 @@ type Step struct {
 // Ready and the connection wrappers end a grant at the next step, so a step
 // applies from its After, and a Write never takes the usage past a Stop. A
 // Read charges what it read, so concurrent Reads can each pass a Stop by
-// their last grant; Charge, which records bytes already transferred, counts
-// them in the step that applied before them.
+// their last grant, as can a Read in progress when a change takes back the
+// lease it read on, as Lease describes; Charge, which records bytes already
+// transferred, counts them in the step that applied before them.
 //
 // All methods are safe for concurrent use and on a nil *Budget, which never
 // limits. The zero value only counts until SetSteps.
 type Budget struct {
-	used   atomic.Int64
-	period atomic.Uint64 // counts Reset and SetUsed, which void earlier charges
+	// The period: Reset and SetUsed start a new one, which voids the
+	// refunds and leases of the earlier ones.
+	cur    atomic.Pointer[budgetPeriod]
 	expiry atomic.Pointer[budgetExpiry]
 	steps  atomic.Pointer[budgetSteps]
 	onStep atomic.Pointer[func(step int, used int64)]
-	clock  atomic.Pointer[clockBox] // set by SetClock, nil for the monotonic clock
-	// The wrappers' leases, whose unused bytes Used leaves out.
+	clock  atomic.Pointer[clockBox] // SetClock's, nil for the monotonic clock
+	// The wrappers' leases, whose unused bytes Used leaves out, and,
+	// under its mu, the timer that takes them back at the expiry.
 	lessees lessees
+	timer   *time.Timer
+}
+
+// budgetPeriod is a period of a Budget and its bytes used. Charges, refunds
+// and leases hold the period they were made in, so that those of a period
+// that a Reset ended change nothing.
+type budgetPeriod struct{ used atomic.Int64 }
+
+// per returns b's period.
+func (b *Budget) per() *budgetPeriod {
+	if p := b.cur.Load(); p != nil {
+		return p
+	}
+	b.cur.CompareAndSwap(nil, &budgetPeriod{})
+	return b.cur.Load()
 }
 
 // budgetExpiry is the time after which a Budget stops all bytes, as given
@@ -120,7 +139,10 @@ func (b *Budget) SetSteps(steps ...Step) {
 			set.stopAt = s.After
 		}
 	}
+	b.lessees.mu.Lock()
+	defer b.lessees.mu.Unlock()
 	b.steps.Store(set)
+	b.revokeLocked()
 }
 
 // Steps returns b's steps, sorted by After.
@@ -145,16 +167,21 @@ func (b *Budget) Used() int64 {
 	return b.usedExact()
 }
 
-// SetUsed makes n the bytes used in the period, such as the bytes persisted
-// before a restart, or a total that several Budgets share. Refunds of bytes
-// charged before it are dropped, and OnStep does not report the step it
-// brings b into.
+// SetUsed makes n the bytes used in a new period, such as the bytes
+// persisted before a restart, or a total that several Budgets share.
+// Refunds of bytes charged before it are dropped, and OnStep does not
+// report the step it brings b into. The wrappers' leases of the old period
+// end with it: what passes from then on counts in the new one.
 func (b *Budget) SetUsed(n int64) {
 	if b == nil {
 		return
 	}
-	b.period.Add(1)
-	b.used.Store(max(n, 0))
+	p := &budgetPeriod{}
+	p.used.Store(max(n, 0))
+	b.lessees.mu.Lock()
+	defer b.lessees.mu.Unlock()
+	b.cur.Store(p)
+	b.revokeLocked()
 }
 
 // Step returns the index of the step that applies, in the order of After,
@@ -163,22 +190,49 @@ func (b *Budget) Step() int {
 	if b == nil {
 		return -1
 	}
-	i, _ := b.stepSet().at(b.used.Load())
+	i, _ := b.stepSet().at(b.per().used.Load())
 	return i
 }
 
 // SetExpiry makes b stop all bytes after t, as a step with Stop does; a zero
 // t means never. The expiry is kept on the monotonic clock, as a deadline
-// is, so a later change of the wall clock does not move it.
+// is, so a later change of the wall clock does not move it. A timer takes
+// the wrappers' leases back when it passes; with a Clock set, which no
+// timer follows, the wrappers charge b at every read and write instead
+// while it has an expiry.
 func (b *Budget) SetExpiry(t time.Time) {
 	if b == nil {
 		return
 	}
-	if t.IsZero() {
-		b.expiry.Store(nil)
+	var e *budgetExpiry
+	if !t.IsZero() {
+		e = &budgetExpiry{t: t, at: addSat(nowNs(), int64(time.Until(t)))}
+	}
+	b.lessees.mu.Lock()
+	defer b.lessees.mu.Unlock()
+	b.expiry.Store(e)
+	b.scheduleLocked()
+	b.revokeLocked()
+}
+
+// scheduleLocked sets the timer that takes the leases back at b's expiry,
+// unless b reads a Clock or has none. b.lessees.mu must be held.
+func (b *Budget) scheduleLocked() {
+	if b.timer != nil {
+		b.timer.Stop()
+		b.timer = nil
+	}
+	e := b.expiry.Load()
+	if e == nil || b.clock.Load() != nil {
 		return
 	}
-	b.expiry.Store(&budgetExpiry{t: t, at: addSat(nowNs(), int64(time.Until(t)))})
+	// Weak, so that a pending timer does not keep an unused Budget.
+	w := weak.Make(b)
+	b.timer = time.AfterFunc(time.Duration(e.at-nowNs()), func() {
+		if b := w.Value(); b != nil {
+			b.revoke()
+		}
+	})
 }
 
 // Expiry returns the time SetExpiry set, or the zero time for none.
@@ -294,9 +348,15 @@ func (b *Budget) check(n, now int64) error {
 		return ErrBudgetExhausted
 	}
 	set := b.stepSet()
-	used := b.used.Load()
+	used := b.per().used.Load()
 	if addSat(used, n) > set.stopAt {
-		return ErrBudgetExhausted
+		// The wrappers' unused leases may hold the bytes.
+		if !b.reclaim() {
+			return ErrBudgetExhausted
+		}
+		if used = b.per().used.Load(); addSat(used, n) > set.stopAt {
+			return ErrBudgetExhausted
+		}
 	}
 	if _, s := set.at(used); s != nil && s.Limit != nil {
 		return s.t.check(n, now)
@@ -310,25 +370,34 @@ func (b *Budget) check(n, now int64) error {
 // owed them, or nil, when it reports the step the bytes reach itself.
 func (b *Budget) take(n int64, rc *receipt) (set *budgetSteps, used int64, s *budgetStep, err error) {
 	set = b.stepSet()
-	period := b.period.Load()
+	p := b.per()
 	// Take the bytes before waiting, so that concurrent charges cannot pass
 	// a Stop together.
+	reclaimed := false
 	for {
 		if b.expired() {
 			return nil, 0, nil, ErrBudgetExhausted
 		}
-		used = b.used.Load()
+		used = p.used.Load()
 		if addSat(used, n) > set.stopAt {
+			if !reclaimed {
+				// The wrappers' unused leases may hold the bytes.
+				reclaimed = true
+				if b.reclaim() {
+					p = b.per()
+					continue
+				}
+			}
 			return nil, 0, nil, ErrBudgetExhausted
 		}
-		if b.used.CompareAndSwap(used, addSat(used, n)) {
+		if p.used.CompareAndSwap(used, addSat(used, n)) {
 			break
 		}
 	}
 	if _, s = set.at(used); s != nil && s.Limit == nil {
 		s = nil
 	}
-	rc.add(budgetEntry(b, s, period))
+	rc.add(budgetEntry(b, s, p))
 	if s != nil {
 		s.owed.Add(n)
 	} else {
@@ -354,9 +423,14 @@ func (b *Budget) ready(ctx context.Context, t *waitTimer, n int64) (int64, error
 		return 0, ErrBudgetExhausted
 	}
 	set := b.stepSet()
-	used := b.used.Load()
+	used := b.per().used.Load()
 	if used >= set.stopAt {
-		return 0, ErrBudgetExhausted
+		if !b.reclaim() {
+			return 0, ErrBudgetExhausted
+		}
+		if used = b.per().used.Load(); used >= set.stopAt {
+			return 0, ErrBudgetExhausted
+		}
 	}
 	i, s := set.at(used)
 	// Up to the next step, so that a step applies from its After.
@@ -378,7 +452,7 @@ func (b *Budget) Charge(n int64) error {
 		return nil
 	}
 	set := b.stepSet()
-	used := b.add(n)
+	used := b.per().add(n)
 	_, s := set.at(used)
 	var err error
 	if s != nil && s.Limit != nil {
@@ -403,7 +477,7 @@ func (b *Budget) Refund(n int64) {
 		return
 	}
 	set := b.stepSet()
-	was := b.sub(n)
+	was := b.per().sub(n)
 	now := max(was-n, 0)
 	i, _ := set.at(was - 1)
 	for ; i >= 0 && n > 0; i-- {
@@ -417,30 +491,22 @@ func (b *Budget) Refund(n int64) {
 	}
 }
 
-// release takes n bytes charged in period off the usage, unless a Reset or
-// SetUsed since voided them.
-func (b *Budget) release(n int64, period uint64) {
-	if b.period.Load() == period {
-		b.sub(n)
-	}
-}
-
-// add adds n bytes to the usage, saturating, and returns the usage before.
-func (b *Budget) add(n int64) int64 {
+// add adds n bytes to p's usage, saturating, and returns the usage before.
+func (p *budgetPeriod) add(n int64) int64 {
 	for {
-		used := b.used.Load()
-		if b.used.CompareAndSwap(used, addSat(used, n)) {
+		used := p.used.Load()
+		if p.used.CompareAndSwap(used, addSat(used, n)) {
 			return used
 		}
 	}
 }
 
-// sub takes n bytes off the usage, down to zero, and returns the usage
+// sub takes n bytes off p's usage, down to zero, and returns the usage
 // before.
-func (b *Budget) sub(n int64) int64 {
+func (p *budgetPeriod) sub(n int64) int64 {
 	for {
-		used := b.used.Load()
-		if b.used.CompareAndSwap(used, max(used-n, 0)) {
+		used := p.used.Load()
+		if p.used.CompareAndSwap(used, max(used-n, 0)) {
 			return used
 		}
 	}

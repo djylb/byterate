@@ -7,7 +7,8 @@
 // SetLimiters adds, changes or lifts a limit at any time, also for a
 // transfer in progress:
 //
-//	limited := byterate.NewConn(conn, byterate.WithLimiter(byterate.NewRate(1<<20))) // 1 MiB/s
+//	rate := byterate.NewRate(1 << 20) // 1 MiB/s
+//	limited := byterate.NewConn(conn, byterate.WithLimiter(rate))
 //
 // A Rate is a limit in bytes per second; its zero value is ready to use.
 // NewHierarchy nests limiters, such as a connection's Rate within its

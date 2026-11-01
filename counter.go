@@ -36,7 +36,7 @@ type Counter struct {
 
 	// The Meters added up in the totals, with their totals when attached.
 	srcMu sync.Mutex
-	srcs  map[*Meter][2]int64
+	srcs  map[*Meter]*meterSrc
 	nsrc  atomic.Int32 // len(srcs), so that totals skips srcMu without any
 }
 
@@ -194,10 +194,10 @@ func (c *Counter) totals() [2]int64 {
 		t[0] += c.shards[i].read.Load()
 		t[1] += c.shards[i].written.Load()
 	}
-	for m, base := range c.srcs {
+	for m, src := range c.srcs {
 		r, w := m.Total()
-		t[0] += r - base[0]
-		t[1] += w - base[1]
+		t[0] += r - src.base[0]
+		t[1] += w - src.base[1]
 	}
 	return t
 }
@@ -260,7 +260,7 @@ func (c *Counter) Sample() {
 }
 
 // SetClock makes c read the time of its throughput samples from clk, such
-// as a timeshim.Fake in a test; nil goes back to the monotonic clock. Set it
+// as a fake clock in a test; nil goes back to the monotonic clock. Set it
 // before the first sample.
 func (c *Counter) SetClock(clk Clock) {
 	if c == nil {
@@ -293,53 +293,55 @@ func (c *Counter) throughput(now int64) [2]int64 {
 // on every read and write: c adds up its Meters when it is read, so that a
 // Counter shared by many connections, such as a user's, costs their reads
 // and writes nothing. The bytes m counted before stay out of c. Detach
-// ends it, keeping the bytes in c; attaching m again does nothing.
+// ends it, keeping the bytes in c. A Meter attached more than once, such as
+// that of a wrapper given c by WithCounter and as a Group's Traffic, counts
+// once, until as many Detaches.
 func (c *Counter) Attach(m *Meter) {
 	if c == nil || m == nil {
 		return
 	}
 	c.srcMu.Lock()
 	defer c.srcMu.Unlock()
-	if _, ok := c.srcs[m]; ok {
+	if src, ok := c.srcs[m]; ok {
+		src.refs++
 		return
 	}
 	if c.srcs == nil {
-		c.srcs = make(map[*Meter][2]int64)
+		c.srcs = make(map[*Meter]*meterSrc)
 	}
 	r, w := m.Total()
-	c.srcs[m] = [2]int64{r, w}
+	c.srcs[m] = &meterSrc{base: [2]int64{r, w}, refs: 1}
 	c.nsrc.Store(int32(len(c.srcs)))
 }
 
-// Detach stops adding m's bytes to c, keeping those it added so far as if
-// they had been counted by Add.
+// meterSrc is a Meter attached to a Counter: its totals when attached and
+// the Attaches not yet detached.
+type meterSrc struct {
+	base [2]int64
+	refs int
+}
+
+// Detach ends an Attach of m, and with the last one stops adding m's bytes
+// to c, keeping those it added so far as if they had been counted by Add.
 func (c *Counter) Detach(m *Meter) {
 	if c == nil || m == nil {
 		return
 	}
 	c.srcMu.Lock()
 	defer c.srcMu.Unlock()
-	base, ok := c.srcs[m]
+	src, ok := c.srcs[m]
 	if !ok {
+		return
+	}
+	if src.refs--; src.refs > 0 {
 		return
 	}
 	r, w := m.Total()
 	// Added before the Meter leaves, so that totals never misses it.
-	c.read.Add(r - base[0])
-	c.written.Add(w - base[1])
+	c.read.Add(r - src.base[0])
+	c.written.Add(w - src.base[1])
 	delete(c.srcs, m)
 	c.nsrc.Store(int32(len(c.srcs)))
-}
-
-// meters returns the Meters attached to c.
-func (c *Counter) meters() []*Meter {
-	c.srcMu.Lock()
-	defer c.srcMu.Unlock()
-	ms := make([]*Meter, 0, len(c.srcs))
-	for m := range c.srcs {
-		ms = append(ms, m)
-	}
-	return ms
 }
 
 // shardKey spreads goroutines over the shards of a shared Counter by where

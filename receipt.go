@@ -4,16 +4,16 @@ package byterate
 // must check first. Its type tells a Rate's charge from a Budget's and from
 // that of any other Limiter, which takes a plain Refund.
 type entry struct {
-	l    Limiter     // the Rate, Budget, Counter view or other Limiter charged
-	gen  *generation // a Rate's generation charged, which an Enable since voids
-	step *budgetStep // a Budget's step whose Limit took the charge, if any
-	// A Rate's charge: 1 if it added debt rather than only being metered. A
-	// Budget's: the period charged, which a Reset since voids.
+	l    Limiter       // the Rate, Budget, Counter view or other Limiter charged
+	gen  *generation   // a Rate's generation charged, which an Enable since voids
+	step *budgetStep   // a Budget's step whose Limit took the charge, if any
+	per  *budgetPeriod // a Budget's period charged, which a Reset since ends
+	// A Rate's charge: 1 if it added debt rather than only being metered.
 	aux uint64
 }
 
-func budgetEntry(b *Budget, s *budgetStep, period uint64) entry {
-	return entry{l: b, step: s, aux: period}
+func budgetEntry(b *Budget, s *budgetStep, p *budgetPeriod) entry {
+	return entry{l: b, step: s, per: p}
 }
 
 // receipt records the charges of one transfer, of the same size on every
@@ -55,7 +55,7 @@ func (rc *receipt) add(e entry) { *rc.next() = e }
 // only metered, in place, as every charge of a Rate makes one.
 func (rc *receipt) addRate(r *Rate, g *generation, debt bool) {
 	e := rc.next()
-	e.l, e.gen, e.step, e.aux = r, g, nil, 0
+	e.l, e.gen, e.step, e.per, e.aux = r, g, nil, nil, 0
 	if debt {
 		e.aux = 1
 	}
@@ -141,7 +141,7 @@ func (e *entry) refund(size int64) {
 		}
 	case *Budget:
 		// The step's Limit is refunded by the entries after this one.
-		l.release(size, e.aux)
+		e.per.sub(size)
 		if e.step != nil {
 			e.step.unowe(size)
 		}

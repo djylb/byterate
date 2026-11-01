@@ -170,7 +170,8 @@ func (r *Rate) Limit() int64 {
 	return r.rate.Load()
 }
 
-// Enable undoes Disable, starting over with a full burst. It is a no-op on an enabled Rate.
+// Enable undoes Disable, starting over with a full burst. It is a no-op on
+// an enabled Rate.
 func (r *Rate) Enable() {
 	if r == nil {
 		return
@@ -217,8 +218,9 @@ func (r *Rate) Disable() {
 // keeps as bytes; while it is disabled, it does nothing.
 //
 // Refund takes no receipt, so it cannot tell which charge it gives back:
-// bytes charged before the last Enable or Reset, which cleared the debt, are refunded all the same, and so is debt for bytes charged
-// while r was unlimited or disabled, which added none. Refund only bytes of
+// bytes charged before the last Enable or Reset, which cleared the debt,
+// are refunded all the same, and so is debt for bytes charged while r was
+// unlimited or disabled, which added none. Refund only bytes of
 // a charge that r took since the last Enable or Reset and while it had the
 // same kind of limit. The connection wrappers, hierarchies, Switches,
 // Budgets and Groups keep a receipt of each charge instead and refund
