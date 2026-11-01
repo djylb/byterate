@@ -164,3 +164,18 @@ func TestCounterViewsIgnoreNonPositive(t *testing.T) {
 		t.Fatalf("Total() after non-positive counts = %d, %d; want 0, 0", in, out)
 	}
 }
+
+// TestCounterReadRacesFirstAttach reads a Counter while a Meter attaches to
+// it for the first time; run with -race.
+func TestCounterReadRacesFirstAttach(t *testing.T) {
+	for range 20 {
+		var c Counter
+		var m Meter
+		var wg sync.WaitGroup
+		wg.Go(func() { c.Attach(&m) })
+		c.Load()
+		c.Throughput()
+		wg.Wait()
+		c.Detach(&m)
+	}
+}

@@ -183,21 +183,32 @@ func (c *counterWrites) Charge(n int64) error {
 
 // totals returns the bytes read and written since c began.
 func (c *Counter) totals() [2]int64 {
-	if c.nsrc.Load() > 0 {
-		// Under srcMu, so that a Detach that moves a Meter's bytes into
-		// the totals is seen whole or not at all.
-		c.srcMu.Lock()
-		defer c.srcMu.Unlock()
+	// With no Meter attached, srcs is read neither here nor anywhere
+	// without srcMu: an Attach that comes after the load attaches a Meter
+	// with no bytes in c yet, and a Detach is done with the totals before
+	// it stores the count.
+	if c.nsrc.Load() == 0 {
+		return c.counted()
 	}
-	t := [2]int64{c.read.Load(), c.written.Load()}
-	for i := range c.shards {
-		t[0] += c.shards[i].read.Load()
-		t[1] += c.shards[i].written.Load()
-	}
+	// Under srcMu, so that a Detach that moves a Meter's bytes into the
+	// totals is seen whole or not at all.
+	c.srcMu.Lock()
+	defer c.srcMu.Unlock()
+	t := c.counted()
 	for m, src := range c.srcs {
 		r, w := m.Total()
 		t[0] += r - src.base[0]
 		t[1] += w - src.base[1]
+	}
+	return t
+}
+
+// counted returns the bytes added to c itself, by Add or by Detaches.
+func (c *Counter) counted() [2]int64 {
+	t := [2]int64{c.read.Load(), c.written.Load()}
+	for i := range c.shards {
+		t[0] += c.shards[i].read.Load()
+		t[1] += c.shards[i].written.Load()
 	}
 	return t
 }
