@@ -463,3 +463,17 @@ func TestBudgetChangesRaceCharges(t *testing.T) {
 	stop.Store(true)
 	wg.Wait()
 }
+
+// Step follows Used: bytes leased to a connection and not yet passed do not
+// bring the next step.
+func TestBudgetStepFollowsUsed(t *testing.T) {
+	b := NewBudget(Step{After: 0}, Step{After: 100_000})
+	g := NewGroup(nil)
+	setWrite(g, b)
+	c, _ := g.Open(&recordingConn{})
+	defer func() { _ = c.Close() }()
+	_, _ = c.Write(make([]byte, 50_000))
+	if b.Used() != 50_000 || b.Step() != 0 {
+		t.Fatalf("after 50000 B: Used %d, Step %d; want 50000, 0", b.Used(), b.Step())
+	}
+}

@@ -184,13 +184,13 @@ func (b *Budget) SetUsed(n int64) {
 	b.revokeLocked()
 }
 
-// Step returns the index of the step that applies, in the order of After,
-// or -1 before the first step.
+// Step returns the index of the step that applies to Used, in the order of
+// After, or -1 before the first step.
 func (b *Budget) Step() int {
 	if b == nil {
 		return -1
 	}
-	i, _ := b.stepSet().at(b.per().used.Load())
+	i, _ := b.stepSet().at(b.usedExact())
 	return i
 }
 
