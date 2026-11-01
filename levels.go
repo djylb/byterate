@@ -418,7 +418,7 @@ func (v *levels) wait(ctx context.Context, t *waitTimer, size int64, whole bool,
 		}
 	}
 	if v.others {
-		if err := v.waitOthers(ctx, t, size, now, rc); err != nil {
+		if err := v.waitOthers(ctx, t, size, rc); err != nil {
 			if isCanceled(ctx, err) {
 				// It kept the charge, so the views count it, for a refund
 				// to take off.
@@ -434,9 +434,9 @@ func (v *levels) wait(ctx context.Context, t *waitTimer, size int64, whole bool,
 }
 
 // waitOthers charges size bytes to the levels of v other than Rates, which
-// wait already charged at now, and waits for each in turn, recording the
+// wait already charged, and waits for each in turn, recording the
 // charges in rc. It returns the first error, ctx's for a charge kept.
-func (v *levels) waitOthers(ctx context.Context, t *waitTimer, size, now int64, rc *receipt) error {
+func (v *levels) waitOthers(ctx context.Context, t *waitTimer, size int64, rc *receipt) error {
 	for i := range v.lv {
 		lv := &v.lv[i]
 		var err error

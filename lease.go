@@ -148,15 +148,24 @@ type budgetLease struct {
 	// step's Limit applies, which leaves end out of use.
 	per     *budgetPeriod
 	charged bool
+	// Under b.lessees.mu, while per is nil: the period that the bytes up
+	// to end were last charged in, nil for none, for unreserve to give
+	// bytes counted ahead and not sent back to.
+	last *budgetPeriod
 }
 
 // total returns the count of the direction's bytes, as leases see it.
 func (l *budgetLease) total() int64 { return l.set.side.total.Load() }
 
-// settled records, after reading the count, that l's lease was settled
-// against it and left its period, so that a write that reserved bytes in
-// the count before keeps them counted: they were taken as passed.
-func (l *budgetLease) settled() { l.set.side.resets.Add(1) }
+// settled records that l's lease left its period, and was settled up to
+// end in p, if not nil: a nil p charged nothing, which keeps the period
+// of the last charge. b.lessees.mu must be held.
+func (l *budgetLease) settled(p *budgetPeriod) {
+	if p != nil {
+		l.last = p
+	}
+	l.per = nil
+}
 
 // lessees are the budgetLeases of a Budget's wrappers, for Used and
 // Remaining to leave out their unused bytes and for changes of the Budget
@@ -245,8 +254,7 @@ func (b *Budget) revokeLocked() {
 			if u := l.cut(); l.per != nil && u > 0 {
 				l.per.sub(u)
 			}
-			l.per = nil
-			l.settled()
+			l.settled(l.per)
 			// The next I/O leases again, under what b is now.
 			l.set.lower(min(l.end.Load(), l.total()))
 		}
@@ -265,15 +273,16 @@ func (b *Budget) revoke() {
 // direction passed beyond it, in b's period. b.lessees.mu must be held.
 func (l *budgetLease) settleLocked() {
 	t, e := l.total(), l.end.Load()
-	defer l.settled()
+	p := l.per
 	switch {
-	case l.per != nil && e > t:
-		l.per.sub(e - t)
+	case p != nil && e > t:
+		p.sub(e - t)
 	case e < t:
-		l.b.per().add(t - e)
+		p = l.b.per()
+		p.add(t - e)
 	}
 	l.end.Store(t)
-	l.per = nil
+	l.settled(p)
 }
 
 // leaseSet is a direction's leases, of each of its Budgets.
@@ -307,7 +316,6 @@ func (s *leaseSet) set(bs, charged []*Budget) {
 		if found == nil {
 			found = &budgetLease{b: b, set: s}
 			found.end.Store(found.total())
-			found.settled()
 			if b.lessees.m == nil {
 				b.lessees.m = make(map[*budgetLease]struct{})
 			}
@@ -320,7 +328,7 @@ func (s *leaseSet) set(bs, charged []*Budget) {
 		case !c && found.charged:
 			// What passed while b was charged as a Limiter is charged.
 			found.end.Store(found.total())
-			found.settled()
+			found.last = nil
 		}
 		found.charged = i >= len(bs)
 		b.lessees.mu.Unlock()
@@ -470,6 +478,9 @@ func (l *budgetLease) extend(t, short int64) (stepReport, error) {
 		if e := l.end.Load(); e < t {
 			b.per().add(t - e)
 			l.end.Store(t)
+			if l.per == nil {
+				l.last = b.per()
+			}
 		}
 	}
 	return stepReport{}, err

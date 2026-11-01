@@ -34,11 +34,11 @@ var (
 // connection or stream.
 type Option struct {
 	read, write Limiter
-	limiters    bool
+	ctx         context.Context
 	counters    []*Counter
+	limiters    bool
 	datagram    bool
 	drop        bool
-	ctx         context.Context
 }
 
 // WithLimiter charges both directions to l, the same Limiter, so that reads
@@ -120,12 +120,7 @@ type Meter struct {
 type meterSide struct {
 	total atomic.Int64
 	end   atomic.Int64
-	// resets counts the settlements of the direction's leases against
-	// total that end their periods, and unsent the bytes that writes
-	// reserved in total and did not send.
-	resets atomic.Uint64
-	unsent atomic.Int64
-	_      [cacheLineSize - 32]byte
+	_     [cacheLineSize - 16]byte
 }
 
 // newMeter returns the Meter of a wrapper, without leases.
@@ -148,10 +143,7 @@ func (m *Meter) Total() (read, written int64) {
 
 // count returns the bytes of the direction.
 func (s *meterSide) count() int64 {
-	// unsent first, so that a write that moves its bytes to unsent
-	// meanwhile is not left out twice.
-	u := s.unsent.Load()
-	return s.total.Load() - u
+	return s.total.Load()
 }
 
 // rateConn is the core of every wrapper: it counts the bytes of each
@@ -498,7 +490,6 @@ func (d *direction) allow(size int64, whole bool, rv *reservation) (int64, error
 		need, want = size, size
 	}
 	for {
-		resets := d.side.resets.Load()
 		t := d.side.total.Load()
 		if credit := d.side.end.Load() - t; credit >= want {
 			n := size
@@ -509,7 +500,7 @@ func (d *direction) allow(size int64, whole bool, rv *reservation) (int64, error
 				return n, nil
 			}
 			if d.side.total.CompareAndSwap(t, t+n) {
-				*rv = reservation{n: n, resets: resets}
+				*rv = reservation{n: n}
 				return n, nil
 			}
 			continue
@@ -538,12 +529,8 @@ func (d *direction) count(n int64) {
 	}
 }
 
-// reservation is what allow counted ahead of a write: n bytes, when the
-// direction's leases had been reset resets times.
-type reservation struct {
-	n      int64
-	resets uint64
-}
+// reservation is what allow counted ahead of a write: n bytes.
+type reservation struct{ n int64 }
 
 // sentReserved corrects d's Meter for a write of which rv reserved bytes
 // and m were sent, and with none reserved counts m.
@@ -551,19 +538,20 @@ func (d *direction) sentReserved(rv reservation, m int64) {
 	if rv.n == 0 {
 		d.count(m)
 	} else if m = min(max(m, 0), rv.n); m != rv.n {
-		d.leases.unreserve(rv.n-m, rv.resets)
+		d.leases.unreserve(rv.n - m)
 	}
 }
 
 // unreserve takes n bytes that a write reserved and did not send off the
-// count, reserved when the leases had been reset resets times. It holds
-// the locks of the leases' Budgets, which every reset holds too, so that
-// no lease is reset while it decides. While the leases stay in their
-// periods, the bytes go back to them as unused. A lease reset since then,
-// which settled the count as it was, took them as passed: they stay in the
-// count that leases see, and charged, and go to unsent, which the Meter
-// leaves out, instead.
-func (s *leaseSet) unreserve(n int64, resets uint64) {
+// count. It holds the locks of the leases' Budgets, which every change of a
+// lease holds too. A lease still holding its bytes gets them back as
+// unused. A lease taken back meanwhile settled the count with them, as
+// passed: they go back to the period it charged them in, unless a Reset
+// or SetUsed ended it, and the lease ends at the count again, so that
+// neither the write nor a later one pays for them twice. A lease taken
+// again since then holds them as unused in its own period. A Budget that
+// SetLimiters took off the direction meanwhile keeps them charged.
+func (s *leaseSet) unreserve(n int64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	bs := make([]*Budget, 0, len(s.ls))
@@ -579,11 +567,28 @@ func (s *leaseSet) unreserve(n int64, resets uint64) {
 	for _, b := range bs {
 		b.lessees.mu.Lock()
 	}
-	if s.side.resets.Load() == resets {
-		s.side.total.Add(-n)
-	} else {
-		s.side.unsent.Add(n)
+	// The ends of the leases taken back go down to the count without the
+	// bytes before the count does, so that no write that counts its bytes
+	// meanwhile finds them free.
+	t := s.side.total.Load() - n
+	for _, l := range s.ls {
+		if l.per != nil {
+			continue // a lease in use holds them as unused
+		}
+		if over := l.end.Load() - t; over > 0 {
+			if l.last != nil && l.last == l.b.per() {
+				l.last.sub(over)
+			}
+			l.end.Store(t)
+			if !l.charged {
+				// Below the count: a lease taken back holds nothing, and
+				// the count may hold bytes of writes still checking it,
+				// which go to refill and lease them again.
+				s.lower(t - 1)
+			}
+		}
 	}
+	s.side.total.Add(-n)
 	for _, b := range bs {
 		b.lessees.mu.Unlock()
 	}
@@ -652,18 +657,17 @@ func (s *rateConn) Write(b []byte) (int, error) {
 		// Leases that cover the write: its bytes are counted first, so
 		// that no other write or reclaim can take them meanwhile.
 		side, size := d.side, int64(len(b))
-		resets := side.resets.Load()
 		if side.end.Load()-side.total.Load() >= size {
 			if side.total.Add(size) <= side.end.Load() {
 				n, err := s.w.Write(b)
 				if n != len(b) {
-					d.sentReserved(reservation{n: size, resets: resets}, int64(n))
+					d.sentReserved(reservation{n: size}, int64(n))
 				}
 				return n, err
 			}
 			// Another write of the connection, or a Budget taking the
 			// lease back, came first.
-			d.leases.unreserve(size, resets)
+			d.leases.unreserve(size)
 		}
 	}
 	return s.writeSlow(b)
@@ -1017,9 +1021,8 @@ type Conn struct {
 // charged at each read and write, as Budget.Lease describes, and while a
 // step's Limit applies it is charged at every read and write as a Limiter.
 // A Write counts its bytes before it sends them, so writes, also concurrent
-// ones, never pass a Budget's Stop; a Write that fails or is cut short just
-// as a change of the Budget takes its lease back keeps its unsent bytes
-// charged. A Read reads no more than the leases cover and counts what
+// ones, never pass a Budget's Stop; the bytes it does not send, also when a
+// change of the Budget takes its lease back meanwhile, are not charged. A Read reads no more than the leases cover and counts what
 // arrived, so concurrent Reads, and a Read in progress when its lease is
 // taken back, can pass the leases by what each reads, which counts as used.
 //
@@ -1178,6 +1181,12 @@ func newPacketConn(c net.PacketConn, o options, g *Group) *PacketConn {
 	pc.s.init(nil, nil, c, o, g)
 	return pc
 }
+
+// SetLimiters replaces the Limiters of the connection's reads and writes,
+// as WithLimiters set them, from the next read or write; a wait in progress
+// ends and starts over on the new ones, and nil leaves a direction
+// unlimited. A Group's levels still apply on top.
+func (c *Conn) SetLimiters(read, write Limiter) { c.rateConn.SetLimiters(read, write) }
 
 // SetLimiters replaces the Limiters of reads and writes, as Conn's does.
 func (c *PacketConn) SetLimiters(read, write Limiter) { c.s.SetLimiters(read, write) }

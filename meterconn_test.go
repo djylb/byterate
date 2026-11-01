@@ -435,8 +435,11 @@ func combination(t *testing.T, size int, limited, budget, group, swap, revoke bo
 func TestBudgetLeaseAPI(t *testing.T) {
 	b := NewBudget(Step{After: 1000}, Step{After: 3000, Limit: NewRate(1)}, Step{After: 5000, Stop: true})
 	l, err := b.Lease(5000)
-	if err != nil || l.Bytes != 1000 {
-		t.Fatalf("Lease(5000) = %d, %v; want 1000 up to the first step", l.Bytes, err)
+	if err != nil {
+		t.Fatalf("Lease(5000): %v", err)
+	}
+	if l.Bytes != 1000 {
+		t.Fatalf("Lease(5000) = %d; want 1000 up to the first step", l.Bytes)
 	}
 	b.Settle(l, 400)
 	if b.Used() != 400 {
@@ -466,8 +469,10 @@ func TestBudgetLeaseAPI(t *testing.T) {
 	if b.Used() != 0 {
 		t.Fatalf("Return across a Reset changed Used to %d", b.Used())
 	}
-	if l, err := (*Budget)(nil).Lease(7); l.Bytes != 7 || err != nil {
-		t.Fatalf("nil Budget Lease = %d, %v", l.Bytes, err)
+	if l, err := (*Budget)(nil).Lease(7); err != nil {
+		t.Fatalf("nil Budget Lease: %v", err)
+	} else if l.Bytes != 7 {
+		t.Fatalf("nil Budget Lease = %d", l.Bytes)
 	}
 }
 

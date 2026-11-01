@@ -165,7 +165,9 @@ whole second. Counting never reads the clock: the totals are sampled once a
 second of the Counter's clock has passed, by `Throughput` itself or by
 `Sample`. For the throughput of every second, call `Sample` once a second,
 such as from one ticker for all Counters; read more rarely, `Throughput`
-reports the average since the last sample. Limiters, such as a `Rate` in a
+reports the average since the last sample. Without a ticker, the first
+`Throughput` only takes the first sample and reports 0, and one read after a
+long pause reports the average of the whole pause, not its last second. Limiters, such as a `Rate` in a
 `NewHierarchy`, measure no throughput: give the connection a `Counter` with
 `WithCounter`, or open it in a `Group`, whose `Traffic` counts it:
 
@@ -309,7 +311,9 @@ period. Writes never take the usage past it, even concurrent ones: a
 `Write` sends what fits and fails. A `Read` reads no more than is left and
 the next one fails; a read counts what arrived, so a datagram, read whole,
 and a read in progress when its lease is taken back can pass the stop by
-what they read, which counts as used. Steps apply from their `After`. The
+what they read, which counts as used: at most one datagram, or one read
+buffer, per read in progress, such as up to 64 KiB for each concurrent read
+of a UDP socket. Steps apply from their `After`. The
 bytes used count everything
 charged to the `Budget`, whichever step applied, and a step's `Limit` only
 the bytes of its step; a `Limit` adds to the other limits, so it can only
@@ -337,8 +341,11 @@ remain:
 - a read counts what arrived after it, so concurrent reads on one
   direction of a connection, and a read in progress when its lease is taken
   back, can pass the lease by what each reads, which then counts as used;
-- a write that fails or is cut short just as its lease is taken back by one
-  of these changes keeps its unsent bytes charged;
+- a write that fails or is cut short after a `Reset` or `SetUsed` took its
+  lease back, and another write of the connection leased again, leaves its
+  unsent bytes to the new lease, which the new period then does not count;
+- a write that fails or is cut short after `SetLimiters` took a `Budget`
+  off its connection keeps its unsent bytes charged to that `Budget`;
 - the expiry takes leases back when its timer fires, so a read or write
   already admitted then completes;
 - `OnStep` reports a step when a lease reaches it, before its bytes pass,
