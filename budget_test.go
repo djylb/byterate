@@ -3,6 +3,9 @@ package byterate
 import (
 	"context"
 	"errors"
+	"fmt"
+	"io"
+	"net"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -475,5 +478,63 @@ func TestBudgetStepFollowsUsed(t *testing.T) {
 	_, _ = c.Write(make([]byte, 50_000))
 	if b.Used() != 50_000 || b.Step() != 0 {
 		t.Fatalf("after 50000 B: Used %d, Step %d; want 50000, 0", b.Used(), b.Step())
+	}
+}
+
+// writeOnBudget writes total bytes in chunks through a connection whose
+// writes are charged to b, discarding them at the peer, and closes it.
+func writeOnBudget(t *testing.T, b *Budget, total, chunk int) {
+	t.Helper()
+	cl, peer := net.Pipe()
+	done := make(chan struct{})
+	go func() { _, _ = io.Copy(io.Discard, peer); close(done) }()
+	c := NewConn(cl, WithLimiters(nil, b))
+	buf := make([]byte, chunk)
+	for sent := 0; sent < total; {
+		n, err := c.Write(buf[:min(chunk, total-sent)])
+		sent += n
+		if err != nil {
+			break
+		}
+	}
+	_ = c.Close()
+	<-done
+}
+
+// A lease that reaches a step and is given back unused reports no step.
+func TestBudgetOnStepNotOnLeasedBytes(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		b := NewBudget(Step{After: 100_000, Limit: NewRate(50_000)}, Step{After: 200_000, Stop: true})
+		var fired atomic.Int64
+		b.OnStep(func(int, int64) { fired.Add(1) })
+		writeOnBudget(t, b, 50_000, 10_000)
+		if fired.Load() != 0 || b.Used() != 50_000 || b.Step() != -1 {
+			t.Fatalf("OnStep ran %d times, Used %d, Step %d; want 0, 50000, -1", fired.Load(), b.Used(), b.Step())
+		}
+	})
+}
+
+// Connections sharing a Budget, whose leases are taken back below a step,
+// report each step once, with the usage at the step.
+func TestBudgetOnStepSharedOnce(t *testing.T) {
+	for _, conns := range []int{1, 2, 4} {
+		synctest.Test(t, func(t *testing.T) {
+			b := NewBudget(Step{After: 100_000, Limit: NewRate(100_000)}, Step{After: 400_000, Stop: true})
+			var mu sync.Mutex
+			var got []string
+			b.OnStep(func(s int, u int64) { mu.Lock(); got = append(got, fmt.Sprintf("%d@%d", s, u)); mu.Unlock() })
+			var wg sync.WaitGroup
+			for range conns {
+				wg.Go(func() { writeOnBudget(t, b, 300_000, 8<<10) })
+			}
+			wg.Wait()
+			want := "[0@100000 1@400000]"
+			if conns == 1 {
+				want = "[0@100000]"
+			}
+			if s := fmt.Sprint(got); s != want {
+				t.Fatalf("%d conns: OnStep reported %s, want %s", conns, s, want)
+			}
+		})
 	}
 }

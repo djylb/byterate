@@ -2,14 +2,14 @@ package byterate
 
 import "sync"
 
-// window meters the throughput of a Counter in fixed sampling windows of
-// sampleIntervalNs, whole seconds of its clock. Counting never reads the
-// clock: the totals are sampled, by Throughput or Sample, and a sample once
-// the clock has passed the open window's end closes it. The bytes since the
-// last sample count evenly over the whole seconds since then, so a reader
-// who samples every second sees each second on its own, one who samples
-// every N seconds their average. The windows are the same for every reader,
-// so what is reported does not depend on how many read it.
+// window meters the throughput of a Counter between samples of its totals,
+// at most one in each sampleIntervalNs, a whole second of its clock.
+// Counting never reads the clock: the totals are sampled, by Throughput or
+// Sample, and a sample once the clock has passed the open window's end
+// closes it. The bytes since the last sample count evenly over the whole
+// seconds since then, so a reader who samples every second sees about each
+// second on its own, one who samples every N seconds their average. What
+// is reported depends on when the samples were taken.
 //
 // Refunds that outweigh a window's counts, of bytes counted in an earlier
 // one, report it as 0 and carry the rest forward.

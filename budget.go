@@ -71,7 +71,12 @@ type Budget struct {
 // budgetPeriod is a period of a Budget and its bytes used. Charges, refunds
 // and leases hold the period they were made in, so that those of a period
 // that a Reset ended change nothing.
-type budgetPeriod struct{ used atomic.Int64 }
+type budgetPeriod struct {
+	used atomic.Int64
+	// reached is the most of the usage that OnStep looked at, so that
+	// each step is reported at most once in the period.
+	reached atomic.Int64
+}
 
 // per returns b's period.
 func (b *Budget) per() *budgetPeriod {
@@ -178,6 +183,7 @@ func (b *Budget) SetUsed(n int64) {
 	}
 	p := &budgetPeriod{}
 	p.used.Store(max(n, 0))
+	p.reached.Store(max(n, 0))
 	b.lessees.mu.Lock()
 	defer b.lessees.mu.Unlock()
 	b.cur.Store(p)
@@ -264,13 +270,16 @@ func (b *Budget) Remaining() int64 {
 	return max(set.stopAt-b.Used(), 0)
 }
 
-// OnStep makes b call f with the index of the step that a charge brought b
-// into and the bytes used then, each time a charge reaches a later step; of
-// several steps passed at once, it reports the last. f runs on the goroutine
-// of that charge, so it must return quickly. Reports of concurrent charges
-// may come out of order, and a step reached again after a refund is reported
-// again, as is one that a TryWait reached before another level of a
-// hierarchy refused the bytes. A nil f stops the reports.
+// OnStep makes b call f with the index of the step that the usage reached
+// and the bytes used then, each time it reaches a later step than any
+// before in the period; of several steps passed at once, it reports the
+// last. Each step is reported at most once a period, however refunds and
+// leases taken back move the usage below it again. The wrappers report a
+// step once the bytes that passed reach it, not the bytes they leased
+// ahead. f runs on the goroutine of the charge or I/O that found the step
+// reached, so it must return quickly. A step that a TryWait reached before
+// another level of a hierarchy refused the bytes counts as reached. A nil
+// f stops the reports.
 func (b *Budget) OnStep(f func(step int, used int64)) {
 	if b == nil {
 		return
@@ -298,7 +307,7 @@ func (b *Budget) wait(ctx context.Context, t *waitTimer, n int64, rc *receipt) e
 		return nil
 	}
 	m := rc.mark()
-	set, used, s, err := b.take(n, rc)
+	s, err := b.take(n, rc)
 	if err != nil || s == nil {
 		return err
 	}
@@ -308,7 +317,7 @@ func (b *Budget) wait(ctx context.Context, t *waitTimer, n int64, rc *receipt) e
 		}
 		return err
 	}
-	b.report(set, used, addSat(used, n))
+	b.report()
 	return nil
 }
 
@@ -328,7 +337,7 @@ func (b *Budget) tryWait(n, now int64, rc *receipt) error {
 		return nil
 	}
 	m := rc.mark()
-	set, used, s, err := b.take(n, rc)
+	s, err := b.take(n, rc)
 	if err != nil || s == nil {
 		return err
 	}
@@ -336,7 +345,7 @@ func (b *Budget) tryWait(n, now int64, rc *receipt) error {
 		rc.refundFrom(m, n)
 		return err
 	}
-	b.report(set, used, addSat(used, n))
+	b.report()
 	return nil
 }
 
@@ -365,18 +374,19 @@ func (b *Budget) check(n, now int64) error {
 }
 
 // take adds n bytes to the usage, unless they would take it past a Stop or
-// the expiry has passed, and records the charge in rc. It returns the steps,
-// the usage before, and the step whose Limit must take the bytes as well,
-// owed them, or nil, when it reports the step the bytes reach itself.
-func (b *Budget) take(n int64, rc *receipt) (set *budgetSteps, used int64, s *budgetStep, err error) {
-	set = b.stepSet()
+// the expiry has passed, and records the charge in rc. It returns the step
+// whose Limit must take the bytes as well, owed them, or nil, when it
+// reports the step the bytes reach itself.
+func (b *Budget) take(n int64, rc *receipt) (*budgetStep, error) {
+	set := b.stepSet()
 	p := b.per()
 	// Take the bytes before waiting, so that concurrent charges cannot pass
 	// a Stop together.
 	reclaimed := false
+	var used int64
 	for {
 		if b.expired() {
-			return nil, 0, nil, ErrBudgetExhausted
+			return nil, ErrBudgetExhausted
 		}
 		used = p.used.Load()
 		if addSat(used, n) > set.stopAt {
@@ -388,22 +398,23 @@ func (b *Budget) take(n int64, rc *receipt) (set *budgetSteps, used int64, s *bu
 					continue
 				}
 			}
-			return nil, 0, nil, ErrBudgetExhausted
+			return nil, ErrBudgetExhausted
 		}
 		if p.used.CompareAndSwap(used, addSat(used, n)) {
 			break
 		}
 	}
-	if _, s = set.at(used); s != nil && s.Limit == nil {
+	_, s := set.at(used)
+	if s != nil && s.Limit == nil {
 		s = nil
 	}
 	rc.add(budgetEntry(b, s, p))
 	if s != nil {
 		s.owed.Add(n)
 	} else {
-		b.report(set, used, addSat(used, n))
+		b.report()
 	}
-	return set, used, s, nil
+	return s, nil
 }
 
 // Ready returns how many of n bytes may pass at once: up to the next step,
@@ -460,7 +471,7 @@ func (b *Budget) Charge(n int64) error {
 		err = s.t.charge(n)
 	}
 	after := addSat(used, n)
-	b.report(set, used, after)
+	b.report()
 	if after >= set.stopAt || b.expired() {
 		return ErrBudgetExhausted
 	}
@@ -512,16 +523,36 @@ func (p *budgetPeriod) sub(n int64) int64 {
 	}
 }
 
-// report tells the OnStep callback of a charge that took the usage from
-// from to to into a later step of set.
-func (b *Budget) report(set *budgetSteps, from, to int64) {
-	f := b.onStep.Load()
-	if f == nil {
+// report tells the OnStep callback of the step that the usage of b's
+// period reached, unless an earlier report of the period covered it. The
+// usage it looks at leaves out what the wrappers' leases hold unused, so
+// that only bytes that were charged or passed reach a step.
+func (b *Budget) report() {
+	set := b.stepSet()
+	if len(set.steps) == 0 {
 		return
 	}
-	i, _ := set.at(from)
-	if j, _ := set.at(to); j > i {
-		(*f)(j, to)
+	p := b.per()
+	for {
+		seen := p.reached.Load()
+		i, _ := set.at(seen)
+		if j, _ := set.at(p.used.Load()); j <= i {
+			return // the cheap check: no lease or charge reached a step
+		}
+		used, ok := b.usedIn(p)
+		if !ok {
+			return // a new period began
+		}
+		j, _ := set.at(used)
+		if j <= i {
+			return
+		}
+		if p.reached.CompareAndSwap(seen, used) {
+			if f := b.onStep.Load(); f != nil {
+				(*f)(j, used)
+			}
+			return
+		}
 	}
 }
 

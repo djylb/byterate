@@ -2,6 +2,7 @@ package byterate
 
 import (
 	"errors"
+	"slices"
 	"sync"
 	"sync/atomic"
 )
@@ -37,7 +38,9 @@ const (
 // holders of leases together never take the usage past a Stop. Before it
 // refuses, b takes back what the wrappers' leases hold unused, so that the
 // bytes they hold never keep anyone else from the Budget. OnStep reports a
-// step when a lease reaches it, before its bytes pass. Leases never span a
+// step that a Lease taken here reaches as it is taken, since its bytes
+// count as used; the wrappers' leases report a step once the bytes that
+// passed on them reach it, so that one taken back unused reports none. Leases never span a
 // step, so a step's Limit applies from its After.
 //
 // The wrappers of this package lease from the Budgets among their levels by
@@ -49,28 +52,27 @@ func (b *Budget) Lease(n int64) (Lease, error) {
 		return Lease{}, ErrBudgetExhausted
 	}
 	if b == nil || n <= 0 {
-		l, _, _, err := b.leaseLocked(n, nil)
-		return l, err
+		return b.leaseLocked(n, nil)
 	}
 	b.lessees.mu.Lock()
-	l, set, from, err := b.leaseLocked(n, nil)
+	l, err := b.leaseLocked(n, nil)
 	b.lessees.mu.Unlock()
 	if err == nil {
-		b.report(set, from, addSat(from, l.Bytes))
+		b.report()
 	}
 	return l, err
 }
 
 // leaseLocked is Lease without the check of the expiry, which reads the
-// Clock, and the OnStep report, which it returns the arguments of. Refused,
+// Clock, and without the OnStep report. Refused,
 // it takes back the unused bytes of the wrappers' leases other than self
 // and tries once more. b.lessees.mu must be held.
-func (b *Budget) leaseLocked(n int64, self *budgetLease) (Lease, *budgetSteps, int64, error) {
+func (b *Budget) leaseLocked(n int64, self *budgetLease) (Lease, error) {
 	if n <= 0 {
-		return Lease{}, nil, 0, nil
+		return Lease{}, nil
 	}
 	if b == nil {
-		return Lease{Bytes: n}, nil, 0, nil
+		return Lease{Bytes: n}, nil
 	}
 	set := b.stepSet()
 	p := b.per()
@@ -90,11 +92,11 @@ func (b *Budget) leaseLocked(n int64, self *budgetLease) (Lease, *budgetSteps, i
 					continue
 				}
 			}
-			return Lease{}, nil, 0, err
+			return Lease{}, err
 		}
 		take := min(n, set.stopAt-used, set.nextAfter(used)-used)
 		if p.used.CompareAndSwap(used, used+take) {
-			return Lease{Bytes: take, per: p}, set, used, nil
+			return Lease{Bytes: take, per: p}, nil
 		}
 	}
 }
@@ -179,20 +181,30 @@ type lessees struct {
 // usedExact returns the usage less what the wrappers' leases hold unused,
 // plus what they passed beyond them and is not charged yet.
 func (b *Budget) usedExact() int64 {
-	p := b.per()
+	for {
+		if n, ok := b.usedIn(b.per()); ok {
+			return n
+		}
+	}
+}
+
+// usedIn is usedExact in period p, and false once p is not b's period.
+func (b *Budget) usedIn(p *budgetPeriod) (int64, bool) {
 	if b.lessees.n.Load() == 0 {
-		return p.used.Load()
+		return p.used.Load(), b.cur.Load() == p
 	}
 	b.lessees.mu.Lock()
 	defer b.lessees.mu.Unlock()
-	p = b.per()
+	if b.cur.Load() != p {
+		return 0, false
+	}
 	n := p.used.Load()
 	for l := range b.lessees.m {
 		if !l.charged && (l.per == p || l.per == nil) {
 			n -= l.end.Load() - l.total()
 		}
 	}
-	return max(n, 0)
+	return max(n, 0), true
 }
 
 // reclaimLocked takes back the unused bytes of the leases of p other than
@@ -356,12 +368,14 @@ func containsLease(ls []*budgetLease, l *budgetLease) bool {
 func (l *budgetLease) release() {
 	b := l.b
 	b.lessees.mu.Lock()
-	defer b.lessees.mu.Unlock()
 	if !l.charged {
 		l.settleLocked()
 	}
 	delete(b.lessees.m, l)
 	b.lessees.n.Store(int32(len(b.lessees.m)))
+	b.lessees.mu.Unlock()
+	// The bytes the lease passed may have taken the usage to a step.
+	b.report()
 }
 
 // lower lowers the end of s's leases to at most e, for a lease that a
@@ -405,11 +419,12 @@ func (s *leaseSet) minEnd() int64 {
 // bytes past the count, and returns once they cover at least need. On a
 // refusal before that it returns the Budget and its error.
 func (s *leaseSet) refill(want, need int64) (*Budget, error) {
-	var reports []stepReport
+	var reports []*Budget
 	defer func() {
-		// OnStep runs under no lock.
-		for _, r := range reports {
-			r.b.report(r.set, r.from, r.to)
+		// The bytes that passed on the leases used up may have taken the
+		// usage to a step. OnStep runs under no lock.
+		for _, b := range reports {
+			b.report()
 		}
 	}()
 	s.mu.Lock()
@@ -425,53 +440,46 @@ func (s *leaseSet) refill(want, need int64) (*Budget, error) {
 			if credit >= want {
 				break
 			}
-			r, err := l.extend(t, want-credit)
+			err := l.extend(t, want-credit)
+			if !slices.Contains(reports, l.b) {
+				reports = append(reports, l.b)
+			}
 			if err != nil {
 				if credit >= need {
 					break // what is left serves this I/O
 				}
 				return l.b, err
 			}
-			reports = append(reports, r)
 		}
 	}
 	return nil, nil
 }
 
-// stepReport is an OnStep report to make once no lock is held.
-type stepReport struct {
-	b        *Budget
-	set      *budgetSteps
-	from, to int64
-}
-
 // extend leases at least short more bytes, as far as the Budget has them,
-// at the count t, and returns the OnStep report to make. A Budget whose
+// at the count t. A Budget whose
 // expiry only its Clock can tell refuses with ErrWouldWait, so that it is
 // charged, and its expiry checked, at every read and write.
-func (l *budgetLease) extend(t, short int64) (stepReport, error) {
+func (l *budgetLease) extend(t, short int64) error {
 	b := l.b
 	expired := b.expired()
 	b.lessees.mu.Lock()
 	defer b.lessees.mu.Unlock()
 	if !expired && b.clock.Load() != nil && b.expiry.Load() != nil {
-		return stepReport{}, ErrWouldWait
+		return ErrWouldWait
 	}
 	var (
-		got  Lease
-		set  *budgetSteps
-		from int64
-		err  = ErrBudgetExhausted
+		got Lease
+		err = ErrBudgetExhausted
 	)
 	if !expired {
 		left := subSat(b.stepSet().stopAt, b.per().used.Load())
 		size := max(short, min(max(left/2, minLease), maxLease))
-		got, set, from, err = b.leaseLocked(size, l)
+		got, err = b.leaseLocked(size, l)
 	}
 	if err == nil {
 		l.per = got.per
 		l.end.Add(got.Bytes)
-		return stepReport{b: b, set: set, from: from, to: addSat(from, got.Bytes)}, nil
+		return nil
 	}
 	if errors.Is(err, ErrBudgetExhausted) {
 		// The bytes passed beyond the leases count all the same.
@@ -483,5 +491,5 @@ func (l *budgetLease) extend(t, short int64) (stepReport, error) {
 			}
 		}
 	}
-	return stepReport{}, err
+	return err
 }

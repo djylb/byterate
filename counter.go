@@ -230,19 +230,19 @@ func (c *Counter) Swap() (read, written int64) {
 	return read, written
 }
 
-// Throughput returns the bytes per second read and written in the last whole
-// second, or 0s until a second sample. Counting never reads the clock: the totals are sampled when a
-// whole second of c's clock has passed since the last sample, by Throughput
-// itself or by Sample, and the bytes between two samples count evenly over
-// the seconds between them. Called at least once a second, as a ticker of
-// the caller's does with Sample, it reports each second on its own; called
-// every N seconds, the average of those N seconds; without Sample, the
-// first call only takes the first sample, and a call after a long pause
-// reports the average of the whole pause. The windows are whole
-// seconds of c's clock, the same for every reader, so what it reports does
-// not depend on how many callers read it. Bytes counted before c's first
-// sample count in no window. A window in which more was refunded than
-// counted reports 0 and takes the rest off the following ones.
+// Throughput returns the bytes per second read and written between the
+// last two samples of c's totals, or 0s until a second sample. Counting
+// never reads the clock: the totals are sampled by Throughput itself or by
+// Sample, at most once in each whole second of c's clock, and the bytes
+// counted between two samples are averaged over the whole seconds between
+// them. So the first call without Sample reports 0, a reader that samples
+// once a second sees about each second on its own, and one that reads every
+// N seconds sees the average of those N seconds. What it reports depends on
+// when the samples were taken, by any caller: call Sample once a second, as
+// from a ticker of the caller's, for readings that do not depend on how
+// often or by how many Throughput is called. Bytes counted before c's first
+// sample count in none. A span in which more was refunded than counted
+// reports 0 and takes the rest off the following ones.
 func (c *Counter) Throughput() (readBps, writtenBps int64) {
 	if c == nil {
 		return 0, 0

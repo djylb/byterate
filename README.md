@@ -160,14 +160,17 @@ c := byterate.NewConn(conn, byterate.WithCounter(&traffic))
 read, written := traffic.Swap()
 ```
 
-**Throughput.** `Throughput` reports a Counter's bytes per second of the last
-whole second. Counting never reads the clock: the totals are sampled once a
-second of the Counter's clock has passed, by `Throughput` itself or by
-`Sample`. For the throughput of every second, call `Sample` once a second,
-such as from one ticker for all Counters; read more rarely, `Throughput`
-reports the average since the last sample. Without a ticker, the first
-`Throughput` only takes the first sample and reports 0, and one read after a
-long pause reports the average of the whole pause, not its last second. Limiters, such as a `Rate` in a
+**Throughput.** `Throughput` reports a Counter's bytes per second between
+its last two samples. Counting never reads the clock: the totals are sampled
+by `Throughput` itself or by `Sample`, at most once in each second of the
+Counter's clock, and the bytes between two samples are averaged over the
+whole seconds between them. So the first `Throughput` without a ticker only
+takes the first sample and reports 0, and a later one reports the average
+over the interval since the previous call, such as the whole of a long
+pause, not its last second. What it reports depends on when the samples
+were taken, by any caller; for the throughput of every second, independent
+of how often it is read, call `Sample` once a second, such as from one
+ticker for all Counters. Limiters, such as a `Rate` in a
 `NewHierarchy`, measure no throughput: give the connection a `Counter` with
 `WithCounter`, or open it in a `Group`, whose `Traffic` counts it:
 
@@ -308,8 +311,9 @@ transferred, keeps them on every level and returns the refusal.
 **Budgets.** A `Budget` never blocks by itself; the `Limit` of its step does.
 Once the usage reaches a `Stop` step, it refuses everything until the next
 period. Writes never take the usage past it, even concurrent ones: a
-`Write` sends what fits and fails. A `Read` reads no more than is left and
-the next one fails; a read counts what arrived, so a datagram, read whole,
+`Write` sends what fits and fails. A `Read` reads no more than is left: the
+`Read` that reaches the stop returns its bytes and a nil error, and the next
+one returns `ErrBudgetExhausted`; a read counts what arrived, so a datagram, read whole,
 and a read in progress when its lease is taken back can pass the stop by
 what they read, which counts as used: at most one datagram, or one read
 buffer, per read in progress, such as up to 64 KiB for each concurrent read
@@ -348,8 +352,11 @@ remain:
   off its connection keeps its unsent bytes charged to that `Budget`;
 - the expiry takes leases back when its timer fires, so a read or write
   already admitted then completes;
-- `OnStep` reports a step when a lease reaches it, before its bytes pass,
-  and a step applies from its `After` in each connection's leases.
+- `OnStep` reports a step once the bytes that passed reach it, not when a
+  lease reaches it, so a lease taken back unused reports nothing, and each
+  step at most once a period; a connection that reaches a step finds it at
+  its next read, write or `Close`, and a step applies from its `After` in
+  each connection's leases.
 
 `Close` gives back what a lease did not use; a wrapper dropped without
 `Close` gives it back once the garbage collector finds it.
@@ -383,10 +390,11 @@ bytes back to the limiter as it is now, so call it only for bytes the same
 limiter charged since its last `Enable`, `Reset`, `SetUsed` or `Set`, such as
 the unsent part of a `Wait` of your own.
 
-**Throughput.** `Counter.Throughput` reports the bytes of the last whole
-second, in one-second windows of the Counter's clock, the same for every
-reader, so it lags by one to two seconds. The bytes between two samples
-count evenly over the seconds between them. Refunds are taken off, those of
+**Throughput.** `Counter.Throughput` reports the average between the last
+two samples, the first reading 0: the bytes between two samples count
+evenly over the whole seconds between them, so a reading lags by up to the
+interval between samples, one to two seconds with a ticker calling `Sample`
+each second. Refunds are taken off, those of
 an earlier window off the following ones; `Restore` and `Set` are not
 traffic.
 
