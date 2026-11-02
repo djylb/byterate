@@ -169,17 +169,14 @@ takes the first sample and reports 0, and a later one reports the average
 over the interval since the previous call, such as the whole of a long
 pause, not its last second. What it reports depends on when the samples
 were taken, by any caller; for the throughput of every second, independent
-of how often it is read, call `Sample` once a second, such as from one
-ticker for all Counters. Limiters, such as a `Rate` in a
+of how often it is read, call `SampleEverySecond`, which samples it from a
+ticker that all such Counters share and drops it once it is garbage, or
+call `Sample` once a second from a ticker of your own. Limiters, such as a `Rate` in a
 `NewHierarchy`, measure no throughput: give the connection a `Counter` with
 `WithCounter`, or open it in a `Group`, whose `Traffic` counts it:
 
 ```go
-for range time.Tick(time.Second) {
-	for _, c := range counters {
-		c.Sample()
-	}
-}
+traffic.SampleEverySecond()
 readBps, writtenBps := traffic.Throughput()
 ```
 
@@ -365,7 +362,8 @@ remain:
 without ending connections; a slowed connection gets its full speed back
 from its next grant. `SetUsed` takes back persisted usage after a restart,
 or a total that several budgets share, and `SetExpiry` stops all bytes after
-a time. `Reset` drops the usage of the period, so keep what is billed in a
+a time; `AfterExpiry` runs a function then, such as to close connections
+that sit idle and so never meet the refusal. `Reset` drops the usage of the period, so keep what is billed in a
 `Counter`.
 
 **Groups.** Every read and write is limited by the limits of the group and

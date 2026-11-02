@@ -66,6 +66,9 @@ type Budget struct {
 	// under its mu, the timer that takes them back at the expiry.
 	lessees lessees
 	timer   *time.Timer
+	// AfterExpiry's funcs, under lessees.mu, and their number.
+	afterExpiry  map[*expiryFunc]struct{}
+	nAfterExpiry atomic.Int32
 }
 
 // budgetPeriod is a period of a Budget and its bytes used. Charges, refunds
@@ -237,6 +240,7 @@ func (b *Budget) scheduleLocked() {
 	b.timer = time.AfterFunc(time.Duration(e.at-nowNs()), func() {
 		if b := w.Value(); b != nil {
 			b.revoke()
+			b.runAfterExpiry()
 		}
 	})
 }
@@ -582,8 +586,21 @@ func (set *budgetSteps) at(used int64) (int, *budgetStep) {
 	return i, &set.steps[i]
 }
 
-// expired reports whether b's expiry has passed.
+// expired reports whether b's expiry has passed. With a Clock set, which
+// no timer follows, it starts the funcs of AfterExpiry when it finds so.
 func (b *Budget) expired() bool {
+	if !b.expiredLocked() {
+		return false
+	}
+	if b.nAfterExpiry.Load() != 0 && b.clock.Load() != nil {
+		b.runAfterExpiry()
+	}
+	return true
+}
+
+// expiredLocked is expired without starting the funcs of AfterExpiry; it
+// takes no lock, so it may be called with b.lessees.mu held.
+func (b *Budget) expiredLocked() bool {
 	if b == nil {
 		return false
 	}
