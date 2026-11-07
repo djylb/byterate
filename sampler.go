@@ -1,6 +1,7 @@
 package byterate
 
 import (
+	"slices"
 	"sync"
 	"time"
 	"weak"
@@ -27,10 +28,8 @@ func (c *Counter) SampleEverySecond() {
 	sampler.mu.Lock()
 	defer sampler.mu.Unlock()
 	p := weak.Make(c)
-	for _, q := range sampler.counters {
-		if q == p {
-			return
-		}
+	if slices.Contains(sampler.counters, p) {
+		return
 	}
 	sampler.counters = append(sampler.counters, p)
 	if !sampler.running {

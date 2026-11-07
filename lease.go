@@ -356,12 +356,7 @@ func (s *leaseSet) set(bs, charged []*Budget) {
 }
 
 func containsLease(ls []*budgetLease, l *budgetLease) bool {
-	for _, x := range ls {
-		if x == l {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(ls, l)
 }
 
 // release settles l and stops counting it as a lessee.

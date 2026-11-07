@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"maps"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -188,9 +189,7 @@ func (g *Group) SetParent(p *Group) error {
 		if a.members == nil {
 			a.members = make(map[weak.Pointer[rateConn]]*Meter)
 		}
-		for k, m := range g.members {
-			a.members[k] = m
-		}
+		maps.Copy(a.members, g.members)
 	}
 	for a := old; a != nil; a = a.parent.Load() {
 		if !stay[a] {

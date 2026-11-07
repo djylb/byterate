@@ -302,12 +302,7 @@ func (d *direction) recheck() {
 }
 
 func containsBudget(bs []*Budget, b *Budget) bool {
-	for _, x := range bs {
-		if x == b {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(bs, b)
 }
 
 // flatten returns the levels of l, those of a hierarchy one by one.
