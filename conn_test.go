@@ -298,12 +298,12 @@ func TestConnNilArguments(t *testing.T) {
 // test ends.
 func tcpPair(t *testing.T) (client, server net.Conn) {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = ln.Close() }()
-	client, err = net.Dial("tcp", ln.Addr().String())
+	client, err = (&net.Dialer{}).DialContext(t.Context(), "tcp", ln.Addr().String())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -365,7 +365,6 @@ func TestDuplexConnChargesEachDirection(t *testing.T) {
 	if got, want := metered(out), int64(7); got != want {
 		t.Fatalf("write limiter charged %d in total, want %d", got, want)
 	}
-
 }
 
 // drain reads from c until it fails.
@@ -557,7 +556,7 @@ func isClosed(ch <-chan struct{}) bool {
 
 // checkEnded fails unless ctx, whose Done channel was done, still has that
 // channel and a non-nil Err, as context.Context requires.
-func checkEnded(t *testing.T, ctx context.Context, done <-chan struct{}, want error) {
+func checkEnded(ctx context.Context, t *testing.T, done <-chan struct{}, want error) {
 	t.Helper()
 	if ctx.Done() != done {
 		t.Fatal("Done() returned a different channel after the wait ended")
@@ -595,7 +594,7 @@ func TestConnWaitContextStaysEnded(t *testing.T) {
 	if r := <-res; r.n != 0 || !isTimeout(r.err) {
 		t.Fatalf("Write() aborted by a deadline = %d, %v; want 0 and a timeout matching %v", r.n, r.err, os.ErrDeadlineExceeded)
 	}
-	checkEnded(t, ctx, done, context.DeadlineExceeded)
+	checkEnded(ctx, t, done, context.DeadlineExceeded)
 
 	// The cleared deadline gives the next wait an open context, which Close
 	// ends.
@@ -610,8 +609,8 @@ func TestConnWaitContextStaysEnded(t *testing.T) {
 	if r := <-res; r.n != 0 || !errors.Is(r.err, net.ErrClosed) {
 		t.Fatalf("Write() ended by Close = %d, %v; want 0, %v", r.n, r.err, net.ErrClosed)
 	}
-	checkEnded(t, ctx2, done2, context.Canceled)
-	checkEnded(t, ctx, done, context.DeadlineExceeded)
+	checkEnded(ctx2, t, done2, context.Canceled)
+	checkEnded(ctx, t, done, context.DeadlineExceeded)
 }
 
 // derivingLimiter is a Limiter that derives a context from the one it
@@ -876,7 +875,7 @@ func TestConnPendingDeadlineDoesNotPinConn(t *testing.T) {
 // testing/synctest bubble and collects the connection outside it: nothing
 // may touch the bubble's timer from outside, which is a fatal error.
 func TestBubbleDeadlineOutlivesBubble(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
+	synctest.Test(t, func(*testing.T) {
 		for range 2 {
 			c := NewConn(&nopNetConn{}, WithLimiter(NewRate(1000)))
 			_ = c.SetDeadline(time.Now().Add(time.Hour))

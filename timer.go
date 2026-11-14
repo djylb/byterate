@@ -4,7 +4,6 @@ import (
 	"math/rand/v2"
 	"sync/atomic"
 	"time"
-	"unsafe"
 )
 
 const (
@@ -114,9 +113,9 @@ func (w *waitTimer) sleep(waitNs int64, g *generation, done, switchCh <-chan str
 // the waiter of a plain Wait, takes one at random.
 func (w *waitTimer) key() uint32 {
 	if w == nil {
-		return rand.Uint32()
+		return rand.Uint32() //nolint:gosec // spreads waiters over channels, no secret
 	}
-	return mix32(uintptr(unsafe.Pointer(w)))
+	return mix32(addrOf(w))
 }
 
 // signaled reports whether ch is closed.

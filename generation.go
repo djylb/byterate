@@ -91,7 +91,7 @@ func (g *generation) waitCh(key uint32) <-chan struct{} {
 	if set == stoppedSet {
 		return closedChan
 	}
-	s := &set.shards[key&uint32(len(set.shards)-1)]
+	s := &set.shards[shardIndex(key, len(set.shards))]
 	c := s.Load()
 	if c == nil {
 		c = &stopChan{ch: make(chan struct{})}

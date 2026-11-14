@@ -264,8 +264,7 @@ func ExampleConn_SetLimiters() {
 // Report throughput every second from one ticker of the application's, for
 // all its Counters: counting itself never reads the clock.
 func ExampleCounter_Sample() {
-	var users []*byterate.Counter // such as each user Group's Traffic
-	users = append(users, new(byterate.Counter))
+	users := []*byterate.Counter{new(byterate.Counter)} // such as each user Group's Traffic
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 	report := func() {

@@ -23,7 +23,7 @@ func (b *Budget) AfterExpiry(f func()) (stop func() bool) {
 		b.afterExpiry = make(map[*expiryFunc]struct{})
 	}
 	b.afterExpiry[e] = struct{}{}
-	b.nAfterExpiry.Store(int32(len(b.afterExpiry)))
+	b.nAfterExpiry.Store(int64(len(b.afterExpiry)))
 	b.lessees.mu.Unlock()
 	if b.expired() {
 		b.runAfterExpiry()
@@ -35,7 +35,7 @@ func (b *Budget) AfterExpiry(f func()) (stop func() bool) {
 			return false
 		}
 		delete(b.afterExpiry, e)
-		b.nAfterExpiry.Store(int32(len(b.afterExpiry)))
+		b.nAfterExpiry.Store(int64(len(b.afterExpiry)))
 		return true
 	}
 }

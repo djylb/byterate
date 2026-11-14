@@ -175,7 +175,7 @@ func (l *budgetLease) settled(p *budgetPeriod) {
 type lessees struct {
 	mu sync.Mutex
 	m  map[*budgetLease]struct{}
-	n  atomic.Int32
+	n  atomic.Int64
 }
 
 // usedExact returns the usage less what the wrappers' leases hold unused,
@@ -314,7 +314,7 @@ func (s *leaseSet) set(bs, charged []*Budget) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	keep := make([]*budgetLease, 0, len(bs)+len(charged))
-	for i, b := range append(bs[:len(bs):len(bs)], charged...) {
+	for i, b := range append(slices.Clip(bs), charged...) {
 		var found *budgetLease
 		for _, l := range s.ls {
 			if l.b == b {
@@ -332,7 +332,7 @@ func (s *leaseSet) set(bs, charged []*Budget) {
 				b.lessees.m = make(map[*budgetLease]struct{})
 			}
 			b.lessees.m[found] = struct{}{}
-			b.lessees.n.Store(int32(len(b.lessees.m)))
+			b.lessees.n.Store(int64(len(b.lessees.m)))
 		}
 		switch c := i >= len(bs); {
 		case c && !found.charged:
@@ -367,7 +367,7 @@ func (l *budgetLease) release() {
 		l.settleLocked()
 	}
 	delete(b.lessees.m, l)
-	b.lessees.n.Store(int32(len(b.lessees.m)))
+	b.lessees.n.Store(int64(len(b.lessees.m)))
 	b.lessees.mu.Unlock()
 	// The bytes the lease passed may have taken the usage to a step.
 	b.report()
@@ -447,7 +447,7 @@ func (s *leaseSet) refill(want, need int64) (*Budget, error) {
 			}
 		}
 	}
-	return nil, nil
+	return nil, nil //nolint:nilnil // no Budget refused: the leases cover need
 }
 
 // extend leases at least short more bytes, as far as the Budget has them,

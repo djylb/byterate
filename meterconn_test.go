@@ -90,7 +90,7 @@ func TestConnSetLimitersHotSwap(t *testing.T) {
 // Used counts what passed, not what is leased.
 func TestConnBudgetLeasesShared(t *testing.T) {
 	b := stopAfter(1 << 20)
-	var conns []*Conn
+	conns := make([]*Conn, 0, 4)
 	for range 4 {
 		conns = append(conns, NewConn(&recordingConn{}, WithLimiter(b)))
 	}
@@ -294,6 +294,7 @@ func TestConnFeatureCombinations(t *testing.T) {
 }
 
 func combination(t *testing.T, size int, limited, budget, group, swap, revoke bool, how string) {
+	t.Helper()
 	client, server := tcpPair(t)
 	var levels []Limiter
 	if limited {
@@ -365,7 +366,7 @@ func combination(t *testing.T, size int, limited, budget, group, swap, revoke bo
 	switch how {
 	case "Write":
 		for off := 0; off < size && err == nil; {
-			m := 0
+			var m int
 			m, err = c.Write(data[off:min(off+50_000, size)])
 			off += m
 			n += int64(m)

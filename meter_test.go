@@ -68,7 +68,7 @@ func TestThroughputAveragesSparseSamples(t *testing.T) {
 func TestThroughputIgnoresReaders(t *testing.T) {
 	run := func(readers int) []int64 {
 		var got []int64
-		synctest.Test(t, func(t *testing.T) {
+		synctest.Test(t, func(*testing.T) {
 			c := NewSharedCounter()
 			nextWindow()
 			c.Sample()

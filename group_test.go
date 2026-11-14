@@ -400,11 +400,11 @@ func TestGroupOptions(t *testing.T) {
 		defer cancel()
 		opened := make(chan net.Conn)
 		go func() {
-			c, err := g.Open(&recordingConn{}, WithWait(ctx))
+			oc, err := g.Open(&recordingConn{}, WithWait(ctx))
 			if err != nil {
 				t.Error(err)
 			}
-			opened <- c
+			opened <- oc
 		}()
 		synctest.Wait()
 		_ = c.Close()
@@ -618,8 +618,8 @@ func TestGroupOpenVariants(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if n, err := dc.Write(make([]byte, 3000)); n != 3000 || err != nil || rc.maxWrite() != 3000 {
-			t.Fatalf("datagram Write = %d, %v, largest write %d; want 3000 whole", n, err, rc.maxWrite())
+		if n, werr := dc.Write(make([]byte, 3000)); n != 3000 || werr != nil || rc.maxWrite() != 3000 {
+			t.Fatalf("datagram Write = %d, %v, largest write %d; want 3000 whole", n, werr, rc.maxWrite())
 		}
 		rwc, err := g.OpenStream(&recordingConn{})
 		if err != nil || g.Conns() != 2 {

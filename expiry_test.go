@@ -79,8 +79,7 @@ func TestCounterSampleEverySecond(t *testing.T) {
 		if n != 1 {
 			t.Fatalf("%d Counters sampled, want 1", n)
 		}
-		runtime.KeepAlive(c)
-		c = nil
+		runtime.KeepAlive(c) // the last use: c can be collected from here
 		runtime.GC()
 		time.Sleep(2 * time.Second)
 		synctest.Wait()

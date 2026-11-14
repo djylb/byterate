@@ -3,9 +3,9 @@ package byterate
 import (
 	"bytes"
 	"context"
-	"fmt"
 	"io"
 	"net"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -14,7 +14,7 @@ import (
 
 func BenchmarkConnWrite(b *testing.B) {
 	for _, levels := range []int{1, 3, 5} {
-		b.Run(fmt.Sprint(levels), func(b *testing.B) {
+		b.Run(strconv.Itoa(levels), func(b *testing.B) {
 			rates := make([]*Rate, levels)
 			for i := range rates {
 				rates[i] = NewRate(benchLimit)
@@ -32,7 +32,7 @@ func BenchmarkConnWrite(b *testing.B) {
 
 func BenchmarkConnRead(b *testing.B) {
 	for _, levels := range []int{1, 3, 5} {
-		b.Run(fmt.Sprint(levels), func(b *testing.B) {
+		b.Run(strconv.Itoa(levels), func(b *testing.B) {
 			rates := make([]*Rate, levels)
 			for i := range rates {
 				rates[i] = NewRate(benchLimit)

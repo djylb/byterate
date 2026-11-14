@@ -5,7 +5,6 @@ import (
 	"runtime"
 	"sync"
 	"sync/atomic"
-	"unsafe"
 )
 
 // Counter adds up the bytes read and written by a transfer, for accounting
@@ -37,7 +36,7 @@ type Counter struct {
 	// The Meters added up in the totals, with their totals when attached.
 	srcMu sync.Mutex
 	srcs  map[*Meter]*meterSrc
-	nsrc  atomic.Int32 // len(srcs), so that totals skips srcMu without any
+	nsrc  atomic.Int64 // len(srcs), so that totals skips srcMu without any
 }
 
 // counterShard is one of the counter pairs of a shared Counter, on a cache
@@ -63,7 +62,7 @@ func (c *Counter) Add(read, written int64) {
 	}
 	cr, cw := &c.read, &c.written
 	if s := c.shards; s != nil {
-		shard := &s[shardKey()&uint32(len(s)-1)]
+		shard := &s[shardIndex(shardKey(), len(s))]
 		cr, cw = &shard.read, &shard.written
 	}
 	if read != 0 {
@@ -329,7 +328,7 @@ func (c *Counter) attachLocked(m *Meter, tot [2]int64) {
 		c.srcs = make(map[*Meter]*meterSrc)
 	}
 	c.srcs[m] = &meterSrc{base: tot, refs: 1}
-	c.nsrc.Store(int32(len(c.srcs)))
+	c.nsrc.Store(int64(len(c.srcs)))
 }
 
 // meterSrc is a Meter attached to a Counter: its totals when attached and
@@ -364,7 +363,7 @@ func (c *Counter) detachLocked(m *Meter, tot [2]int64) {
 	c.read.Add(tot[0] - src.base[0])
 	c.written.Add(tot[1] - src.base[1])
 	delete(c.srcs, m)
-	c.nsrc.Store(int32(len(c.srcs)))
+	c.nsrc.Store(int64(len(c.srcs)))
 }
 
 // moveMeters detaches ms from each Counter of from and attaches them to
@@ -420,5 +419,5 @@ func moveMeters(from, to []*Counter, ms []*Meter) {
 // its goroutine to another shard.
 func shardKey() uint32 {
 	var probe byte
-	return mix32(uintptr(unsafe.Pointer(&probe)) >> 12)
+	return mix32(addrOf(&probe) >> 12)
 }

@@ -124,14 +124,14 @@ func TestZeroCopyOverTCP(t *testing.T) {
 	done := make(chan error, 1)
 	go func() {
 		// file -> limited -> client ... server -> limited -> relayIn ... relayOut
-		_, err := io.Copy(NewConn(client, WithLimiter(write)), f)
+		_, cerr := io.Copy(NewConn(client, WithLimiter(write)), f)
 		_ = client.(*net.TCPConn).CloseWrite()
-		done <- err
+		done <- cerr
 	}()
 	go func() {
-		_, err := io.Copy(relayIn, NewConn(server, WithLimiter(read)))
+		_, cerr := io.Copy(relayIn, NewConn(server, WithLimiter(read)))
 		_ = relayIn.(*net.TCPConn).CloseWrite()
-		done <- err
+		done <- cerr
 	}()
 	got, err := io.ReadAll(relayOut)
 	if err != nil {

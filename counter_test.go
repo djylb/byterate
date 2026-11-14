@@ -167,7 +167,7 @@ func TestCounterViewsIgnoreNonPositive(t *testing.T) {
 
 // TestCounterReadRacesFirstAttach reads a Counter while a Meter attaches to
 // it for the first time; run with -race.
-func TestCounterReadRacesFirstAttach(t *testing.T) {
+func TestCounterReadRacesFirstAttach(*testing.T) {
 	for range 20 {
 		var c Counter
 		var m Meter

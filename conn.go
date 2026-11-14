@@ -14,7 +14,6 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
-	"unsafe"
 	"weak"
 )
 
@@ -34,7 +33,7 @@ var (
 // connection or stream.
 type Option struct {
 	read, write Limiter
-	ctx         context.Context
+	ctx         context.Context //nolint:containedctx // WithWait carries it to Open, which uses it once
 	counters    []*Counter
 	limiters    bool
 	datagram    bool
@@ -80,7 +79,7 @@ type options struct {
 	counters    []*Counter
 	datagram    bool
 	drop        bool
-	ctx         context.Context
+	ctx         context.Context //nolint:containedctx // the merged WithWait, for Open's wait
 }
 
 func mergeOptions(opts []Option) options {
@@ -93,7 +92,7 @@ func mergeOptions(opts []Option) options {
 		o.datagram = o.datagram || x.datagram
 		o.drop = o.drop || x.drop
 		if x.ctx != nil {
-			o.ctx = x.ctx
+			o.ctx = x.ctx //nolint:fatcontext // the last WithWait replaces the others; nothing is derived
 		}
 	}
 	return o
@@ -564,7 +563,7 @@ func (s *leaseSet) unreserve(n int64) {
 	}
 	// In address order, as another direction may lock the same Budgets.
 	slices.SortFunc(bs, func(x, y *Budget) int {
-		return cmp.Compare(uintptr(unsafe.Pointer(x)), uintptr(unsafe.Pointer(y)))
+		return cmp.Compare(addrOf(x), addrOf(y))
 	})
 	for _, b := range bs {
 		b.lessees.mu.Lock()
@@ -700,9 +699,9 @@ func (s *rateConn) writeSlow(b []byte) (n int, err error) {
 		var r *receipt
 		if st&dirLimited != 0 {
 			if !locked && d.writing != nil {
-				if err := d.lockWrite(); err != nil {
+				if lerr := d.lockWrite(); lerr != nil {
 					d.sentReserved(reserved, 0)
-					return n, err
+					return n, lerr
 				}
 				locked = true
 			}
@@ -781,9 +780,9 @@ func (s *rateConn) ReadFrom(r io.Reader) (int64, error) {
 		limited := st&dirLimited != 0
 		if limited {
 			if !locked {
-				if err := d.lockWrite(); err != nil {
+				if lerr := d.lockWrite(); lerr != nil {
 					d.sentReserved(reserved, 0)
-					return n, err
+					return n, lerr
 				}
 				locked = true
 			}
@@ -1118,6 +1117,8 @@ func isDatagramConn(c any) bool {
 	return false
 }
 
+// LocalAddr returns the local address of the wrapped connection, or nil
+// without one.
 func (c *Conn) LocalAddr() net.Addr {
 	if c.conn == nil {
 		return nil
@@ -1125,6 +1126,8 @@ func (c *Conn) LocalAddr() net.Addr {
 	return c.conn.LocalAddr()
 }
 
+// RemoteAddr returns the remote address of the wrapped connection, or nil
+// without one.
 func (c *Conn) RemoteAddr() net.Addr {
 	if c.conn == nil {
 		return nil
@@ -1204,6 +1207,9 @@ func (d *direction) admit(size int64, rc *receipt) error {
 	return d.lim.tryWait(size, nowNs(), rc)
 }
 
+// ReadFrom reads a whole datagram into b, once the read limit has no debt,
+// and charges it; with WithDrop, it drops the datagrams that the limit does
+// not let through at once and reads the next.
 func (c *PacketConn) ReadFrom(b []byte) (int, net.Addr, error) {
 	if c.pc == nil {
 		return 0, nil, ErrNilConn
@@ -1265,6 +1271,8 @@ func (c *PacketConn) readDropping(d *direction, b []byte) (int, net.Addr, error)
 	}
 }
 
+// WriteTo charges the datagram b and sends it whole to addr; with WithDrop,
+// it drops one that would wait and reports it sent.
 func (c *PacketConn) WriteTo(b []byte, addr net.Addr) (int, error) {
 	if c.pc == nil {
 		return 0, ErrNilConn
@@ -1316,8 +1324,12 @@ func (c *PacketConn) WriteTo(b []byte, addr net.Addr) (int, error) {
 	}
 }
 
+// Close closes the wrapped connection and ends c's waits, as Conn's Close
+// does.
 func (c *PacketConn) Close() error { return c.s.Close() }
 
+// LocalAddr returns the local address of the wrapped connection, or nil
+// without one.
 func (c *PacketConn) LocalAddr() net.Addr {
 	if c.pc == nil {
 		return nil
@@ -1325,14 +1337,18 @@ func (c *PacketConn) LocalAddr() net.Addr {
 	return c.pc.LocalAddr()
 }
 
+// SetDeadline sets the read and write deadlines of the wrapped connection
+// and ends c's limit waits at them, as Conn's does.
 func (c *PacketConn) SetDeadline(t time.Time) error {
 	return c.dl.set(c.pc, &c.s, t, true, true)
 }
 
+// SetReadDeadline sets the read deadline, as SetDeadline does for both.
 func (c *PacketConn) SetReadDeadline(t time.Time) error {
 	return c.dl.set(c.pc, &c.s, t, true, false)
 }
 
+// SetWriteDeadline sets the write deadline, as SetDeadline does for both.
 func (c *PacketConn) SetWriteDeadline(t time.Time) error {
 	return c.dl.set(c.pc, &c.s, t, false, true)
 }

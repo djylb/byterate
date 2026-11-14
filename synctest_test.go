@@ -108,7 +108,7 @@ func TestWaitTimerDrainsFiredTimer(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		cmd := exec.Command(exe, "-test.run=^TestWaitTimerDrainsFiredTimer$", "-test.count=1")
+		cmd := exec.CommandContext(t.Context(), exe, "-test.run=^TestWaitTimerDrainsFiredTimer$", "-test.count=1")
 		cmd.Env = append(os.Environ(), "GODEBUG=asynctimerchan=1", "BYTERATE_ASYNC_TIMER_CHILD=1")
 		out, err := cmd.CombinedOutput()
 		switch {

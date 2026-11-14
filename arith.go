@@ -3,6 +3,7 @@ package byterate
 import (
 	"math/bits"
 	"time"
+	"unsafe"
 )
 
 // bytesToNsCeil returns ceil(bytes*1e9/rate), saturated to maxI64.
@@ -26,11 +27,11 @@ func bytesToNsCeil(bytes, rate int64) int64 {
 
 // mulDiv returns floor(a*b/c) for a, b >= 0 and c > 0, saturated to maxI64.
 func mulDiv(a, b, c int64) int64 {
-	hi, lo := bits.Mul64(uint64(a), uint64(b))
-	if hi >= uint64(c) { // quotient does not fit in 64 bits
+	hi, lo := bits.Mul64(u64(a), u64(b))
+	if hi >= u64(c) { // quotient does not fit in 64 bits
 		return maxI64
 	}
-	q, _ := bits.Div64(hi, lo, uint64(c))
+	q, _ := bits.Div64(hi, lo, u64(c))
 	if q > uint64(maxI64) {
 		return maxI64
 	}
@@ -68,9 +69,25 @@ func covers(size, creditNs, limit int64) bool {
 	if limit <= 0 {
 		return true
 	}
-	hi, lo := bits.Mul64(uint64(creditNs), uint64(limit))
-	shi, slo := bits.Mul64(uint64(size), uint64(time.Second))
+	hi, lo := bits.Mul64(u64(creditNs), u64(limit))
+	shi, slo := bits.Mul64(u64(size), u64(int64(time.Second)))
 	return hi > shi || hi == shi && lo >= slo
+}
+
+// u64 converts x, which the caller knows not to be negative, to a uint64.
+func u64(x int64) uint64 {
+	return uint64(x) //nolint:gosec // x >= 0 by the caller's contract
+}
+
+// shardIndex returns key masked to the n shards of a set, n a power of two
+// small enough for a uint32, as pow2AtLeast makes them.
+func shardIndex(key uint32, n int) uint32 {
+	return key & uint32(n-1) //nolint:gosec // n <= 1<<31, a power of two
+}
+
+// addrOf returns the address of p, to order or spread pointers by.
+func addrOf[T any](p *T) uintptr {
+	return uintptr(unsafe.Pointer(p)) //nolint:gosec // only the address is used, never dereferenced
 }
 
 // mix32 spreads the bits of x over 32 bits by Fibonacci hashing, for keys

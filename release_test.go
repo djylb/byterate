@@ -3,7 +3,7 @@ package byterate
 import (
 	"context"
 	"errors"
-	"fmt"
+	"strconv"
 	"sync"
 	"testing"
 	"testing/synctest"
@@ -12,7 +12,7 @@ import (
 
 func TestWriteReceiptRefundsEveryLevel(t *testing.T) {
 	for _, count := range []int{1, 3, 5, 10} {
-		t.Run(fmt.Sprint(count), func(t *testing.T) {
+		t.Run(strconv.Itoa(count), func(t *testing.T) {
 			rates := make([]*Rate, count)
 			for i := range rates {
 				rates[i] = NewRate(1000)
@@ -77,7 +77,8 @@ func TestHierarchyWriteReceipts(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		// Exercise limited, unlimited and disabled levels, including receipts
 		// beyond the inline storage.
-		rates := []*Rate{NewRate(0), NewRate(1000), NewRate(0), NewRate(1000), NewRate(1000)}
+		rates := make([]*Rate, 0, 10)
+		rates = append(rates, NewRate(0), NewRate(1000), NewRate(0), NewRate(1000), NewRate(1000))
 		for range 5 {
 			rates = append(rates, NewRate(1000))
 		}
@@ -127,6 +128,7 @@ func TestHierarchyResetBeforeLevelCharge(t *testing.T) {
 // restartOnCharge restarts r once from inside its next charge, after the
 // charger has read r's generation, as a Reset on another goroutine can.
 func restartOnCharge(t *testing.T, r *Rate) {
+	t.Helper()
 	var once sync.Once
 	hook := func(c *Rate) {
 		if c == r {

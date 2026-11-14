@@ -45,7 +45,11 @@ func ExampleRate_json() {
 	}
 	_ = json.Unmarshal([]byte(`{"name":"alice","rate":{"limit":1048576}}`), &user)
 	fmt.Println(user.Rate.Limit())
-	out, _ := json.Marshal(user)
+	out, err := json.Marshal(user)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
 	fmt.Println(string(out))
 	// Output:
 	// 1048576

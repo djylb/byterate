@@ -1,0 +1,86 @@
+version: "2"
+
+linters:
+  default: all
+  disable:
+    # Formatting and naming style that gofmt and the code's idiom already
+    # settle: blank-line placement, short names in short scopes, the
+    # if err := f(); err != nil form, embedded-field spacing.
+    - wsl
+    - wsl_v5
+    - nlreturn
+    - varnamelen
+    - noinlineerr
+    - embeddedstructfieldcheck
+    - lll
+    # Zero values are ready to use throughout the package; literals name
+    # only the fields they set.
+    - exhaustruct
+    - exhaustruct_v5
+    # Functions are ordered by topic, next to the code they serve.
+    - funcorder
+    # The hot paths are written out in one function on purpose, so that
+    # the fast path stays inlined and free of calls; size metrics flag
+    # exactly those.
+    - cyclop
+    - gocognit
+    - gocyclo
+    - nestif
+    - funlen
+    - maintidx
+    # Tests measure timing and use synctest bubbles; running them in
+    # parallel would distort what they measure. Internal tests need the
+    # package's unexported state.
+    - paralleltest
+    - tparallel
+    - testpackage
+    # The wrappers return the errors of the connections they wrap as they
+    # are, so that callers see the same errors as without them.
+    - wrapcheck
+    # Limiter is the package's interface: constructors and views return it.
+    - ireturn
+    # Named results document what a function returns.
+    - nonamedreturns
+    # Package state is deliberate: the configuration lock, shared closed
+    # channels and the clock epoch.
+    - gochecknoglobals
+    # Constants are explained where they are used.
+    - mnd
+    # Type assertions follow a classification of the Limiter's kind; a
+    # mismatch is a bug that must panic.
+    - forcetypeassert
+    # No import rules: the module has no dependencies.
+    - depguard
+    # Deprecated, replaced by gomodguard_v2.
+    - gomodguard
+  settings:
+    govet:
+      enable-all: true
+      disable:
+        # Checked on its own, as fieldalignment; what remains are
+        # pointer-byte reports, for which fields keep their order of
+        # meaning.
+        - fieldalignment
+    exhaustive:
+      default-signifies-exhaustive: true
+    nolintlint:
+      require-explanation: true
+      require-specific: true
+  exclusions:
+    rules:
+      # Tests build errors in place, repeat their case names and unpack
+      # fixtures they partly ignore; they open files and run the test
+      # binary by path.
+      - path: (_test\.go|internal/leakcheck/)
+        linters:
+          - err113
+          - goconst
+          - dogsled
+      - path: _test\.go
+        linters:
+          - gosec
+        text: "G204|G304"
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0

@@ -68,7 +68,7 @@ type Budget struct {
 	timer   *time.Timer
 	// AfterExpiry's funcs, under lessees.mu, and their number.
 	afterExpiry  map[*expiryFunc]struct{}
-	nAfterExpiry atomic.Int32
+	nAfterExpiry atomic.Int64
 }
 
 // budgetPeriod is a period of a Budget and its bytes used. Charges, refunds
