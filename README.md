@@ -396,6 +396,30 @@ each second. Refunds are taken off, those of
 an earlier window off the following ones; `Restore` and `Set` are not
 traffic.
 
+## Reserving ahead
+
+A forwarder or a batched writer often learns how much it sends only after it
+has reserved room for it. Every limiter of this package is a `Reserver` for
+that: `Acquire(ctx, min, max)` waits until at least `min` bytes may be taken
+and takes as many of `max` as the limit allows at once; `TryAcquire(min,
+max)` does the same without waiting, or takes nothing and returns
+`ErrWouldWait`; `Refund` gives back what was not sent. `(n, n)` asks for all
+`n` bytes or none, `(1, n)` for what the limit allows of them. Grants never
+add up to more than the limit, however many goroutines share it; a
+hierarchy takes them on every level or on none, and unlike `Wait`, a
+canceled or refused `Acquire` keeps nothing. `NewHierarchy` and a Group's
+`Reads` and `Writes` return a `Limiter` that is also a `Reserver`.
+
+```go
+l := byterate.NewHierarchy(user, global).(byterate.Reserver)
+n, err := l.Acquire(ctx, 1, int64(len(buf)))
+if err != nil {
+	return err
+}
+m, err := src.Read(buf[:n])
+l.Refund(n - int64(m))
+```
+
 ## Writing a Limiter
 
 Most code combines the limiters of this package. A `Limiter` of your own needs

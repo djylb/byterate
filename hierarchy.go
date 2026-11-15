@@ -42,10 +42,15 @@ func NewHierarchy(limiters ...Limiter) Limiter {
 	case 0:
 		return nil
 	case 1:
-		if len(h.lv) == 1 {
-			return h.lv[0].l
+		// The level itself, when it is also a Reserver, as every Limiter
+		// of this package is.
+		one := h.lv
+		if len(one) == 0 {
+			one = h.views
 		}
-		return h.views[0].l
+		if _, ok := one[0].l.(Reserver); ok {
+			return one[0].l
+		}
 	}
 	return h
 }
