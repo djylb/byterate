@@ -20,13 +20,16 @@ func try(t *testing.T, r Reserver, minBytes, maxBytes int64) int64 {
 	return n
 }
 
-// The static types give the reserve capability without an assertion.
-var (
-	_ Reserver                  = NewHierarchy()
-	_ func(...Limiter) Reserver = NewHierarchy
-	_ func(*Group) Reserver     = (*Group).Reads
-	_ func(*Group) Reserver     = (*Group).Writes
-)
+// hasType compiles only when v has type T: the static types give the
+// reserve capability without an assertion.
+func hasType[T any](T) {}
+
+func TestReserverStaticTypes(*testing.T) {
+	hasType[Reserver](NewHierarchy())
+	hasType[func(...Limiter) Reserver](NewHierarchy)
+	hasType[func(*Group) Reserver]((*Group).Reads)
+	hasType[func(*Group) Reserver]((*Group).Writes)
+}
 
 func TestAcquireUnlimited(t *testing.T) {
 	var zero *Rate
