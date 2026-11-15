@@ -10,7 +10,7 @@ import (
 // forwarder or a batched writer that learns how much it sends only after
 // it has reserved room for it. Every Limiter of this package implements
 // it: *Rate, *Budget, *Switch, the result of NewHierarchy and the Reads and
-// Writes of a Group, which return a Limiter to assert it on.
+// Writes of a Group, which return it as a Reserver.
 //
 // Acquire and TryAcquire take as much of the range as the limit allows at
 // once, at least minBytes, on the same charges as Wait and TryWait, and

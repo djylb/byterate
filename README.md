@@ -408,10 +408,10 @@ max)` does the same without waiting, or takes nothing and returns
 add up to more than the limit, however many goroutines share it; a
 hierarchy takes them on every level or on none, and unlike `Wait`, a
 canceled or refused `Acquire` keeps nothing. `NewHierarchy` and a Group's
-`Reads` and `Writes` return a `Limiter` that is also a `Reserver`.
+`Reads` and `Writes` return a `Reserver`.
 
 ```go
-l := byterate.NewHierarchy(user, global).(byterate.Reserver)
+l := byterate.NewHierarchy(user, global)
 n, err := l.Acquire(ctx, 1, int64(len(buf)))
 if err != nil {
 	return err

@@ -33,7 +33,7 @@ import "context"
 // keeps its long-run limit, but when many waits on stricter levels end
 // together, a looser Rate they share can pass more than its burst at once:
 // up to the bytes of those waits.
-func NewHierarchy(limiters ...Limiter) Limiter {
+func NewHierarchy(limiters ...Limiter) Reserver {
 	h := &hierarchy{}
 	for _, l := range limiters {
 		h.add(l)
@@ -48,8 +48,8 @@ func NewHierarchy(limiters ...Limiter) Limiter {
 		if len(one) == 0 {
 			one = h.views
 		}
-		if _, ok := one[0].l.(Reserver); ok {
-			return one[0].l
+		if r, ok := one[0].l.(Reserver); ok {
+			return r
 		}
 	}
 	return h

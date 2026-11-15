@@ -20,12 +20,20 @@ func try(t *testing.T, r Reserver, minBytes, maxBytes int64) int64 {
 	return n
 }
 
+// The static types give the reserve capability without an assertion.
+var (
+	_ Reserver                  = NewHierarchy()
+	_ func(...Limiter) Reserver = NewHierarchy
+	_ func(*Group) Reserver     = (*Group).Reads
+	_ func(*Group) Reserver     = (*Group).Writes
+)
+
 func TestAcquireUnlimited(t *testing.T) {
 	var zero *Rate
 	var g Group
 	for name, r := range map[string]Reserver{
 		"nil": zero, "unlimited": NewRate(0), "budget": NewBudget(), "switch": NewSwitch(nil),
-		"hierarchy": NewHierarchy(NewRate(0), NewRate(0)).(Reserver), "group": g.Writes().(Reserver),
+		"hierarchy": NewHierarchy(NewRate(0), NewRate(0)), "group": g.Writes(),
 	} {
 		if n, err := r.Acquire(bg, 10, 1<<20); n != 1<<20 || err != nil {
 			t.Errorf("%s: Acquire = %d, %v, want %d", name, n, err, 1<<20)
@@ -110,7 +118,7 @@ func TestHierarchyAcquireRollback(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		r := NewRate(1000)
 		b := NewBudget(Step{After: 100, Stop: true})
-		h := NewHierarchy(r, b).(Reserver)
+		h := NewHierarchy(r, b)
 		if _, err := h.Acquire(bg, 200, 200); !errors.Is(err, ErrBudgetExhausted) {
 			t.Fatalf("Acquire past Stop = %v", err)
 		}
@@ -162,7 +170,7 @@ func TestAcquireConcurrentNeverOvergrants(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		const limit = 100_000
 		r := NewRate(limit)
-		h := NewHierarchy(r, NewRate(1<<30)).(Reserver)
+		h := NewHierarchy(r, NewRate(1<<30))
 		var got atomic.Int64
 		ctx, cancel := context.WithTimeout(bg, 2*time.Second)
 		defer cancel()
@@ -235,7 +243,7 @@ func BenchmarkRateAcquire(b *testing.B) {
 }
 
 func BenchmarkHierarchyAcquire(b *testing.B) {
-	h := NewHierarchy(NewRate(1<<50), NewRate(1<<50)).(Reserver)
+	h := NewHierarchy(NewRate(1<<50), NewRate(1<<50))
 	b.ReportAllocs()
 	for b.Loop() {
 		_, _ = h.Acquire(bg, 1, 1500)
@@ -243,7 +251,7 @@ func BenchmarkHierarchyAcquire(b *testing.B) {
 }
 
 func BenchmarkHierarchyTryAcquire(b *testing.B) {
-	h := NewHierarchy(NewRate(1<<50), NewRate(1<<50)).(Reserver)
+	h := NewHierarchy(NewRate(1<<50), NewRate(1<<50))
 	b.ReportAllocs()
 	for b.Loop() {
 		_, _ = h.TryAcquire(1, 1500)

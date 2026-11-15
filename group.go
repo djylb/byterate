@@ -531,7 +531,7 @@ func (q *slotQueue) wake(all bool) {
 // Reads returns the Limiter of the reads of g's connections: it charges the
 // read Limiters of g and its ancestors and counts the bytes read in their
 // Traffic, along the ancestors of the moment. It is nil for a nil g.
-func (g *Group) Reads() Limiter {
+func (g *Group) Reads() Reserver {
 	if g == nil {
 		return nil
 	}
@@ -540,7 +540,7 @@ func (g *Group) Reads() Limiter {
 
 // Writes returns the Limiter of the writes of g's connections, as Reads
 // does for reads, counting the bytes written.
-func (g *Group) Writes() Limiter {
+func (g *Group) Writes() Reserver {
 	if g == nil {
 		return nil
 	}
