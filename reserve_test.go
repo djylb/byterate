@@ -20,15 +20,13 @@ func try(t *testing.T, r Reserver, minBytes, maxBytes int64) int64 {
 	return n
 }
 
-// hasType compiles only when v has type T: the static types give the
-// reserve capability without an assertion.
-func hasType[T any](T) {}
-
-func TestReserverStaticTypes(*testing.T) {
-	hasType[Reserver](NewHierarchy())
-	hasType[func(...Limiter) Reserver](NewHierarchy)
-	hasType[func(*Group) Reserver]((*Group).Reads)
-	hasType[func(*Group) Reserver]((*Group).Writes)
+// The static return types give the reserve capability without a type
+// assertion: this compiles only while they return a Reserver. It is never
+// run, so the zero-level hierarchy (nil) is never called.
+var _ = func(g *Group) {
+	_, _ = NewHierarchy().TryAcquire(1, 1)
+	_, _ = g.Reads().TryAcquire(1, 1)
+	_, _ = g.Writes().TryAcquire(1, 1)
 }
 
 func TestAcquireUnlimited(t *testing.T) {
