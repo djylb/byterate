@@ -1,0 +1,114 @@
+== rate gcra
+      0s  wait 500 ok
+      0s  wait 1500 ok
+   700ms  wait 700 ok
+    3.7s  wait 3000 ok
+   3.71s  wait 10 ok
+   3.71s  trywait 100 byterate: limit would wait
+   6.71s  trywait 100 ok
+   7.21s  refund; wait 2500 ok
+9.209999999s  setlimit; wait 8000 ok
+9.337999999s  acquire 512 ok
+9.337999999s  tryacquire 0 byterate: limit would wait
+9.587999999s  burst 100ms; wait 1000 ok
+== hierarchy
+      1s  wait 3000 ok
+      2s  wait 1000 ok
+    2.5s  wait 500 ok
+    2.5s  trywait byterate: limit would wait
+    2.6s  refund; wait 600 ok
+    4.1s  budget wait 1500 ok used=1500
+    4.1s  budget wait 1500 byterate: budget exhausted used=1500
+    4.3s  canceled wait context deadline exceeded
+    9.2s  after cancel wait 100 ok
+== budget steps
+      0s  wait 6000 ok used=6000 step=-1 remaining=14000
+      0s  wait 6000 ok used=12000 step=0 remaining=8000
+      4s  wait 6000 ok used=18000 step=0 remaining=2000
+      4s  wait 6000 byterate: budget exhausted used=18000 step=0 remaining=2000
+      4s  charge byterate: budget exhausted used=23000
+      4s  refund used=20000
+      4s  reset used=0 step=-1
+      4s  lease 4000 ok used=4000
+      4s  settle used=1000
+      4s  setsteps trywait byterate: budget exhausted used=1000
+      4s  setused used=100 remaining=400
+      4s  steps [0@12000 1@23000]
+== budget leases on conns
+      0s  round 0: write 10240 ok read 10240 ok used=20480 remaining=81920
+      0s  round 1: write 10240 ok read 10240 ok used=40960 remaining=61440
+      0s  round 2: write 10240 ok read 10240 ok used=61440 remaining=40960
+      0s  round 3: write 10240 ok read 10240 ok used=81920 remaining=20480
+      0s  round 4: write 10240 ok read 10240 ok used=102400 remaining=0
+      0s  round 5: write 0 byterate: budget exhausted read 0 byterate: budget exhausted used=102400 remaining=0
+      0s  close c1 used=102400
+      0s  c2 wrote 0 then byterate: budget exhausted used=102400
+      0s  closed used=102400
+== switch
+      0s  first write
+   500ms  long write 5000 ok
+   500ms  switched; write ok
+   500ms  unlimited write 1048576 ok
+== group tree
+      0s  open ok
+      0s  c1 wrote 20000
+      0s  before move root: traffic 5300/26000 conns 3
+      0s  before move user: traffic 5300/21000 conns 2
+      0s  before move tun: traffic 300/21000 conns 1
+      0s  before move other: traffic 0/5000 conns 1
+      0s  setparent ok
+      0s  cycle byterate: group would be its own ancestor
+   500ms  c1 wrote 5000 under other
+   500ms  after move root: traffic 5300/31700 conns 3
+   500ms  after move user: traffic 5300/21000 conns 1
+   500ms  after move tun: traffic 300/26700 conns 1
+   500ms  after move other: traffic 0/10700 conns 2
+   600ms  after settraffic root: traffic 5300/36700 conns 3
+   600ms  after settraffic user: traffic 0/5000 conns 1
+   600ms  after settraffic tun: traffic 300/26700 conns 1
+   600ms  after settraffic other: traffic 0/10700 conns 2
+   600ms  closed root: traffic 5300/36700 conns 0
+   600ms  closed user: traffic 0/5000 conns 0
+   600ms  closed tun: traffic 300/26700 conns 0
+   600ms  closed other: traffic 0/10700 conns 0
+    8.6s  c4 under root rate
+    9.1s  root rate removed
+    9.1s  end root: traffic 5300/51700 conns 0
+    9.1s  end user: traffic 0/5000 conns 0
+    9.1s  end tun: traffic 300/41700 conns 0
+    9.1s  end other: traffic 0/25700 conns 0
+== group budget leases
+      0s  wrote 51200 then byterate: budget exhausted used=51200
+      0s  after removing budget write 8192 ok used=51200
+      0s  closed used=51200
+== group slots
+      0s  a ok
+      0s  b ok
+      0s  a again byterate: too many connections refused-by-root=true
+      0s  waiters 3 conns root=3 a=3 b=0
+      0s  b ok
+      1s  b ctx context deadline exceeded
+      1s  move a under b ok conns b=4 root=4
+== counter
+      0s  total 100/200
+      0s  swap 100/200
+      0s  load 5/6
+      0s  restore total 1105/1206 load 5/6
+      0s  set total 10/20 load 5/6
+      1s  throughput 0/0
+      2s  throughput 1000/3000
+      3s  throughput 1000/3000
+      3s  attached total 3010/9097
+      3s  one detach total 3010/9100
+      3s  detached total 3010/9100 meter 0/85
+      3s  shared total 8000/16000
+      3s  withcounter twice total 0/9
+== conn limiters
+      0s  write 1500 ok
+      1s  write 1500 ok
+    2.5s  write 1500 ok
+    2.5s  unlimited write 1500 ok
+    2.5s  read 1000 ok
+    2.5s  read 512 ok
+  3.524s  read 512 ok
+  3.624s  deadline write 0 i/o timeout
