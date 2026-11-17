@@ -111,6 +111,7 @@ type Meter struct {
 	read    meterSide
 	written meterSide
 	leases  [2]leaseSet // of reads and writes
+	node    *groupNode  // of the Group of the wrapper, nil for none
 }
 
 // meterSide is the count of one direction of a Meter and the count at which
@@ -1154,7 +1155,8 @@ func (s *rateConn) init(r io.Reader, w io.Writer, c io.Closer, o options, g *Gro
 		c.attach(m, [2]int64{})
 	}
 	if g != nil {
-		g.node().sum.attach(m, [2]int64{})
+		m.node = g.node()
+		m.node.sum.attach(m, [2]int64{})
 		s.seen.Store(groupGen.Load())
 		s.levels = g.levels()
 	}

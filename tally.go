@@ -29,7 +29,7 @@ type tally struct {
 	nsrc  atomic.Int64 // sources attached, so that a Detach of none skips the table
 }
 
-// source is what a tally adds up: a Meter, or a tally.
+// source is what a tally adds up: a Meter, or a Group's node.
 type source interface {
 	totals() [2]int64
 }
@@ -170,9 +170,6 @@ func (t *tally) total() [2]int64 {
 	}
 }
 
-// totals is total, for a tally that is a source.
-func (t *tally) totals() [2]int64 { return t.total() }
-
 // sourced returns the bytes of t's sources, and false when a bigger table
 // replaced the one it read meanwhile. Each shard is read whole under its
 // lock, so a Detach that moves a source's bytes into the shard is seen
@@ -219,6 +216,33 @@ func (t *tally) detach(s source, tot [2]int64) {
 	if sh.drop(s, tot) {
 		t.nsrc.Add(-1)
 	}
+}
+
+// anySource reports whether f reports true for a source of t.
+func (t *tally) anySource(f func(source) bool) bool {
+	tab := t.srcs.Load()
+	for tab != nil {
+		found, retired := false, false
+		for i := range tab.shards {
+			sh := &tab.shards[i]
+			sh.mu.Lock()
+			if retired = tab.retired; !retired {
+				found = sh.one.src != nil && f(sh.one.src)
+				for s := range sh.m {
+					found = found || f(s)
+				}
+			}
+			sh.mu.Unlock()
+			if found || retired {
+				break
+			}
+		}
+		if !retired {
+			return found
+		}
+		tab = t.srcs.Load()
+	}
+	return false
 }
 
 // lock locks and returns the shard of s, making the table on first use and
@@ -284,7 +308,7 @@ func srcKey(s source) uint32 {
 	switch v := s.(type) {
 	case *Meter:
 		return mix32(addrOf(v) >> 4)
-	case *tally:
+	case *groupNode:
 		return mix32(addrOf(v) >> 4)
 	}
 	return 0

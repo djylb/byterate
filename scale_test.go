@@ -1,6 +1,7 @@
 package byterate
 
 import (
+	"errors"
 	"runtime"
 	"slices"
 	"testing"
@@ -228,5 +229,29 @@ func TestCacheLinePadding(t *testing.T) {
 		if x.size != lines*cacheLineSize {
 			t.Errorf("%s takes %d B, want %d lines of %d", x.name, x.size, lines, cacheLineSize)
 		}
+	}
+}
+
+// A Counter that counts a connection by Attach cannot become the Traffic of
+// the connection's Group or of an ancestor, which counts it already.
+func TestTrafficOverlapsAttachedMeter(t *testing.T) {
+	root := NewGroup(nil)
+	g := NewGroup(root)
+	c, err := g.Open(&nopNetConn{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = c.Close() }()
+	var ctr Counter
+	if err := ctr.Attach(c.Meter()); err != nil {
+		t.Fatal(err)
+	}
+	for _, x := range []*Group{g, root} {
+		if err := x.SetTraffic(&ctr); !errors.Is(err, ErrCounterOverlap) {
+			t.Fatalf("SetTraffic of a Counter that counts a connection below: %v", err)
+		}
+	}
+	if err := NewGroup(nil).SetTraffic(&ctr); err != nil {
+		t.Fatalf("SetTraffic elsewhere: %v", err)
 	}
 }

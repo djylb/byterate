@@ -375,8 +375,12 @@ close; the bytes counted before stay with the old ancestors. `SetParent` and
 at most one chunk of traffic away; a wait in progress ends on the limits it
 began with. `SetMaxConns` limits the connections of a level and everything
 below it. `Acquire` takes a slot at every level or none. A limiter given to
-several levels is charged once; a `Counter` given to several, as `Traffic`
-or by `WithCounter`, counts at each of them.
+several levels is charged once. A `Counter` may be the `Traffic` of
+sibling groups, adding them up, but never counts the same bytes twice:
+`SetTraffic`, `SetParent`, `Open` with `WithCounter` and `Counter.Attach`
+return `ErrCounterOverlap`, and change nothing, where the Counter would
+count a group together with an ancestor or descendant, or a connection
+together with its group or an ancestor.
 
 **Switching.** After `Switch.Set`, new charges go to the new limiter, and a
 wait in progress on a `Rate` of the old one ends, is refunded there, and

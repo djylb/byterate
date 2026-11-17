@@ -295,27 +295,39 @@ func (nopRWC) Read(b []byte) (int, error)  { return len(b), nil }
 func (nopRWC) Write(b []byte) (int, error) { return len(b), nil }
 func (nopRWC) Close() error                { return nil }
 
-// A Counter shared by Groups, or given to a connection as well, counts
-// what each of them passes, each where it is: moving one Group moves its
-// connections alone, and a connection given the Counter of its Group
-// counts in it through both.
+// A Counter shared by sibling Groups counts each connection where it is:
+// moving one Group moves its connections alone. Where a Counter would count
+// the same bytes twice, the call that would make it so fails with
+// ErrCounterOverlap and changes nothing.
 func TestSharedTrafficCounter(t *testing.T) {
 	var shared Counter
 	p, q := NewGroup(nil), NewGroup(nil)
 	g1, g2 := NewGroup(p), NewGroup(nil)
-	g1.SetTraffic(&shared)
-	g2.SetTraffic(&shared)
+	for _, g := range []*Group{g1, g2} {
+		if err := g.SetTraffic(&shared); err != nil {
+			t.Fatal(err)
+		}
+	}
 	c1, _ := g1.OpenStream(nopRWC{})
-	c2, _ := g2.OpenStream(nopRWC{}, WithCounter(&shared))
+	if _, err := g2.OpenStream(nopRWC{}, WithCounter(&shared)); !errors.Is(err, ErrCounterOverlap) {
+		t.Fatalf("WithCounter of the Group's own Traffic: %v, want ErrCounterOverlap", err)
+	}
+	if g2.Conns() != 0 {
+		t.Fatalf("a refused Open kept its slot: %d", g2.Conns())
+	}
+	c2, _ := g2.OpenStream(nopRWC{})
 	defer func() { _ = c1.Close() }()
 	defer func() { _ = c2.Close() }()
+	if err := shared.Attach(c2.Meter()); !errors.Is(err, ErrCounterOverlap) {
+		t.Fatalf("Attach of a Meter that the Counter counts: %v, want ErrCounterOverlap", err)
+	}
 	write := func() {
 		_, _ = c1.Write(make([]byte, 100))
 		_, _ = c2.Write(make([]byte, 10))
 	}
 	write()
-	if _, w := shared.Total(); w != 120 {
-		t.Fatalf("shared Counter counted %d, want 100 B of g1 and 10 B twice", w)
+	if _, w := shared.Total(); w != 110 {
+		t.Fatalf("shared Counter counted %d, want 110", w)
 	}
 	if err := g1.SetParent(q); err != nil {
 		t.Fatal(err)
@@ -327,25 +339,40 @@ func TestSharedTrafficCounter(t *testing.T) {
 	if _, w := p.Traffic().Total(); w != 100 {
 		t.Fatalf("old parent counted %d, want 100", w)
 	}
+	// g2 below g1 would put the shared Counter above and below.
+	if err := g2.SetParent(g1); !errors.Is(err, ErrCounterOverlap) {
+		t.Fatalf("SetParent under a Group of the same Traffic: %v, want ErrCounterOverlap", err)
+	}
+	if g2.Parent() != nil {
+		t.Fatal("a refused SetParent moved the Group")
+	}
 	var moved Counter
-	g1.SetTraffic(&moved)
+	if err := g1.SetTraffic(&moved); err != nil {
+		t.Fatal(err)
+	}
 	write()
 	if _, w := moved.Total(); w != 100 {
 		t.Fatalf("moved Counter counted %d, want 100", w)
 	}
-	if _, w := shared.Total(); w != 260 {
-		t.Fatalf("shared Counter counted %d, want 260", w)
+	if _, w := shared.Total(); w != 230 {
+		t.Fatalf("shared Counter counted %d, want 230", w)
 	}
-	// g2's Traffic and the connection's WithCounter are one Counter: once
-	// g2 takes another, the connection counts in it alone.
-	if err := g2.SetParent(p); err != nil {
+	// Without the shared Traffic, g2 may move below g1, and its connection
+	// may count in the Counter by Attach.
+	if err := g2.SetTraffic(&Counter{}); err != nil {
 		t.Fatal(err)
 	}
-	g2.SetTraffic(&Counter{})
-	write()
-	if _, w := shared.Total(); w != 270 {
-		t.Fatalf("shared Counter counted %d after g2 left it, want 270", w)
+	if err := g2.SetParent(g1); err != nil {
+		t.Fatal(err)
 	}
+	if err := shared.Attach(c2.Meter()); err != nil {
+		t.Fatal(err)
+	}
+	write()
+	if _, w := shared.Total(); w != 240 {
+		t.Fatalf("shared Counter counted %d, want 240", w)
+	}
+	shared.Detach(c2.Meter())
 }
 
 // A Write that starts after SetUsed at the stop returned passes nothing,

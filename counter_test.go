@@ -172,7 +172,7 @@ func TestCounterReadRacesFirstAttach(*testing.T) {
 		var c Counter
 		var m Meter
 		var wg sync.WaitGroup
-		wg.Go(func() { c.Attach(&m) })
+		wg.Go(func() { _ = c.Attach(&m) })
 		c.Load()
 		c.Throughput()
 		wg.Wait()

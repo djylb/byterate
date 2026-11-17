@@ -239,11 +239,22 @@ func (c *Counter) throughput(now int64) [2]int64 {
 // Counter shared by many connections costs their reads and writes nothing.
 // The bytes m counted before stay out of c. Detach ends it, keeping the
 // bytes in c. A Meter attached more than once counts once, until as many
-// Detaches.
-func (c *Counter) Attach(m *Meter) {
-	if c != nil && m != nil {
-		c.attach(m, m.totals())
+// Detaches. It returns ErrCounterOverlap, and attaches nothing, when c is
+// the Traffic of the Group m's wrapper was opened in or of an ancestor,
+// which counts m already.
+func (c *Counter) Attach(m *Meter) error {
+	if c == nil || m == nil {
+		return nil
 	}
+	if m.node != nil {
+		cycleMu.Lock()
+		defer cycleMu.Unlock()
+		if c.countsAbove(m.node) {
+			return ErrCounterOverlap
+		}
+	}
+	c.attach(m, m.totals())
+	return nil
 }
 
 // Detach ends an Attach of m, and with the last one stops adding m's bytes

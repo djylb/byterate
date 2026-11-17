@@ -226,7 +226,7 @@ func BenchmarkConnWriteNested(b *testing.B) {
 // are timed; more such goroutines would take processors from the writers.
 func BenchmarkGroupOpenWrite(b *testing.B) {
 	root := NewGroup(nil)
-	root.SetTraffic(new(Counter))
+	_ = root.SetTraffic(new(Counter))
 	stop := make(chan struct{})
 	var churn sync.WaitGroup
 	churner := NewGroup(root)

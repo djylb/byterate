@@ -19,6 +19,13 @@ var (
 	// ErrGroupCycle is returned by SetParent for a parent that is the Group
 	// itself or one of its descendants.
 	ErrGroupCycle = errors.New("byterate: group would be its own ancestor")
+	// ErrCounterOverlap is returned where a Counter would count the same
+	// bytes twice: given as the Traffic of a Group and of one of its
+	// ancestors or descendants, or to a connection by WithCounter or Attach
+	// while it is the Traffic of the connection's Group or of an ancestor.
+	// Groups that share a Counter must not be above one another; siblings
+	// may share one.
+	ErrCounterOverlap = errors.New("byterate: counter would count the same bytes twice")
 )
 
 // TooManyConnsError is the error of Acquire and Open when a Group refuses a
@@ -93,8 +100,20 @@ type groupNode struct {
 	// detaches it when the Group is collected.
 	up      *groupNode
 	sum     tally
-	mu      sync.Mutex // serializes SetTraffic
 	cleanup bool
+}
+
+// totals makes a node the source of the sums and Counters it is attached to.
+func (n *groupNode) totals() [2]int64 { return n.sum.total() }
+
+// within reports whether n is a, or below a. cycleMu must be held.
+func (n *groupNode) within(a *groupNode) bool {
+	for x := n; x != nil; x = x.up {
+		if x == a {
+			return true
+		}
+	}
+	return false
 }
 
 // groupSlots are the fields of a Group that Acquire and Release write.
@@ -137,7 +156,7 @@ func (g *Group) node() *groupNode {
 // unless g is not yet shared.
 func (g *Group) adopt(p *Group, tot [2]int64) {
 	n, up := g.node(), p.node()
-	up.sum.attach(&n.sum, tot)
+	up.sum.attach(n, tot)
 	n.up = up
 	if !n.cleanup {
 		n.cleanup = true
@@ -151,7 +170,7 @@ func (n *groupNode) orphan() {
 	cycleMu.Lock()
 	defer cycleMu.Unlock()
 	if up := n.up; up != nil {
-		up.sum.detach(&n.sum, n.sum.total())
+		up.sum.detach(n, n.sum.total())
 		n.up = nil
 	}
 }
@@ -245,6 +264,13 @@ func (g *Group) SetParent(p *Group) error {
 			return ErrGroupCycle
 		}
 	}
+	// A Traffic of the new ancestors that counts a Group or connection of
+	// g's subtree already would count its bytes twice once g is below.
+	for a := p; a != nil; a = a.parent.Load() {
+		if t := a.traffic.Load(); t != nil && t.countsWithin(g.node()) {
+			return ErrCounterOverlap
+		}
+	}
 	old := g.parent.Load()
 	n := g.conns.Load()
 	for a := old; a != nil; a = a.parent.Load() {
@@ -259,7 +285,7 @@ func (g *Group) SetParent(p *Group) error {
 	nd := g.node()
 	tot := nd.sum.total()
 	if old != nil {
-		old.node().sum.detach(&nd.sum, tot)
+		old.node().sum.detach(nd, tot)
 		nd.up = nil
 	}
 	if p != nil {
@@ -370,7 +396,7 @@ func (g *Group) Traffic() *Counter {
 	}
 	// The first Counter counts all that g's sum did, and is made once.
 	c := &Counter{}
-	c.attach(&g.node().sum, [2]int64{})
+	c.attach(g.node(), [2]int64{})
 	g.traffic.CompareAndSwap(nil, c)
 	return g.traffic.Load()
 }
@@ -378,23 +404,66 @@ func (g *Group) Traffic() *Counter {
 // SetTraffic makes c the Counter of g's traffic from now on, such as a
 // Counter restored after a restart, or one that several Groups share to add
 // up their traffic; nil makes a new one. The bytes counted before stay in
-// the Counter it replaces. A Counter that a Group shares with one of its
-// ancestors counts the Group's bytes in each.
-func (g *Group) SetTraffic(c *Counter) {
+// the Counter it replaces. It returns ErrCounterOverlap, and changes
+// nothing, when c already counts an ancestor or descendant of g, or a
+// connection in g or below, whose bytes it would count twice.
+func (g *Group) SetTraffic(c *Counter) error {
 	if c == nil {
 		c = &Counter{}
 	}
+	cycleMu.Lock()
+	defer cycleMu.Unlock()
 	n := g.node()
-	n.mu.Lock()
-	defer n.mu.Unlock()
 	old := g.Traffic()
 	if old == c {
-		return
+		return nil
+	}
+	if c.countsAround(n) {
+		return ErrCounterOverlap
 	}
 	tot := n.sum.total()
-	old.detach(&n.sum, tot)
-	c.attach(&n.sum, tot)
+	old.detach(n, tot)
+	c.attach(n, tot)
 	g.traffic.Store(c)
+	return nil
+}
+
+// countsWithin reports whether c counts a Group at or below n, or a
+// connection opened there. cycleMu must be held.
+func (c *Counter) countsWithin(n *groupNode) bool {
+	return c.anySource(func(s source) bool {
+		switch v := s.(type) {
+		case *groupNode:
+			return v.within(n)
+		case *Meter:
+			return v.node != nil && v.node.within(n)
+		}
+		return false
+	})
+}
+
+// countsAbove reports whether c counts a Group at or above n. cycleMu must
+// be held.
+func (c *Counter) countsAbove(n *groupNode) bool {
+	return c.anySource(func(s source) bool {
+		v, ok := s.(*groupNode)
+		return ok && n.within(v)
+	})
+}
+
+// countsAround reports whether c counts a Group other than n's above or
+// below it, or a connection opened at or below n, which as n's Traffic it
+// would count again. cycleMu must be held.
+func (c *Counter) countsAround(n *groupNode) bool {
+	return c.anySource(func(s source) bool {
+		switch v := s.(type) {
+		case *groupNode:
+			return v != n && (v.within(n) || n.within(v))
+		case *Meter:
+			return v.node != nil && v.node.within(n)
+		}
+		return false
+	})
 }
 
 // SetMaxConns caps the connections of g and its descendants at n, from the
@@ -651,9 +720,10 @@ func (g *Group) Open(c net.Conn, opts ...Option) (*Conn, error) {
 		return nil, ErrNilConn
 	}
 	o := mergeOptions(opts)
-	if err := g.acquireFor(o.ctx); err != nil {
+	if err := g.admit(o); err != nil {
 		return nil, err
 	}
+	defer g.admitted(o)
 	return newConn(c, o, g), nil
 }
 
@@ -664,9 +734,10 @@ func (g *Group) OpenPacketConn(c net.PacketConn, opts ...Option) (*PacketConn, e
 		return nil, ErrNilConn
 	}
 	o := mergeOptions(opts)
-	if err := g.acquireFor(o.ctx); err != nil {
+	if err := g.admit(o); err != nil {
 		return nil, err
 	}
+	defer g.admitted(o)
 	return newPacketConn(c, o, g), nil
 }
 
@@ -676,12 +747,44 @@ func (g *Group) OpenStream(rwc io.ReadWriteCloser, opts ...Option) (*Stream, err
 		return nil, ErrNilConn
 	}
 	o := mergeOptions(opts)
-	if err := g.acquireFor(o.ctx); err != nil {
+	if err := g.admit(o); err != nil {
 		return nil, err
 	}
+	defer g.admitted(o)
 	s := &Stream{}
 	s.init(rwc, rwc, rwc, withDatagram(o, rwc), g)
 	return s, nil
+}
+
+// admit takes a slot for a connection opened with o and, when o gives
+// Counters, checks them against the Traffic of g and its ancestors and
+// holds cycleMu, for admitted to release once the connection is attached:
+// a Counter that already counts g or an ancestor would count the
+// connection twice.
+func (g *Group) admit(o options) error {
+	if err := g.acquireFor(o.ctx); err != nil {
+		return err
+	}
+	if len(o.counters) == 0 {
+		return nil
+	}
+	cycleMu.Lock()
+	n := g.node()
+	for _, c := range o.counters {
+		if c.countsAbove(n) {
+			cycleMu.Unlock()
+			g.Release()
+			return ErrCounterOverlap
+		}
+	}
+	return nil
+}
+
+// admitted ends what admit began for o.
+func (g *Group) admitted(o options) {
+	if len(o.counters) > 0 {
+		cycleMu.Unlock()
+	}
 }
 
 // acquireFor takes a slot for Open, waiting for it until ctx is done if

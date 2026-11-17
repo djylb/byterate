@@ -502,26 +502,40 @@ func TestGroupRefusalsAndSwitchesCountOnce(t *testing.T) {
 	})
 }
 
-// A Limiter given to several levels is charged once, a Counter given to
-// several counts at each, and SetTraffic sends later bytes to the new
-// Counter.
+// A Limiter given to several levels is charged once, a Counter is refused
+// at a level below or above one that has it, and SetTraffic sends later
+// bytes to the new Counter.
 func TestGroupSharedLevelsChargeOnce(t *testing.T) {
 	user := NewGroup(nil)
 	tunnel := NewGroup(user)
 	budget := NewBudget()
 	var traffic Counter
-	for _, g := range []*Group{user, tunnel} {
-		setWrite(g, budget)
-		g.SetTraffic(&traffic)
+	setWrite(user, budget)
+	setWrite(tunnel, budget)
+	if err := user.SetTraffic(&traffic); err != nil {
+		t.Fatal(err)
+	}
+	if err := tunnel.SetTraffic(&traffic); !errors.Is(err, ErrCounterOverlap) {
+		t.Fatalf("the Traffic of an ancestor below: %v, want ErrCounterOverlap", err)
+	}
+	if tunnel.Traffic() == &traffic {
+		t.Fatal("a refused SetTraffic took the Counter")
+	}
+	var down Counter
+	if err := tunnel.SetTraffic(&down); err != nil {
+		t.Fatal(err)
+	}
+	if err := user.SetTraffic(&down); !errors.Is(err, ErrCounterOverlap) {
+		t.Fatalf("the Traffic of a descendant above: %v, want ErrCounterOverlap", err)
 	}
 	if err := tunnel.Writes().Charge(100); err != nil {
 		t.Fatal(err)
 	}
-	if _, out := traffic.Load(); budget.Used() != 100 || out != 200 {
-		t.Fatalf("a Budget and a Counter at two levels took %d B and %d B, want 100 and 200", budget.Used(), out)
+	if _, out := traffic.Load(); budget.Used() != 100 || out != 100 {
+		t.Fatalf("a Budget at two levels and the Counter took %d B and %d B, want 100 each", budget.Used(), out)
 	}
 	fresh := &Counter{}
-	user.SetTraffic(fresh)
+	_ = user.SetTraffic(fresh)
 	_ = tunnel.Writes().Charge(10)
 	if _, out := fresh.Load(); out != 10 {
 		t.Fatalf("the new Counter counted %d B, want 10", out)
@@ -538,8 +552,8 @@ func TestGroupChangesRebuildOnlyBelow(t *testing.T) {
 	_ = tunnel.Writes().Charge(1)
 	built := tunnel.cache.Load()
 	setWrite(other, NewRate(1000))
-	other.SetTraffic(nil)
-	root.SetTraffic(nil) // Traffic is not among the levels
+	_ = other.SetTraffic(nil)
+	_ = root.SetTraffic(nil) // Traffic is not among the levels
 	_ = tunnel.Writes().Charge(1)
 	if tunnel.cache.Load() != built {
 		t.Fatal("a change to an unrelated Group, or to a Traffic, rebuilt the levels")
@@ -586,7 +600,7 @@ func TestGroupChangesRaceCharges(t *testing.T) {
 			mu.Lock()
 			counters = append(counters, c)
 			mu.Unlock()
-			root.SetTraffic(c)
+			_ = root.SetTraffic(c)
 		}
 		runtime.Gosched()
 	}
@@ -700,7 +714,7 @@ func TestGroupSetTrafficCountsEveryByte(t *testing.T) {
 	// The first writes may count in g's first Counter, before any swap.
 	cs := [2]*Counter{g.Traffic(), {}}
 	for i := range 2000 {
-		g.SetTraffic(cs[(i+1)%2])
+		_ = g.SetTraffic(cs[(i+1)%2])
 	}
 	close(stop)
 	n := <-done
