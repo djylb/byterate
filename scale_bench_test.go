@@ -86,6 +86,35 @@ func BenchmarkScaleMemory(b *testing.B) {
 	}
 }
 
+// BenchmarkScaleConnMemory reports the heap that each connection open in a
+// tree of Groups three deep takes, at both ends of the scale.
+func BenchmarkScaleConnMemory(b *testing.B) {
+	for _, n := range []int{10, 100_000} {
+		b.Run("conns-"+strconv.Itoa(n), func(b *testing.B) {
+			for b.Loop() {
+				root := NewGroup(nil)
+				users := make([]*Group, 100)
+				for i := range users {
+					users[i] = NewGroup(NewGroup(root))
+				}
+				var conns []*Conn
+				memPerItem(b, n, func(i int) any {
+					c, err := users[i%len(users)].Open(&nopNetConn{})
+					if err != nil {
+						b.Fatal(err)
+					}
+					_, _ = c.Write(make([]byte, 1))
+					conns = append(conns, c)
+					return c
+				})
+				for _, c := range conns {
+					_ = c.Close()
+				}
+			}
+		})
+	}
+}
+
 func memPerItem(b *testing.B, n int, mk func(int) any) {
 	b.Helper()
 	keep := make([]any, n)
