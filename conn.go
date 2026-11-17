@@ -14,6 +14,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unsafe"
 	"weak"
 )
 
@@ -119,7 +120,7 @@ type Meter struct {
 type meterSide struct {
 	total atomic.Int64
 	end   atomic.Int64
-	_     [cacheLineSize - 16]byte
+	_     [(cacheLineSize - unsafe.Sizeof([2]atomic.Int64{})%cacheLineSize) % cacheLineSize]byte
 }
 
 // newMeter returns the Meter of a wrapper, without leases.

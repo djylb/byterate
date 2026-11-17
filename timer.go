@@ -35,12 +35,11 @@ func nowNs() int64 {
 	return int64(time.Since(epoch))
 }
 
-// cacheLineSize covers the 128-byte lines of Apple silicon and the
-// adjacent-line prefetch of x86. Objects whose size is a multiple of it are
-// aligned to it by the allocator.
-const cacheLineSize = 128
-
-// cacheLinePad separates fields written by different cores.
+// cacheLinePad separates fields written by different cores. cacheLineSize,
+// set per architecture, is the size of the lines it pads to; objects whose
+// size is a multiple of it are aligned to it by the allocator. A field set
+// padded with [(cacheLineSize - unsafe.Sizeof(f)%cacheLineSize) %
+// cacheLineSize]byte fills whole lines at the sizes of the architecture.
 type cacheLinePad [cacheLineSize]byte
 
 // sleepResult says how a wait ended.

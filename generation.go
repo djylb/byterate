@@ -17,12 +17,12 @@ import (
 // every charge, the second written by every charge.
 type generation struct {
 	generationRead
-	_   [cacheLineSize - unsafe.Sizeof(generationRead{})]byte
+	_   [(cacheLineSize - unsafe.Sizeof(generationRead{})%cacheLineSize) % cacheLineSize]byte
 	tat atomic.Int64 // theoretical arrival time (ns since epoch), can be negative
 	// total is the bytes charged, net of refunds: the line is written by
 	// every charge anyway, so it costs a charge nothing more.
 	total atomic.Int64
-	_     [cacheLineSize - 16]byte
+	_     [(cacheLineSize - unsafe.Sizeof([2]atomic.Int64{})%cacheLineSize) % cacheLineSize]byte
 }
 
 // generationRead are the fields of a generation that every charge reads.

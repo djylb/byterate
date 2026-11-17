@@ -63,9 +63,9 @@ type Group struct {
 	// Group changes, the second is written by every Acquire and Release
 	// below it.
 	groupLinks
-	_ [cacheLineSize - unsafe.Sizeof(groupLinks{})]byte
+	_ [(cacheLineSize - unsafe.Sizeof(groupLinks{})%cacheLineSize) % cacheLineSize]byte
 	groupSlots
-	_ [cacheLineSize - unsafe.Sizeof(groupSlots{})]byte
+	_ [(cacheLineSize - unsafe.Sizeof(groupSlots{})%cacheLineSize) % cacheLineSize]byte
 }
 
 // groupLinks are the fields of a Group that its charges read.

@@ -5,6 +5,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unsafe"
 )
 
 // burstWindowNs is the default burst allowance: after an idle period a Rate
@@ -22,15 +23,20 @@ const burstWindowNs = int64(2 * time.Second)
 // limits. The zero value is an enabled, unlimited Rate, ready for SetLimit. A
 // Rate must not be copied after first use; use Clone.
 type Rate struct {
-	// The fields fill the size class's cache line exactly, so that those
-	// every charge reads share it with nothing that others write.
+	// The fields fill whole cache lines, so that those every charge reads
+	// share them with nothing that others write.
+	rateFields
+	_ [(cacheLineSize - unsafe.Sizeof(rateFields{})%cacheLineSize) % cacheLineSize]byte
+}
+
+// rateFields are the fields of a Rate.
+type rateFields struct {
 	gen      atomic.Pointer[generation] // nil until a zero value's first charge or Enable
 	rate     atomic.Int64               // bytes/s, <=0 => unlimited
 	burst    atomic.Int64               // ns of traffic passed at once after an idle period, 0 for burstWindowNs
 	debtRate int64                      // protected by mu: the limit tat's debt is reckoned at, the last one above 0
 	mu       sync.Mutex                 // serializes Enable, Disable, SetLimit, Clone and refunds; charges take no lock
 	disabled atomic.Bool                // written under mu
-	_        [cacheLineSize - 44]byte
 }
 
 // NewRate returns a Rate limited to limitBps bytes per second with a full
@@ -38,7 +44,7 @@ type Rate struct {
 // more memory than its own until something is charged to it.
 func NewRate(limitBps int64) *Rate {
 	limitBps = max(limitBps, 0)
-	r := &Rate{debtRate: limitBps}
+	r := &Rate{rateFields: rateFields{debtRate: limitBps}}
 	r.rate.Store(limitBps)
 	if limitBps > 0 {
 		r.gen.Store(newGeneration(nowNs(), burstWindowNs)) // the full burst starts now
@@ -69,7 +75,7 @@ func (r *Rate) Clone() *Rate {
 	// enabled would charge without ever waiting.
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	c := &Rate{debtRate: r.debtRate}
+	c := &Rate{rateFields: rateFields{debtRate: r.debtRate}}
 	c.rate.Store(r.rate.Load())
 	c.burst.Store(r.burst.Load())
 	if g := r.gen.Load(); g != nil {
