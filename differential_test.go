@@ -24,7 +24,7 @@ func TestDifferential(t *testing.T) {
 	for _, sc := range differentialScenarios {
 		synctest.Test(t, func(*testing.T) {
 			rec := &diffRecorder{b: &out, start: time.Now()}
-			fmt.Fprintf(&out, "== %s\n", sc.name)
+			_, _ = fmt.Fprintf(&out, "== %s\n", sc.name)
 			sc.run(rec)
 		})
 	}
@@ -66,7 +66,7 @@ type diffRecorder struct {
 
 // log records a line with the bubble time since the scenario began.
 func (r *diffRecorder) logf(format string, args ...any) {
-	fmt.Fprintf(r.b, "%8v  %s\n", time.Since(r.start), fmt.Sprintf(format, args...))
+	_, _ = fmt.Fprintf(r.b, "%8v  %s\n", time.Since(r.start), fmt.Sprintf(format, args...))
 }
 
 func errStr(err error) string {

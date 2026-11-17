@@ -22,7 +22,6 @@ func within(t *testing.T, what string, f func()) {
 	case <-done:
 	case <-time.After(time.Second):
 		t.Fatalf("%s waited for a lock held elsewhere", what)
-		<-done
 	}
 }
 
