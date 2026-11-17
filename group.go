@@ -88,6 +88,10 @@ type groupLinks struct {
 	// allocate nothing.
 	cache atomic.Pointer[groupLevels]
 	nd    atomic.Pointer[groupNode] // made on first use
+	// ver, while the Group is a root, changes with the levels of any Group
+	// of its tree and when SetParent moves a Group out of it, for the
+	// connections opened in the tree to look whether their levels changed.
+	ver atomic.Uint64
 }
 
 // groupNode is the sum of a Group's traffic, which its parent's sum, its
@@ -98,7 +102,10 @@ type groupNode struct {
 	// up is the node of the parent, under cycleMu, which the sum is
 	// attached to; cleanup is set once the Group has a cleanup that
 	// detaches it when the Group is collected.
-	up      *groupNode
+	up *groupNode
+	// traffic is the Counter the node is attached to as the Group's
+	// Traffic, under cycleMu.
+	traffic *Counter
 	sum     tally
 	cleanup bool
 }
@@ -158,20 +165,33 @@ func (g *Group) adopt(p *Group, tot [2]int64) {
 	n, up := g.node(), p.node()
 	up.sum.attach(n, tot)
 	n.up = up
+	g.orphanWhenDropped(n)
+}
+
+// orphanWhenDropped makes sure that g, once collected, takes its node out
+// of what it is attached to. cycleMu must be held, unless g is not yet
+// shared.
+func (g *Group) orphanWhenDropped(n *groupNode) {
 	if !n.cleanup {
 		n.cleanup = true
 		runtime.AddCleanup(g, (*groupNode).orphan, n)
 	}
 }
 
-// orphan takes the sum of a collected Group out of its parent's, keeping
-// the bytes it counted there.
+// orphan takes the sum of a collected Group out of its parent's and out of
+// its Traffic, which another Group may share, keeping the bytes it counted
+// there.
 func (n *groupNode) orphan() {
 	cycleMu.Lock()
 	defer cycleMu.Unlock()
+	tot := n.sum.total()
 	if up := n.up; up != nil {
-		up.sum.detach(n, n.sum.total())
+		up.sum.detach(n, tot)
 		n.up = nil
+	}
+	if t := n.traffic; t != nil {
+		t.detach(n, tot)
+		n.traffic = nil
 	}
 }
 
@@ -292,7 +312,10 @@ func (g *Group) SetParent(p *Group) error {
 		g.adopt(p, tot)
 	}
 	g.parent.Store(p)
-	groupGen.Add(1)
+	// The connections below g watch the version of the tree they were in,
+	// which from was the root of: they look up their new tree. Other trees
+	// keep theirs.
+	from.ver.Add(1)
 	// The waiters of the old ancestors may now find a slot, or a chain
 	// without them; the chain of old does not change.
 	for a := old; a != nil; a = a.parent.Load() {
@@ -339,13 +362,22 @@ func (g *Group) setLimiters(read, write *Limiter) {
 		g.write.Store(&groupLimiter{l: *write})
 	}
 	g.epoch.Add(1)
-	groupGen.Add(1)
+	g.bumpTree()
 }
 
-// groupGen changes with the limiters and the parent of any Group, for the
-// connections opened in Groups to look whether their levels changed: one
-// load per read or write tells them they did not.
-var groupGen atomic.Uint64
+// bumpTree changes the version of g's tree, after a change to g's levels,
+// so that the connections of the tree look at their levels again. A
+// SetParent that moves g meanwhile changes the version of the tree it
+// moved g from, which the connections below g watch until they look again.
+func (g *Group) bumpTree() {
+	for {
+		r := g.root()
+		r.ver.Add(1)
+		if g.root() == r {
+			return
+		}
+	}
+}
 
 // chargedBy reports whether l charges the Reads or Writes of g or of one of
 // its descendants. cycleMu must be held.
@@ -394,11 +426,30 @@ func (g *Group) Traffic() *Counter {
 	if c := g.traffic.Load(); c != nil {
 		return c
 	}
-	// The first Counter counts all that g's sum did, and is made once.
+	cycleMu.Lock()
+	defer cycleMu.Unlock()
+	return g.trafficLocked()
+}
+
+// trafficLocked is Traffic. cycleMu must be held.
+func (g *Group) trafficLocked() *Counter {
+	if c := g.traffic.Load(); c != nil {
+		return c
+	}
+	// The first Counter counts all that g's sum did.
 	c := &Counter{}
-	c.attach(g.node(), [2]int64{})
-	g.traffic.CompareAndSwap(nil, c)
-	return g.traffic.Load()
+	g.setTrafficLocked(c, [2]int64{})
+	return c
+}
+
+// setTrafficLocked attaches g's node to c with base its totals as c's
+// first, and makes c g's Traffic. cycleMu must be held.
+func (g *Group) setTrafficLocked(c *Counter, base [2]int64) {
+	n := g.node()
+	c.attach(n, base)
+	n.traffic = c
+	g.traffic.Store(c)
+	g.orphanWhenDropped(n)
 }
 
 // SetTraffic makes c the Counter of g's traffic from now on, such as a
@@ -414,17 +465,19 @@ func (g *Group) SetTraffic(c *Counter) error {
 	cycleMu.Lock()
 	defer cycleMu.Unlock()
 	n := g.node()
-	old := g.Traffic()
+	old := g.traffic.Load()
 	if old == c {
 		return nil
 	}
 	if c.countsAround(n) {
 		return ErrCounterOverlap
 	}
+	// The bytes before stay in the Traffic replaced, if there was one.
 	tot := n.sum.total()
-	old.detach(n, tot)
-	c.attach(n, tot)
-	g.traffic.Store(c)
+	if old != nil {
+		old.detach(n, tot)
+	}
+	g.setTrafficLocked(c, tot)
 	return nil
 }
 
@@ -720,11 +773,7 @@ func (g *Group) Open(c net.Conn, opts ...Option) (*Conn, error) {
 		return nil, ErrNilConn
 	}
 	o := mergeOptions(opts)
-	if err := g.admit(o); err != nil {
-		return nil, err
-	}
-	defer g.admitted(o)
-	return newConn(c, o, g), nil
+	return open(g, o, func() (*Conn, error) { return newConn(c, o, g) })
 }
 
 // OpenPacketConn is Open for a net.PacketConn, wrapped as NewPacketConn
@@ -734,11 +783,7 @@ func (g *Group) OpenPacketConn(c net.PacketConn, opts ...Option) (*PacketConn, e
 		return nil, ErrNilConn
 	}
 	o := mergeOptions(opts)
-	if err := g.admit(o); err != nil {
-		return nil, err
-	}
-	defer g.admitted(o)
-	return newPacketConn(c, o, g), nil
+	return open(g, o, func() (*PacketConn, error) { return newPacketConn(c, o, g) })
 }
 
 // OpenStream is Open for an io.ReadWriteCloser, wrapped as NewStream does.
@@ -747,44 +792,27 @@ func (g *Group) OpenStream(rwc io.ReadWriteCloser, opts ...Option) (*Stream, err
 		return nil, ErrNilConn
 	}
 	o := mergeOptions(opts)
-	if err := g.admit(o); err != nil {
-		return nil, err
-	}
-	defer g.admitted(o)
-	s := &Stream{}
-	s.init(rwc, rwc, rwc, withDatagram(o, rwc), g)
-	return s, nil
-}
-
-// admit takes a slot for a connection opened with o and, when o gives
-// Counters, checks them against the Traffic of g and its ancestors and
-// holds cycleMu, for admitted to release once the connection is attached:
-// a Counter that already counts g or an ancestor would count the
-// connection twice.
-func (g *Group) admit(o options) error {
-	if err := g.acquireFor(o.ctx); err != nil {
-		return err
-	}
-	if len(o.counters) == 0 {
-		return nil
-	}
-	cycleMu.Lock()
-	n := g.node()
-	for _, c := range o.counters {
-		if c.countsAbove(n) {
-			cycleMu.Unlock()
-			g.Release()
-			return ErrCounterOverlap
+	return open(g, o, func() (*Stream, error) {
+		s := &Stream{}
+		if err := s.init(rwc, rwc, rwc, withDatagram(o, rwc), g); err != nil {
+			return nil, err
 		}
-	}
-	return nil
+		return s, nil
+	})
 }
 
-// admitted ends what admit began for o.
-func (g *Group) admitted(o options) {
-	if len(o.counters) > 0 {
-		cycleMu.Unlock()
+// open wraps a connection in g, made by mk once g gave it a slot, which
+// it gives back when mk fails.
+func open[T any](g *Group, o options, mk func() (T, error)) (T, error) {
+	if err := g.acquireFor(o.ctx); err != nil {
+		var zero T
+		return zero, err
 	}
+	w, err := mk()
+	if err != nil {
+		g.Release()
+	}
+	return w, err
 }
 
 // acquireFor takes a slot for Open, waiting for it until ctx is done if

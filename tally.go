@@ -1,6 +1,7 @@
 package byterate
 
 import (
+	"maps"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -64,6 +65,7 @@ type srcShard struct {
 	m    map[source]srcEntry
 	one  srcSlot // its src nil for none
 	mu   sync.Mutex
+	peak int // the most sources m held since it was made
 	kept [2]int64
 }
 
@@ -80,17 +82,40 @@ type srcEntry struct {
 	refs int
 }
 
-// sum returns the bytes that the sources of sh counted while attached.
-// sh.mu must be held.
-func (sh *srcShard) sum() [2]int64 {
+// sum returns the bytes that the Meters of sh counted while attached, and
+// those its detached sources counted, and appends its Groups' nodes to
+// kids, to be read without the lock. sh.mu must be held.
+func (sh *srcShard) sum(kids []kid) ([2]int64, []kid) {
 	v := sh.kept
+	add := func(s source, e *srcEntry) {
+		if n, ok := s.(*groupNode); ok {
+			kids = append(kids, kid{n: n, base: e.base})
+			return
+		}
+		v = addCounted(v, s, e)
+	}
 	if sh.one.src != nil {
-		v = addCounted(v, sh.one.src, &sh.one.srcEntry)
+		add(sh.one.src, &sh.one.srcEntry)
 	}
 	for s, e := range sh.m {
-		v = addCounted(v, s, &e)
+		add(s, &e)
 	}
-	return v
+	return v, kids
+}
+
+// kid is a Group's node attached to a shard, and its base there.
+type kid struct {
+	n    *groupNode
+	base [2]int64
+}
+
+// has reports whether s is attached to sh with base. sh.mu must be held.
+func (sh *srcShard) has(s source, base [2]int64) bool {
+	if sh.one.src == s {
+		return sh.one.base == base
+	}
+	e, ok := sh.m[s]
+	return ok && e.base == base
 }
 
 func addCounted(v [2]int64, s source, e *srcEntry) [2]int64 {
@@ -118,8 +143,26 @@ func (sh *srcShard) put(s source, e srcEntry) bool {
 		sh.m = make(map[source]srcEntry)
 	}
 	sh.m[s] = e
+	sh.peak = max(sh.peak, len(sh.m))
 	return true
 }
+
+// shrink lets go of the memory of a map that held many more sources than
+// it does now, as maps keep their size. sh.mu must be held.
+func (sh *srcShard) shrink() {
+	switch n := len(sh.m); {
+	case n == 0:
+		sh.m, sh.peak = nil, 0
+	case sh.peak >= minShrink && n <= sh.peak/4:
+		m := make(map[source]srcEntry, n)
+		maps.Copy(m, sh.m)
+		sh.m, sh.peak = m, n
+	}
+}
+
+// minShrink is the least peak of a shard's map that shrink copies from:
+// smaller maps cost little enough as they are.
+const minShrink = 64
 
 // drop ends an attach of s with tot its totals now, and reports whether
 // that was its last one, which keeps its bytes in sh. sh.mu must be held.
@@ -138,6 +181,7 @@ func (sh *srcShard) drop(s source, tot [2]int64) bool {
 		}
 		e = old
 		delete(sh.m, s)
+		sh.shrink()
 	default:
 		return false
 	}
@@ -180,17 +224,44 @@ func (t *tally) sourced() ([2]int64, bool) {
 	if tab == nil {
 		return v, true
 	}
+	var kids []kid
 	for i := range tab.shards {
 		sh := &tab.shards[i]
-		sh.mu.Lock()
-		if tab.retired {
+		for {
+			sh.mu.Lock()
+			if tab.retired {
+				sh.mu.Unlock()
+				return v, false
+			}
+			var n [2]int64
+			n, kids = sh.sum(kids[:0])
 			sh.mu.Unlock()
-			return v, false
+			if len(kids) == 0 {
+				v[0] += n[0]
+				v[1] += n[1]
+				break
+			}
+			// The Groups below are read without the lock, which a read of
+			// a large tree would otherwise hold throughout; a Group whose
+			// attach changed meanwhile, such as by SetParent, may have
+			// had its bytes moved into kept, so the shard is read again.
+			for _, k := range kids {
+				tot := k.n.totals()
+				n[0] += tot[0] - k.base[0]
+				n[1] += tot[1] - k.base[1]
+			}
+			sh.mu.Lock()
+			same := !tab.retired
+			for _, k := range kids {
+				same = same && sh.has(k.n, k.base)
+			}
+			sh.mu.Unlock()
+			if same {
+				v[0] += n[0]
+				v[1] += n[1]
+				break
+			}
 		}
-		n := sh.sum()
-		sh.mu.Unlock()
-		v[0] += n[0]
-		v[1] += n[1]
 	}
 	return v, true
 }

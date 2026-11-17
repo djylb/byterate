@@ -7,7 +7,8 @@
 - Charge paths (Limiter methods, wrapper reads and writes) stay
   allocation-free and lock-free.
 - A wrapper direction with nothing to charge reads no clock and writes
-  nothing shared: one atomic load and its own Meter's add. The fast and the
+  nothing shared: one atomic load and its own Meter's add, and for a
+  wrapper opened in a Group two more loads that check its tree's version. The fast and the
   limited paths must give the same results; the feature-combination tests
   cover them.
 - Wrappers never let I/O bypass the limiter or the leases: no raw socket

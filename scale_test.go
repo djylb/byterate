@@ -255,3 +255,134 @@ func TestTrafficOverlapsAttachedMeter(t *testing.T) {
 		t.Fatalf("SetTraffic elsewhere: %v", err)
 	}
 }
+
+// A Traffic Counter shared by sibling Groups lets go of each Group once it
+// is collected, keeping what it counted, so that Groups made and dropped do
+// not pile up in it.
+func TestSharedTrafficLetsGoOfDroppedGroups(t *testing.T) {
+	root := NewGroup(nil)
+	shared := &Counter{}
+	for range 100 {
+		g := NewGroup(root)
+		if err := g.SetTraffic(shared); err != nil {
+			t.Fatal(err)
+		}
+		c, err := g.Open(&nopNetConn{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = c.Read(make([]byte, 1))
+		_ = c.Close()
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for shared.nsrc.Load() != 0 || root.node().sum.nsrc.Load() != 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("%d Groups left in the shared Counter, %d in the root", shared.nsrc.Load(), root.node().sum.nsrc.Load())
+		}
+		runtime.GC()
+		time.Sleep(time.Millisecond)
+	}
+	if r, _ := shared.Total(); r != 100 {
+		t.Fatalf("shared Counter read %d, want 100", r)
+	}
+	if r, _ := root.Traffic().Total(); r != 100 {
+		t.Fatalf("root read %d, want 100", r)
+	}
+}
+
+// A change in one tree of Groups leaves the connections of other trees
+// alone, and a connection moved to another tree takes on its levels.
+func TestTreeVersions(t *testing.T) {
+	a, b := NewGroup(nil), NewGroup(nil)
+	g := NewGroup(a)
+	c, err := g.Open(&nopNetConn{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = c.Close() }()
+	setWrite(NewGroup(b), NewRate(1000))
+	if c.write.load()&dirStale != 0 {
+		t.Fatal("a change in another tree made the connection look again")
+	}
+	setWrite(b, NewRate(1<<40))
+	if err := g.SetParent(b); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = c.Write(make([]byte, 10))
+	if c.write.state.Load() != dirLimited {
+		t.Fatal("the connection moved to another tree does not take on its limit")
+	}
+	setWrite(b, nil)
+	_, _ = c.Write(make([]byte, 10))
+	if c.write.state.Load() != 0 {
+		t.Fatal("the connection does not follow a change in its new tree")
+	}
+}
+
+// Reading a Group's Traffic does not hold the lock of its shard while it
+// reads the Groups below, so attaches to it go on meanwhile.
+func TestTallyReadDoesNotHoldParentLock(t *testing.T) {
+	root := NewGroup(nil)
+	child := NewGroup(root)
+	cn, err := child.Open(&nopNetConn{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = cn.Close() }()
+	csh := &child.node().sum.srcs.Load().shards[0]
+	csh.mu.Lock() // the child busy
+	read := make(chan struct{})
+	go func() {
+		defer close(read)
+		_, _ = root.Traffic().Total()
+	}()
+	time.Sleep(10 * time.Millisecond) // let the read reach the child
+	made := make(chan struct{})
+	go func() {
+		defer close(made)
+		_ = NewGroup(root)
+	}()
+	select {
+	case <-made:
+		csh.mu.Unlock()
+	case <-time.After(time.Second):
+		csh.mu.Unlock()
+		<-made
+		<-read
+		t.Fatal("a Group made under a root being read waited for the read")
+	}
+	<-read
+}
+
+// A wrapper closed registers no cleanup later, when a change it applies
+// after Close gives it leases.
+func TestNoCleanupAfterClose(t *testing.T) {
+	c := NewConn(&nopNetConn{})
+	_ = c.Close()
+	c.SetLimiters(nil, stopAfter(1<<20))
+	if c.settles {
+		t.Fatal("a closed wrapper registered a cleanup")
+	}
+}
+
+// A shard's map lets go of its memory once most of its sources left.
+func TestShardMapShrinks(t *testing.T) {
+	var tl tally
+	ms := make([]*Meter, 1000)
+	for i := range ms {
+		ms[i] = newMeter()
+		tl.attach(ms[i], [2]int64{})
+	}
+	for _, m := range ms[10:] {
+		tl.detach(m, [2]int64{})
+	}
+	tab := tl.srcs.Load()
+	for i := range tab.shards {
+		if sh := &tab.shards[i]; sh.peak > 4*len(sh.m)+minShrink {
+			t.Fatalf("shard %d keeps a map of %d for %d sources", i, sh.peak, len(sh.m))
+		}
+	}
+	if tl.nsrc.Load() != 10 {
+		t.Fatalf("%d sources, want 10", tl.nsrc.Load())
+	}
+}

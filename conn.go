@@ -164,7 +164,9 @@ type rateConn struct {
 	// Limiters, and the levels of its Group, which it takes on at its next
 	// read or write after they change.
 	mu sync.Mutex
-	// seen is the groupGen at which levels were last found current.
+	// tree is the root of the Group's tree when the wrapper last looked
+	// at its levels, and seen the root's version then.
+	tree     atomic.Pointer[Group]
 	seen     atomic.Uint64
 	settles  bool // cleanup is set, under mu
 	datagram bool // every Read and Write carries one whole message
@@ -238,27 +240,48 @@ func (s *rateConn) SetLimiters(read, write Limiter) {
 // wrapper's Group may have changed since they were applied.
 func (d *direction) load() uint32 {
 	st := d.state.Load()
-	if s := d.conn; s != nil && s.seen.Load() != groupGen.Load() {
+	if s := d.conn; s != nil && s.stale() {
 		st |= dirStale
 	}
 	return st
 }
 
-// refresh applies the levels of s's Group, if they changed since it last
-// did. A change after it loads groupGen changes groupGen again, so that the
-// next read or write looks once more.
+// stale reports whether the version of the tree s watches changed since
+// s looked at its levels.
+func (s *rateConn) stale() bool { return s.seen.Load() != s.tree.Load().ver.Load() }
+
+// refresh applies the levels of s's Group, if its tree changed since it
+// last looked.
 func (s *rateConn) refresh() {
-	gen := groupGen.Load()
-	if s.seen.Load() == gen {
+	if !s.stale() {
 		return
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if lv := s.reg.group.levels(); lv != s.levels {
-		s.levels = lv
-		s.applyLocked()
+	s.watchLocked()
+}
+
+// watchLocked applies the levels of s's Group as they are now, and watches
+// the version of its tree for changes. A change after it loads the version
+// changes it again, so that the next read or write looks once more. s.mu
+// must be held.
+func (s *rateConn) watchLocked() {
+	g := s.reg.group
+	for {
+		r := g.root()
+		ver := r.ver.Load()
+		lv := g.levels()
+		if g.root() != r {
+			continue // moved meanwhile: watch the tree it is in now
+		}
+		if lv != s.levels {
+			s.levels = lv
+			s.applyLocked()
+		}
+		s.tree.Store(r)
+		s.seen.Store(ver)
+		return
 	}
-	s.seen.Store(gen)
 }
 
 // Meter returns the Meter of the wrapper's bytes.
@@ -283,7 +306,7 @@ func (s *rateConn) applyLocked() {
 // keep it, nor its leases. A wrapper with none of them needs nothing
 // settled, and costs the runtime no cleanup. s.mu must be held.
 func (s *rateConn) settleWhenDroppedLocked() {
-	if !s.settles {
+	if !s.settles && !s.reg.done.Load() {
 		s.settles = true
 		s.cleanup = runtime.AddCleanup(s, (*connReg).finish, s.reg)
 	}
@@ -1031,7 +1054,7 @@ type Stream struct{ rateConn }
 // ErrNilConn if rwc is nil.
 func NewStream(rwc io.ReadWriteCloser, opts ...Option) *Stream {
 	s := &Stream{}
-	s.init(rwc, rwc, rwc, withDatagram(mergeOptions(opts), rwc), nil)
+	_ = s.init(rwc, rwc, rwc, withDatagram(mergeOptions(opts), rwc), nil)
 	return s
 }
 
@@ -1040,7 +1063,7 @@ func NewStream(rwc io.ReadWriteCloser, opts ...Option) *Stream {
 func NewReader(r io.Reader, opts ...Option) *Stream {
 	c, _ := r.(io.Closer)
 	s := &Stream{}
-	s.init(r, nil, c, withDatagram(mergeOptions(opts), r), nil)
+	_ = s.init(r, nil, c, withDatagram(mergeOptions(opts), r), nil)
 	return s
 }
 
@@ -1049,7 +1072,7 @@ func NewReader(r io.Reader, opts ...Option) *Stream {
 func NewWriter(w io.Writer, opts ...Option) *Stream {
 	c, _ := w.(io.Closer)
 	s := &Stream{}
-	s.init(nil, w, c, withDatagram(mergeOptions(opts), w), nil)
+	_ = s.init(nil, w, c, withDatagram(mergeOptions(opts), w), nil)
 	return s
 }
 
@@ -1124,20 +1147,27 @@ type Conn struct {
 // what its Ready allows; one that refuses bytes ends the Read or Write with
 // its error, a Read keeping the bytes it already read.
 func NewConn(c net.Conn, opts ...Option) *Conn {
-	return newConn(c, mergeOptions(opts), nil)
+	nc, _ := newConn(c, mergeOptions(opts), nil) // no error without a Group
+	return nc
 }
 
-func newConn(c net.Conn, o options, g *Group) *Conn {
+func newConn(c net.Conn, o options, g *Group) (*Conn, error) {
 	nc := &Conn{conn: c}
 	o = withDatagram(o, c)
-	nc.init(c, c, c, o, g)
-	return nc
+	if err := nc.init(c, c, c, o, g); err != nil {
+		return nil, err
+	}
+	return nc, nil
 }
 
 // init sets what the wrapper reads from, writes to and closes, which a nil
 // interface value leaves out, and its options, within g, whose levels limit
 // the wrapper and whose Traffic counts it, unless g is nil.
-func (s *rateConn) init(r io.Reader, w io.Writer, c io.Closer, o options, g *Group) {
+//
+// With g and Counters, it returns ErrCounterOverlap, and leaves the wrapper
+// unusable, when a Counter is the Traffic of g or an ancestor, which counts
+// the wrapper already. Without g it returns no error.
+func (s *rateConn) init(r io.Reader, w io.Writer, c io.Closer, o options, g *Group) error {
 	s.r, s.w, s.c = r, w, c
 	s.datagram = o.datagram
 	m := newMeter()
@@ -1151,19 +1181,45 @@ func (s *rateConn) init(r io.Reader, w io.Writer, c io.Closer, o options, g *Gro
 	s.write.init(s, &m.written, &m.leases[1])
 	// Not yet shared: no lock. The Meter counts nothing yet.
 	s.own = [2]Limiter{o.read, o.write}
+	if g != nil {
+		m.node = g.node()
+		if err := attachCounters(m, reg.counters); err != nil {
+			return err
+		}
+		m.node.sum.attach(m, [2]int64{})
+		s.settleWhenDroppedLocked()
+		s.watchLocked() // applies the levels
+		return nil
+	}
 	for _, c := range reg.counters {
 		c.attach(m, [2]int64{})
 	}
-	if g != nil {
-		m.node = g.node()
-		m.node.sum.attach(m, [2]int64{})
-		s.seen.Store(groupGen.Load())
-		s.levels = g.levels()
-	}
-	if g != nil || len(reg.counters) > 0 {
+	if len(reg.counters) > 0 {
 		s.settleWhenDroppedLocked()
 	}
 	s.applyLocked()
+	return nil
+}
+
+// attachCounters attaches m, of a wrapper opened in a Group, to cs, unless
+// one of them counts the Group or an ancestor already. It holds the lock
+// of the topology checks for the check and the attaches alone, so that no
+// SetTraffic or SetParent makes them overlap meanwhile.
+func attachCounters(m *Meter, cs []*Counter) error {
+	if len(cs) == 0 {
+		return nil
+	}
+	cycleMu.Lock()
+	defer cycleMu.Unlock()
+	for _, c := range cs {
+		if c.countsAbove(m.node) {
+			return ErrCounterOverlap
+		}
+	}
+	for _, c := range cs {
+		c.attach(m, [2]int64{})
+	}
+	return nil
 }
 
 // isDatagramConn reports whether c is a socket whose every Read and Write
@@ -1242,14 +1298,17 @@ type PacketConn struct {
 // rather drop the datagrams that the limit does not let through at once
 // than wait for them passes WithDrop.
 func NewPacketConn(c net.PacketConn, opts ...Option) *PacketConn {
-	return newPacketConn(c, mergeOptions(opts), nil)
+	pc, _ := newPacketConn(c, mergeOptions(opts), nil) // no error without a Group
+	return pc
 }
 
-func newPacketConn(c net.PacketConn, o options, g *Group) *PacketConn {
+func newPacketConn(c net.PacketConn, o options, g *Group) (*PacketConn, error) {
 	pc := &PacketConn{pc: c, drop: o.drop}
 	o.datagram = true
-	pc.s.init(nil, nil, c, o, g)
-	return pc
+	if err := pc.s.init(nil, nil, c, o, g); err != nil {
+		return nil, err
+	}
+	return pc, nil
 }
 
 // SetLimiters replaces the Limiters of the connection's reads and writes,
