@@ -42,8 +42,10 @@ func TestDifferential(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := out.String(); got != string(want) {
-		gl, wl := strings.Split(got, "\n"), strings.Split(string(want), "\n")
+	// A checkout with autocrlf turns the golden file's line ends into CRLF.
+	wantText := strings.ReplaceAll(string(want), "\r\n", "\n")
+	if got := out.String(); got != wantText {
+		gl, wl := strings.Split(got, "\n"), strings.Split(wantText, "\n")
 		for i := range max(len(gl), len(wl)) {
 			var g, w string
 			if i < len(gl) {
