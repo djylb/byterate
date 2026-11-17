@@ -171,8 +171,8 @@ func TestConnBudgetStepLimit(t *testing.T) {
 	}
 }
 
-// A Group's limits apply to its open connections when they change, and its
-// Traffic adds up their Meters.
+// A Group's limits apply to its open connections from their next read or
+// write after they change, and its Traffic adds up their Meters.
 func TestGroupOpenFollowsChanges(t *testing.T) {
 	root, user, _, tunnel := tree()
 	c, err := tunnel.Open(&recordingConn{})
@@ -184,18 +184,21 @@ func TestGroupOpenFollowsChanges(t *testing.T) {
 	}
 	_, _ = c.Write(make([]byte, 100))
 	setWrite(user, NewRate(1<<40))
-	if c.write.state.Load() != dirLimited {
-		t.Fatal("the user's limit does not apply to the open connection")
+	if c.write.load()&dirStale == 0 {
+		t.Fatal("the open connection does not see the user's limit change")
 	}
 	_, _ = c.Write(make([]byte, 50))
+	if c.write.load() != dirLimited {
+		t.Fatal("the user's limit does not apply to the open connection")
+	}
 	other := NewGroup(root)
 	if err := tunnel.Parent().SetParent(other); err != nil {
 		t.Fatal(err)
 	}
-	if c.write.state.Load() != 0 {
+	_, _ = c.Write(make([]byte, 25))
+	if c.write.load() != 0 {
 		t.Fatal("the connection moved out from under the limit is still limited")
 	}
-	_, _ = c.Write(make([]byte, 25))
 	for _, x := range []struct {
 		g    *Group
 		want int64
@@ -511,7 +514,7 @@ func TestConnCloseLeavesNothing(t *testing.T) {
 		_ = c.Close()
 	}
 	for _, g := range []*Group{root, user, tunnel} {
-		if n := g.Traffic().nsrc.Load(); n != 0 {
+		if n := meterSources(&g.node().sum); n != 0 {
 			t.Fatalf("%d Meters left attached to a Group", n)
 		}
 	}

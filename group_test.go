@@ -251,7 +251,7 @@ func TestGroupMovesRaceSlots(t *testing.T) {
 		if g.Conns() != 0 {
 			t.Fatalf("Conns() = %d after every slot was released, want 0", g.Conns())
 		}
-		if a := g.queue(); a.n.Load() != 0 || len(a.q) != 0 {
+		if a := g.queue(); a.n.Load() != 0 || a.head != nil {
 			t.Fatalf("%d waiters left after every AcquireContext returned", a.n.Load())
 		}
 	}
@@ -502,8 +502,9 @@ func TestGroupRefusalsAndSwitchesCountOnce(t *testing.T) {
 	})
 }
 
-// A Limiter or Counter given to several levels is charged once, and
-// SetTraffic sends later bytes to the new Counter.
+// A Limiter given to several levels is charged once, a Counter given to
+// several counts at each, and SetTraffic sends later bytes to the new
+// Counter.
 func TestGroupSharedLevelsChargeOnce(t *testing.T) {
 	user := NewGroup(nil)
 	tunnel := NewGroup(user)
@@ -516,8 +517,8 @@ func TestGroupSharedLevelsChargeOnce(t *testing.T) {
 	if err := tunnel.Writes().Charge(100); err != nil {
 		t.Fatal(err)
 	}
-	if _, out := traffic.Load(); budget.Used() != 100 || out != 100 {
-		t.Fatalf("a Budget and a Counter at two levels took %d B and %d B, want 100 each", budget.Used(), out)
+	if _, out := traffic.Load(); budget.Used() != 100 || out != 200 {
+		t.Fatalf("a Budget and a Counter at two levels took %d B and %d B, want 100 and 200", budget.Used(), out)
 	}
 	fresh := &Counter{}
 	user.SetTraffic(fresh)
@@ -538,15 +539,15 @@ func TestGroupChangesRebuildOnlyBelow(t *testing.T) {
 	built := tunnel.cache.Load()
 	setWrite(other, NewRate(1000))
 	other.SetTraffic(nil)
+	root.SetTraffic(nil) // Traffic is not among the levels
 	_ = tunnel.Writes().Charge(1)
 	if tunnel.cache.Load() != built {
-		t.Fatal("a change to an unrelated Group rebuilt the levels")
+		t.Fatal("a change to an unrelated Group, or to a Traffic, rebuilt the levels")
 	}
 	for _, change := range []func(){
 		func() { _ = user.SetParent(NewGroup(nil)) }, // a parent as unchanged as the root
 		func() { setWrite(user, NewRate(1000)) },
 		func() { _ = user.SetParent(root) },
-		func() { root.SetTraffic(nil) },
 		func() { _ = root.SetParent(NewGroup(nil)) }, // a new ancestor past the chain
 	} {
 		change()

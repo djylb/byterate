@@ -284,8 +284,8 @@ func TestDroppedWrapperIsSettled(t *testing.T) {
 	if _, w := traffic.Total(); w != 100 || b.Used() != 100 {
 		t.Fatalf("Counter %d, Budget %d; want 100", w, b.Used())
 	}
-	if _, w := g.Traffic().Total(); w != 100 || g.Traffic().nsrc.Load() != 0 {
-		t.Fatalf("Group Traffic %d, %d Meters", w, g.Traffic().nsrc.Load())
+	if _, w := g.Traffic().Total(); w != 100 || meterSources(&g.node().sum) != 0 {
+		t.Fatalf("Group Traffic %d, %d Meters", w, meterSources(&g.node().sum))
 	}
 }
 
@@ -296,8 +296,9 @@ func (nopRWC) Write(b []byte) (int, error) { return len(b), nil }
 func (nopRWC) Close() error                { return nil }
 
 // A Counter shared by Groups, or given to a connection as well, counts
-// each connection where it is: moving one Group moves its connections
-// alone.
+// what each of them passes, each where it is: moving one Group moves its
+// connections alone, and a connection given the Counter of its Group
+// counts in it through both.
 func TestSharedTrafficCounter(t *testing.T) {
 	var shared Counter
 	p, q := NewGroup(nil), NewGroup(nil)
@@ -313,6 +314,9 @@ func TestSharedTrafficCounter(t *testing.T) {
 		_, _ = c2.Write(make([]byte, 10))
 	}
 	write()
+	if _, w := shared.Total(); w != 120 {
+		t.Fatalf("shared Counter counted %d, want 100 B of g1 and 10 B twice", w)
+	}
 	if err := g1.SetParent(q); err != nil {
 		t.Fatal(err)
 	}
@@ -329,18 +333,18 @@ func TestSharedTrafficCounter(t *testing.T) {
 	if _, w := moved.Total(); w != 100 {
 		t.Fatalf("moved Counter counted %d, want 100", w)
 	}
-	if _, w := shared.Total(); w != 230 {
-		t.Fatalf("shared Counter counted %d, want 230", w)
+	if _, w := shared.Total(); w != 260 {
+		t.Fatalf("shared Counter counted %d, want 260", w)
 	}
-	// g2's Traffic and the connection's WithCounter are one Counter: it
-	// counts the connection once, and still after g2 moves.
+	// g2's Traffic and the connection's WithCounter are one Counter: once
+	// g2 takes another, the connection counts in it alone.
 	if err := g2.SetParent(p); err != nil {
 		t.Fatal(err)
 	}
 	g2.SetTraffic(&Counter{})
 	write()
-	if _, w := shared.Total(); w != 240 {
-		t.Fatalf("shared Counter counted %d after g2 left it, want 240", w)
+	if _, w := shared.Total(); w != 270 {
+		t.Fatalf("shared Counter counted %d after g2 left it, want 270", w)
 	}
 }
 

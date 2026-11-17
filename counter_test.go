@@ -10,7 +10,7 @@ import (
 )
 
 func TestCounterAddsAndSwaps(t *testing.T) {
-	for name, c := range map[string]*Counter{"zero": {}, "shared": NewSharedCounter()} {
+	for name, c := range map[string]*Counter{"zero": {}, "spread": spreadCounter()} {
 		t.Run(name, func(t *testing.T) {
 			c.Add(10, 20)
 			_ = c.reads().Charge(5)
@@ -35,7 +35,7 @@ func TestCounterAddsAndSwaps(t *testing.T) {
 
 // Swaps and Sets racing with Adds count every byte exactly once.
 func TestCounterSwapRacesAdds(t *testing.T) {
-	for name, c := range map[string]*Counter{"zero": {}, "shared": NewSharedCounter()} {
+	for name, c := range map[string]*Counter{"zero": {}, "spread": spreadCounter()} {
 		t.Run(name, func(t *testing.T) {
 			const adders, adds = 8, 1 << 12
 			var stop atomic.Bool
@@ -80,7 +80,7 @@ func TestCounterSwapRacesAdds(t *testing.T) {
 }
 
 func BenchmarkCounterAdd(b *testing.B) {
-	for name, c := range map[string]*Counter{"zero": {}, "shared": NewSharedCounter()} {
+	for name, c := range map[string]*Counter{"zero": {}, "spread": spreadCounter()} {
 		b.Run(name, func(b *testing.B) {
 			b.RunParallel(func(pb *testing.PB) {
 				for pb.Next() {

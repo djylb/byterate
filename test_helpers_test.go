@@ -56,3 +56,37 @@ func setWrite(g *Group, l Limiter) {
 	r, _ := g.Limiters()
 	g.SetLimiters(r, l)
 }
+
+// spreadCounter returns a Counter whose Adds already spread over a cell per
+// processor, as contention makes them.
+func spreadCounter() *Counter {
+	c := &Counter{}
+	for set := c.added.grow(nil); ; {
+		next := c.added.grow(set)
+		if next == set {
+			return c
+		}
+		set = next
+	}
+}
+
+// meterSources returns how many Meters are attached to t.
+func meterSources(t *tally) int {
+	n := 0
+	if tab := t.srcs.Load(); tab != nil {
+		for i := range tab.shards {
+			sh := &tab.shards[i]
+			sh.mu.Lock()
+			if _, ok := sh.one.src.(*Meter); ok {
+				n++
+			}
+			for s := range sh.m {
+				if _, ok := s.(*Meter); ok {
+					n++
+				}
+			}
+			sh.mu.Unlock()
+		}
+	}
+	return n
+}

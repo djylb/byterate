@@ -67,17 +67,17 @@ func BenchmarkScaleMemory(b *testing.B) {
 		b.Run("groups-"+strconv.Itoa(n), func(b *testing.B) {
 			for b.Loop() {
 				root := NewGroup(nil)
-				memPerItem(b, n, func(i int) any {
+				memPerItem(b, n, func(int) any {
 					g := NewGroup(root)
 					g.Traffic().Add(1, 1)
 					return g
 				})
 			}
 		})
-		b.Run("sharedcounters-"+strconv.Itoa(n), func(b *testing.B) {
+		b.Run("counters-"+strconv.Itoa(n), func(b *testing.B) {
 			for b.Loop() {
 				memPerItem(b, n, func(int) any {
-					c := NewSharedCounter()
+					c := new(Counter)
 					c.Add(1, 1)
 					return c
 				})
@@ -87,6 +87,7 @@ func BenchmarkScaleMemory(b *testing.B) {
 }
 
 func memPerItem(b *testing.B, n int, mk func(int) any) {
+	b.Helper()
 	keep := make([]any, n)
 	var before, after runtime.MemStats
 	runtime.GC()

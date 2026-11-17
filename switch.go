@@ -58,10 +58,12 @@ func (s *Switch) Set(l Limiter) {
 	if s == nil {
 		return
 	}
-	configMu.Lock()
-	defer configMu.Unlock()
-	if reaches(l, func(x Limiter) bool { return x == Limiter(s) }) {
-		panic("byterate: Switch set to a Limiter that charges the Switch")
+	if mayReach(l) {
+		cycleMu.Lock()
+		defer cycleMu.Unlock()
+		if reaches(l, func(x Limiter) bool { return x == Limiter(s) }) {
+			panic("byterate: Switch set to a Limiter that charges the Switch")
+		}
 	}
 	s.swap(l)
 }

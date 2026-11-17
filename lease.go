@@ -300,11 +300,12 @@ func (l *budgetLease) settleLocked() {
 // leaseSet is a direction's leases, of each of its Budgets.
 type leaseSet struct {
 	side *meterSide // the direction's count, and the end of its leases
+	ls   []*budgetLease
+	mu   sync.Mutex
 	// recheck is set when a Budget that the direction charges as a
 	// Limiter changes, for the direction to lease from it again.
 	recheck atomic.Bool
-	mu      sync.Mutex
-	ls      []*budgetLease
+	closed  bool // under mu: the wrapper is done, and leases no more
 }
 
 // set makes bs the Budgets that lease to the direction, and charged those
@@ -313,6 +314,22 @@ type leaseSet struct {
 func (s *leaseSet) set(bs, charged []*Budget) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.closed {
+		return // a change that a read or write applies after Close
+	}
+	s.setLocked(bs, charged)
+}
+
+// close settles s's leases for good, once its wrapper is done.
+func (s *leaseSet) close() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.setLocked(nil, nil)
+	s.closed = true
+}
+
+// setLocked is set. s.mu must be held.
+func (s *leaseSet) setLocked(bs, charged []*Budget) {
 	keep := make([]*budgetLease, 0, len(bs)+len(charged))
 	for i, b := range append(slices.Clip(bs), charged...) {
 		var found *budgetLease

@@ -4,12 +4,11 @@ import (
 	"context"
 	"errors"
 	"io"
-	"maps"
 	"net"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"unsafe"
-	"weak"
 )
 
 var (
@@ -51,9 +50,12 @@ func (e *TooManyConnsError) Group() *Group { return e.g }
 // parent at any time: from then on, their bytes go to the new ancestors, as
 // do their slots, while the bytes counted before stay where they are.
 //
-// Each tree has a lock of its own, which its root holds: Acquire and Release
-// share it, and SetParent takes it, with that of the tree it moves a Group
-// to, so that trees do not contend with each other. Charges take no lock.
+// Acquire and Release take no lock: SetParent waits for those in progress in
+// the trees it changes, and they wait for it. Charges take no lock, and a
+// connection registers with its own Group alone, so opening and closing
+// connections in different Groups does not contend. A Group's Traffic adds
+// up those of its connections and of its children's Traffic when it is
+// read, so a read costs in proportion to the Groups and connections below.
 //
 // All methods are safe for concurrent use. The zero value is a root without
 // limits.
@@ -78,21 +80,32 @@ type groupLinks struct {
 	// the Group or an ancestor changes, so that charges walk no tree and
 	// allocate nothing.
 	cache atomic.Pointer[groupLevels]
-	// The wrappers opened in the Group and its descendants, and their
-	// Meters, under configMu: the Group's own record of them, as Traffic
-	// may be shared with other Groups or wrappers.
-	members map[weak.Pointer[rateConn]]*Meter
+	nd    atomic.Pointer[groupNode] // made on first use
+}
+
+// groupNode is the sum of a Group's traffic, which its parent's sum, its
+// Traffic and its connections' Meters attach to. It does not refer to the
+// Group, so that a Group dropped can be collected while its sum stays
+// counted in its parent's.
+type groupNode struct {
+	// up is the node of the parent, under cycleMu, which the sum is
+	// attached to; cleanup is set once the Group has a cleanup that
+	// detaches it when the Group is collected.
+	up      *groupNode
+	sum     tally
+	mu      sync.Mutex // serializes SetTraffic
+	cleanup bool
 }
 
 // groupSlots are the fields of a Group that Acquire and Release write.
 type groupSlots struct {
-	conns    atomic.Int64 // slots taken in the Group and its descendants
-	maxConns atomic.Int64 // 0 for no cap
-	// tree, while the Group is a root, serializes SetParent with Acquire and
-	// Release in its tree, so that a moved Group takes its connections
-	// along exactly.
-	tree    sync.RWMutex
-	waiters atomic.Pointer[slotQueue] // made by the first AcquireContext refused here
+	conns    atomic.Int64              // slots taken in the Group and its descendants
+	maxConns atomic.Int64              // 0 for no cap
+	waiters  atomic.Pointer[slotQueue] // made by the first AcquireContext refused here
+	// guard, while the Group is a root, keeps SetParent from changing its
+	// tree while Acquire or Release walk it, so that a moved Group takes
+	// its connections along exactly.
+	guard treeGuard
 }
 
 // groupLimiter holds a Limiter of a Group's own level.
@@ -103,8 +116,44 @@ type groupLimiter struct {
 // NewGroup returns a Group under parent, or a root for a nil parent.
 func NewGroup(parent *Group) *Group {
 	g := &Group{}
-	g.parent.Store(parent)
+	if parent != nil {
+		g.parent.Store(parent)
+		g.adopt(parent, [2]int64{})
+	}
 	return g
+}
+
+// node returns g's node, making it on first use.
+func (g *Group) node() *groupNode {
+	if n := g.nd.Load(); n != nil {
+		return n
+	}
+	g.nd.CompareAndSwap(nil, &groupNode{})
+	return g.nd.Load()
+}
+
+// adopt attaches g's sum to that of p, with tot its totals now, and makes
+// sure that g, once collected, takes it out again. cycleMu must be held,
+// unless g is not yet shared.
+func (g *Group) adopt(p *Group, tot [2]int64) {
+	n, up := g.node(), p.node()
+	up.sum.attach(&n.sum, tot)
+	n.up = up
+	if !n.cleanup {
+		n.cleanup = true
+		runtime.AddCleanup(g, (*groupNode).orphan, n)
+	}
+}
+
+// orphan takes the sum of a collected Group out of its parent's, keeping
+// the bytes it counted there.
+func (n *groupNode) orphan() {
+	cycleMu.Lock()
+	defer cycleMu.Unlock()
+	if up := n.up; up != nil {
+		up.sum.detach(&n.sum, n.sum.total())
+		n.up = nil
+	}
 }
 
 // Parent returns g's parent, or nil for a root.
@@ -119,17 +168,52 @@ func (g *Group) root() *Group {
 	return a
 }
 
-// lockTree read-locks the tree of g and returns its root, which holds the
-// lock: SetParent can move g to another tree before the lock is taken, but
-// not while it is held.
-func (g *Group) lockTree() *Group {
+// treeGuard is how SetParent and the Acquires and Releases of a tree keep
+// out of each other's way without a lock that every Acquire would write: an
+// Acquire marks itself busy in the root, on a counter that spreads as they
+// contend, and checks that no move is under way; SetParent announces its
+// move, then waits until none is busy. Either sees the other, as both
+// write before they read.
+type treeGuard struct {
+	moving atomic.Pointer[chan struct{}] // while SetParent moves, closed when done
+	busy   stripes                       // sum 0: Acquires and Releases under way
+}
+
+// enterTree marks an Acquire or Release in g's tree busy, once no move is
+// under way there, and returns the counter to take it off again with
+// leaveTree.
+func (g *Group) enterTree() *atomic.Int64 {
 	for {
 		r := g.root()
-		r.tree.RLock()
-		if g.root() == r {
-			return r
+		busy := r.guard.busy.add(0, 1)
+		ch := r.guard.moving.Load()
+		if ch == nil && g.root() == r {
+			return busy
 		}
-		r.tree.RUnlock()
+		busy.Add(-1)
+		if ch != nil {
+			<-*ch
+		}
+	}
+}
+
+func leaveTree(busy *atomic.Int64) { busy.Add(-1) }
+
+// beginMove announces a move in the tree of g, a root, and waits until no Acquire or
+// Release is under way there. cycleMu must be held, so that one move runs
+// at a time.
+func (g *Group) beginMove() {
+	ch := make(chan struct{})
+	g.guard.moving.Store(&ch)
+	for g.guard.busy.sum(0) != 0 {
+		runtime.Gosched()
+	}
+}
+
+// endMove ends the move that beginMove announced in g's tree.
+func (g *Group) endMove() {
+	if ch := g.guard.moving.Swap(nil); ch != nil {
+		close(*ch)
 	}
 }
 
@@ -144,17 +228,16 @@ func (g *Group) lockTree() *Group {
 // nothing, when p is g or a descendant of g, or when a Limiter of p or of
 // one of its ancestors charges the Reads or Writes of g or of a descendant.
 func (g *Group) SetParent(p *Group) error {
-	configMu.Lock()
-	defer configMu.Unlock()
-	// No other SetParent runs, so the roots stay; Acquire and Release hold
-	// one tree's lock at a time, so taking two cannot deadlock.
+	cycleMu.Lock()
+	defer cycleMu.Unlock()
+	// No other SetParent runs, so the roots stay.
 	from := g.root()
-	from.tree.Lock()
-	defer from.tree.Unlock()
+	from.beginMove()
+	defer from.endMove()
 	if p != nil {
 		if to := p.root(); to != from {
-			to.tree.Lock()
-			defer to.tree.Unlock()
+			to.beginMove()
+			defer to.endMove()
 		}
 	}
 	for a := p; a != nil; a = a.parent.Load() {
@@ -170,38 +253,20 @@ func (g *Group) SetParent(p *Group) error {
 	for a := p; a != nil; a = a.parent.Load() {
 		a.conns.Add(n)
 	}
+	// g's bytes from now on count in the new ancestors, and those it counted
+	// stay with the old ones: one reading of its totals ends the one and
+	// starts the other. The ancestors in both chains count them all along.
+	nd := g.node()
+	tot := nd.sum.total()
+	if old != nil {
+		old.node().sum.detach(&nd.sum, tot)
+		nd.up = nil
+	}
+	if p != nil {
+		g.adopt(p, tot)
+	}
 	g.parent.Store(p)
-	// The wrappers below g count in the new ancestors from now on, and the
-	// bytes they counted stay with the old ones. The ancestors in both
-	// chains, such as the root of a move within a tree, keep them as they
-	// are.
-	stay := make(map[*Group]bool)
-	for a := old; a != nil; a = a.parent.Load() {
-		stay[a] = true
-	}
-	var left, joined []*Counter
-	for a := p; a != nil; a = a.parent.Load() {
-		if stay[a] {
-			stay[a] = false // in both chains
-			continue
-		}
-		joined = append(joined, a.Traffic())
-		if a.members == nil {
-			a.members = make(map[weak.Pointer[rateConn]]*Meter)
-		}
-		maps.Copy(a.members, g.members)
-	}
-	for a := old; a != nil; a = a.parent.Load() {
-		if !stay[a] {
-			continue
-		}
-		left = append(left, a.Traffic())
-		for k := range g.members {
-			delete(a.members, k)
-		}
-	}
-	moveMeters(left, joined, g.meters())
-	g.update()
+	groupGen.Add(1)
 	// The waiters of the old ancestors may now find a slot, or a chain
 	// without them; the chain of old does not change.
 	for a := old; a != nil; a = a.parent.Load() {
@@ -215,7 +280,9 @@ func (g *Group) SetParent(p *Group) error {
 // descendants', nil for none. A Rate, a Budget or a NewHierarchy of them
 // suits; the same Limiter for both directions shares one limit between
 // them, and one set at several levels is charged once. It applies from the
-// next read or write, also of the connections open in g and below. It
+// next read or write, also of the connections open in g and below, which
+// take it on at their next grant: a wait in progress ends on the Limiters
+// it began with. It
 // panics if a Limiter charges the Reads or Writes of g or of a descendant,
 // which would charge itself without end.
 func (g *Group) SetLimiters(read, write Limiter) { g.setLimiters(&read, &write) }
@@ -223,11 +290,18 @@ func (g *Group) SetLimiters(read, write Limiter) { g.setLimiters(&read, &write) 
 // setLimiters sets the Limiters that read and write point to, leaving a
 // direction with a nil pointer as it is.
 func (g *Group) setLimiters(read, write *Limiter) {
-	configMu.Lock()
-	defer configMu.Unlock()
+	check := false
 	for _, l := range [2]*Limiter{read, write} {
 		if l != nil {
-			if *l = classify(*l).l; g.chargedBy(*l) {
+			*l = classify(*l).l
+			check = check || mayReach(*l)
+		}
+	}
+	if check {
+		cycleMu.Lock()
+		defer cycleMu.Unlock()
+		for _, l := range [2]*Limiter{read, write} {
+			if l != nil && g.chargedBy(*l) {
 				panic("byterate: Group limiter charges the Group itself")
 			}
 		}
@@ -239,11 +313,16 @@ func (g *Group) setLimiters(read, write *Limiter) {
 		g.write.Store(&groupLimiter{l: *write})
 	}
 	g.epoch.Add(1)
-	g.update()
+	groupGen.Add(1)
 }
 
+// groupGen changes with the limiters and the parent of any Group, for the
+// connections opened in Groups to look whether their levels changed: one
+// load per read or write tells them they did not.
+var groupGen atomic.Uint64
+
 // chargedBy reports whether l charges the Reads or Writes of g or of one of
-// its descendants. configMu must be held.
+// its descendants. cycleMu must be held.
 func (g *Group) chargedBy(l Limiter) bool {
 	return reaches(l, func(x Limiter) bool {
 		for a := groupOf(x); a != nil; a = a.parent.Load() {
@@ -283,39 +362,39 @@ func loadLimiter(p *atomic.Pointer[groupLimiter]) Limiter {
 }
 
 // Traffic returns the Counter of the bytes that the connections of g and its
-// descendants read and wrote, and their throughput. A moved connection's
-// bytes count where it was when they passed. Unless SetTraffic gives it
-// another, it is a plain Counter: the connections opened in the Group add
-// to it without contending anyway, and a NewSharedCounter suits a level
-// that many relays charge through Reads and Writes at once.
+// descendants read and wrote, and their throughput. A moved Group's bytes
+// count where it was when they passed.
 func (g *Group) Traffic() *Counter {
 	if c := g.traffic.Load(); c != nil {
 		return c
 	}
-	// The first Counter is made once, so every level built with it counts
-	// in the one that stays.
-	g.traffic.CompareAndSwap(nil, &Counter{})
+	// The first Counter counts all that g's sum did, and is made once.
+	c := &Counter{}
+	c.attach(&g.node().sum, [2]int64{})
+	g.traffic.CompareAndSwap(nil, c)
 	return g.traffic.Load()
 }
 
-// SetTraffic makes c the Counter of g's traffic from the next read or write,
-// such as a NewSharedCounter for a Group that many connections share, or a
-// Counter restored after a restart; nil makes a new one. A read or write that
-// was charged before may still count in the Counter it replaces.
+// SetTraffic makes c the Counter of g's traffic from now on, such as a
+// Counter restored after a restart, or one that several Groups share to add
+// up their traffic; nil makes a new one. The bytes counted before stay in
+// the Counter it replaces. A Counter that a Group shares with one of its
+// ancestors counts the Group's bytes in each.
 func (g *Group) SetTraffic(c *Counter) {
 	if c == nil {
 		c = &Counter{}
 	}
-	configMu.Lock()
-	defer configMu.Unlock()
+	n := g.node()
+	n.mu.Lock()
+	defer n.mu.Unlock()
 	old := g.Traffic()
 	if old == c {
 		return
 	}
-	// Only the wrappers of g's subtree move; others that share old stay.
-	moveMeters([]*Counter{old}, []*Counter{c}, g.meters())
+	tot := n.sum.total()
+	old.detach(&n.sum, tot)
+	c.attach(&n.sum, tot)
 	g.traffic.Store(c)
-	g.epoch.Add(1)
 }
 
 // SetMaxConns caps the connections of g and its descendants at n, from the
@@ -387,8 +466,7 @@ func (g *Group) AcquireContext(ctx context.Context) error {
 // acquire takes a slot in g and each of its ancestors, or none, and returns
 // the one that refused, or nil.
 func (g *Group) acquire() *Group {
-	r := g.lockTree()
-	defer r.tree.RUnlock()
+	defer leaveTree(g.enterTree())
 	for a := g; a != nil; a = a.parent.Load() {
 		if !a.take() {
 			// The slots taken below a may have refused a waiter meanwhile.
@@ -403,6 +481,10 @@ func (g *Group) acquire() *Group {
 
 // take takes a slot in g alone, unless g is at its MaxConns.
 func (g *Group) take() bool {
+	if g.maxConns.Load() == 0 {
+		g.conns.Add(1) // no cap to check: one add, which never retries
+		return true
+	}
 	for {
 		n, limit := g.conns.Load(), g.maxConns.Load()
 		if limit > 0 && n >= limit {
@@ -419,8 +501,7 @@ func (g *Group) take() bool {
 // slot, as a Release without its Acquire finds: the slot of the caller
 // keeps g's count above zero whatever else runs.
 func (g *Group) Release() {
-	r := g.lockTree()
-	defer r.tree.RUnlock()
+	defer leaveTree(g.enterTree())
 	if g.conns.Load() < 1 {
 		panic("byterate: Group.Release without Acquire")
 	}
@@ -461,17 +542,19 @@ func (g *Group) queue() *slotQueue {
 
 // slotQueue holds the callers of AcquireContext that a Group refused, in the
 // order they came, so that a freed slot wakes the one that has waited
-// longest.
+// longest. It is a list linked both ways, so that a caller joins and leaves
+// it at once however many wait.
 type slotQueue struct {
-	mu sync.Mutex
-	q  []*slotWaiter
-	n  atomic.Int32 // len(q), for Release to skip the lock
+	head, tail *slotWaiter
+	mu         sync.Mutex
+	n          atomic.Int32 // waiters queued, for Release to skip the lock
 }
 
 // slotWaiter is a caller waiting in a slotQueue, woken by closing ch.
 type slotWaiter struct {
-	ch    chan struct{}
-	woken bool // under the queue's mu
+	ch         chan struct{}
+	prev, next *slotWaiter // under the queue's mu
+	woken      bool        // under the queue's mu
 }
 
 // add queues a new waiter, at the front if first, and returns it.
@@ -479,15 +562,34 @@ func (q *slotQueue) add(first bool) *slotWaiter {
 	w := &slotWaiter{ch: make(chan struct{})}
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	if first {
-		q.q = append(q.q, nil)
-		copy(q.q[1:], q.q)
-		q.q[0] = w
-	} else {
-		q.q = append(q.q, w)
+	switch {
+	case q.head == nil:
+		q.head, q.tail = w, w
+	case first:
+		w.next, q.head.prev = q.head, w
+		q.head = w
+	default:
+		w.prev, q.tail.next = q.tail, w
+		q.tail = w
 	}
 	q.n.Add(1)
 	return w
+}
+
+// unlink takes w out of q. q.mu must be held.
+func (q *slotQueue) unlink(w *slotWaiter) {
+	if w.prev != nil {
+		w.prev.next = w.next
+	} else {
+		q.head = w.next
+	}
+	if w.next != nil {
+		w.next.prev = w.prev
+	} else {
+		q.tail = w.prev
+	}
+	w.prev, w.next = nil, nil
+	q.n.Add(-1)
 }
 
 // leave takes w out of q. A wake that w took and did not use goes to the
@@ -495,12 +597,7 @@ func (q *slotQueue) add(first bool) *slotWaiter {
 func (q *slotQueue) leave(w *slotWaiter) {
 	q.mu.Lock()
 	if !w.woken {
-		i := 0
-		for q.q[i] != w {
-			i++
-		}
-		q.q = append(q.q[:i], q.q[i+1:]...)
-		q.n.Add(-1)
+		q.unlink(w)
 		q.mu.Unlock()
 		return
 	}
@@ -512,20 +609,14 @@ func (q *slotQueue) leave(w *slotWaiter) {
 func (q *slotQueue) wake(all bool) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	n := min(len(q.q), 1)
-	if all {
-		n = len(q.q)
-	}
-	for _, w := range q.q[:n] {
+	for w := q.head; w != nil; w = q.head {
+		q.unlink(w)
 		w.woken = true
 		close(w.ch)
+		if !all {
+			return
+		}
 	}
-	clear(q.q[:n])
-	q.q = q.q[n:]
-	if len(q.q) == 0 {
-		q.q = nil // drop the memory the woken took
-	}
-	q.n.Add(int32(-n))
 }
 
 // Reads returns the Limiter of the reads of g's connections: it charges the
@@ -602,26 +693,6 @@ func (g *Group) acquireFor(ctx context.Context) error {
 	return g.Acquire()
 }
 
-// meters returns the Meters of the wrappers opened in g and its
-// descendants. configMu must be held.
-func (g *Group) meters() []*Meter {
-	ms := make([]*Meter, 0, len(g.members))
-	for _, m := range g.members {
-		ms = append(ms, m)
-	}
-	return ms
-}
-
-// update gives the wrappers opened in g and its descendants the Limiters
-// of their levels as they are now. configMu must be held.
-func (g *Group) update() {
-	for k := range g.members {
-		if s := k.Value(); s != nil {
-			s.applyLocked()
-		}
-	}
-}
-
 // groupLevels are the levels of both directions of a Group, as built from
 // the Groups of chain.
 //
@@ -632,6 +703,10 @@ func (g *Group) update() {
 type groupLevels struct {
 	chain       []groupStamp
 	read, write hierarchy
+	// The Limiters of the levels of each direction, from g up, without the
+	// view of g's sum: those of the wrappers opened in g, whose Meters
+	// count their bytes.
+	own [2][]Limiter
 }
 
 // groupStamp is a Group of a chain and its epoch when levels were built.
@@ -644,14 +719,20 @@ type groupStamp struct {
 // connections are charged to: the Limiters of that direction of g and each
 // ancestor, flattened, and the views of their Traffic.
 func (g *Group) hierarchy(write bool) *hierarchy {
-	c := g.cache.Load()
-	if c == nil || !c.current(g) {
-		c = g.build()
-	}
+	c := g.levels()
 	if write {
 		return &c.write
 	}
 	return &c.read
+}
+
+// levels returns g's levels as they are now.
+func (g *Group) levels() *groupLevels {
+	c := g.cache.Load()
+	if c == nil || !c.current(g) {
+		c = g.build()
+	}
+	return c
 }
 
 // current reports whether c was built from g and its ancestors as they are.
@@ -675,12 +756,16 @@ func (g *Group) build() *groupLevels {
 		// The epoch first: a change after it makes the next charge build
 		// the levels again.
 		c.chain = append(c.chain, groupStamp{g: a, epoch: a.epoch.Load()})
-		c.read.add(a.readLimiter())
-		c.write.add(a.writeLimiter())
-		t := a.Traffic()
-		c.read.add(t.reads())
-		c.write.add(t.writes())
+		r, w := a.readLimiter(), a.writeLimiter()
+		c.read.add(r)
+		c.write.add(w)
+		c.own[0] = append(c.own[0], r)
+		c.own[1] = append(c.own[1], w)
 	}
+	// The ancestors' sums add up g's.
+	sum := &g.node().sum
+	c.read.add(sum.reads())
+	c.write.add(sum.writes())
 	g.cache.Store(c)
 	return c
 }

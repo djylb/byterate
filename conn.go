@@ -15,7 +15,6 @@ import (
 	"syscall"
 	"time"
 	"unsafe"
-	"weak"
 )
 
 // spliceSockets reports whether the ReadFrom of a socket splices from
@@ -155,11 +154,19 @@ type rateConn struct {
 	w           io.Writer // nil for a wrapper of reads alone
 	c           io.Closer // what Close closes, if anything
 	read, write direction
-	datagram    bool // every Read and Write carries one whole message
 
-	own     [2]Limiter // the wrapper's own Limiters, under configMu
+	own     [2]Limiter   // the wrapper's own Limiters, under mu
+	levels  *groupLevels // the levels of reg.group it applies, under mu
 	reg     *connReg
-	cleanup runtime.Cleanup // runs reg.finish if the wrapper is dropped
+	cleanup runtime.Cleanup // runs reg.finish if the wrapper is dropped, under mu
+	// mu serializes the changes of the wrapper's limiters: its own
+	// Limiters, and the levels of its Group, which it takes on at its next
+	// read or write after they change.
+	mu sync.Mutex
+	// seen is the groupGen at which levels were last found current.
+	seen     atomic.Uint64
+	settles  bool // cleanup is set, under mu
+	datagram bool // every Read and Write carries one whole message
 }
 
 // connReg is where a wrapper is registered: its Meter in Counters, and its
@@ -167,9 +174,8 @@ type rateConn struct {
 // wrapper's accounts once a wrapper dropped without Close is collected.
 type connReg struct {
 	meter    *Meter
-	counters []*Counter // given by WithCounter
 	group    *Group
-	key      weak.Pointer[rateConn] // the wrapper in its Group's members
+	counters []*Counter // given by WithCounter
 	done     atomic.Bool
 }
 
@@ -178,6 +184,10 @@ type connReg struct {
 const (
 	dirLimited uint32 = 1 << iota // a limiter other than leases applies
 	dirLeased                     // Budgets lease bytes to the direction
+	// dirStale is never stored: load adds it while the levels of the
+	// wrapper's Group may have changed, which keeps the I/O off its fast
+	// path until recheck applies them.
+	dirStale
 )
 
 // direction holds the limiting of one direction of a rateConn.
@@ -193,14 +203,21 @@ type direction struct {
 	// writes of a *net.TCPConn do not. Made for the writes of a stream.
 	writing chan struct{}
 	leases  *leaseSet // in the Meter
+	// conn is the wrapper, while it is opened in a Group, for load to
+	// look whether the Group's levels changed; nil otherwise.
+	conn *rateConn
+	mu   *sync.Mutex // the wrapper's
 	// src is the Limiter apply was given; charged lists the Budgets taken
-	// out of leasing because a step's Limit applies. Under configMu.
+	// out of leasing because a step's Limit applies. Under mu.
 	src     Limiter
 	charged []*Budget
 }
 
-func (d *direction) init(side *meterSide, leases *leaseSet) {
-	d.side, d.leases = side, leases
+func (d *direction) init(s *rateConn, side *meterSide, leases *leaseSet) {
+	d.side, d.leases, d.mu = side, leases, &s.mu
+	if s.reg.group != nil {
+		d.conn = s
+	}
 	d.lim.init(&d.sw)
 	d.cancel.init()
 }
@@ -210,31 +227,73 @@ func (d *direction) init(side *meterSide, leases *leaseSet) {
 // ends and starts over on the new ones, and nil leaves a direction
 // unlimited. A Group's levels still apply on top.
 func (s *rateConn) SetLimiters(read, write Limiter) {
-	configMu.Lock()
-	defer configMu.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.own = [2]Limiter{read, write}
 	s.applyLocked()
+}
+
+// load returns d's state, with dirStale added while the levels of the
+// wrapper's Group may have changed since they were applied.
+func (d *direction) load() uint32 {
+	st := d.state.Load()
+	if s := d.conn; s != nil && s.seen.Load() != groupGen.Load() {
+		st |= dirStale
+	}
+	return st
+}
+
+// refresh applies the levels of s's Group, if they changed since it last
+// did. A change after it loads groupGen changes groupGen again, so that the
+// next read or write looks once more.
+func (s *rateConn) refresh() {
+	gen := groupGen.Load()
+	if s.seen.Load() == gen {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if lv := s.reg.group.levels(); lv != s.levels {
+		s.levels = lv
+		s.applyLocked()
+	}
+	s.seen.Store(gen)
 }
 
 // Meter returns the Meter of the wrapper's bytes.
 func (s *rateConn) Meter() *Meter { return s.meter }
 
 // applyLocked gives each direction its Limiter: its own, within those of
-// its Group's levels. configMu must be held.
+// its Group's levels. s.mu must be held.
 func (s *rateConn) applyLocked() {
 	read, write := s.own[0], s.own[1]
-	for a := s.reg.group; a != nil; a = a.parent.Load() {
-		read, write = NewHierarchy(read, a.readLimiter()), NewHierarchy(write, a.writeLimiter())
+	if lv := s.levels; lv != nil {
+		read = NewHierarchy(append([]Limiter{read}, lv.own[0]...)...)
+		write = NewHierarchy(append([]Limiter{write}, lv.own[1]...)...)
 	}
-	s.read.apply(read)
-	s.write.apply(write)
+	r, w := s.read.apply(read), s.write.apply(write)
+	if r || w {
+		s.settleWhenDroppedLocked()
+	}
+}
+
+// settleWhenDroppedLocked makes sure that s, if dropped without Close, is
+// settled once collected, so that its Counters, Budgets and Group do not
+// keep it, nor its leases. A wrapper with none of them needs nothing
+// settled, and costs the runtime no cleanup. s.mu must be held.
+func (s *rateConn) settleWhenDroppedLocked() {
+	if !s.settles {
+		s.settles = true
+		s.cleanup = runtime.AddCleanup(s, (*connReg).finish, s.reg)
+	}
 }
 
 // apply makes l the direction's Limiter. The Budgets among its levels lease
 // bytes to the direction rather than being charged each read and write;
 // the other levels, and the Budgets in charged, are charged as a
-// hierarchy. configMu must be held.
-func (d *direction) apply(l Limiter) {
+// hierarchy. It reports whether the direction has leases, which the
+// wrapper must settle even when dropped. The wrapper's mu must be held.
+func (d *direction) apply(l Limiter) (leased bool) {
 	if l != d.src {
 		d.charged = nil
 	}
@@ -266,35 +325,40 @@ func (d *direction) apply(l Limiter) {
 		// without it; without one, the state first.
 		d.sw.swap(lim)
 		d.state.Store(st | dirLimited)
-		return
+		return len(lease)+len(d.charged) > 0
 	}
 	d.state.Store(st)
 	if d.sw.state().t.limiter() != nil {
 		d.sw.swap(nil) // a wait in progress passes at once
 	}
+	return len(lease)+len(d.charged) > 0
 }
 
 // charge takes b out of the direction's leases, to charge it at every read
 // and write, as a Limiter, while a step's Limit applies.
 func (d *direction) charge(b *Budget) {
-	configMu.Lock()
-	defer configMu.Unlock()
+	d.mu.Lock()
+	defer d.mu.Unlock()
 	if !containsBudget(d.charged, b) {
 		d.charged = append(d.charged, b)
 		d.apply(d.src)
 	}
 }
 
-// recheck gives the Budgets that the direction charges as Limiters back to
-// its leases once one of them changed, such as by a Reset that left the
-// step whose Limit applied: the next lease finds out whether they may
-// lease again.
+// recheck applies the levels of the wrapper's Group if they changed, and
+// gives the Budgets that the direction charges as Limiters back to its
+// leases once one of them changed, such as by a Reset that left the step
+// whose Limit applied: the next lease finds out whether they may lease
+// again.
 func (d *direction) recheck() {
+	if d.conn != nil {
+		d.conn.refresh()
+	}
 	if !d.leases.recheck.Load() || !d.leases.recheck.Swap(false) {
 		return
 	}
-	configMu.Lock()
-	defer configMu.Unlock()
+	d.mu.Lock()
+	defer d.mu.Unlock()
 	if len(d.charged) > 0 {
 		d.charged = nil
 		d.apply(d.src)
@@ -340,19 +404,17 @@ func (r *connReg) finish() {
 	if !r.done.CompareAndSwap(false, true) {
 		return
 	}
-	configMu.Lock()
 	g := r.group
+	tot := r.meter.totals()
 	for _, c := range r.counters {
-		c.Detach(r.meter)
+		c.detach(r.meter, tot)
 	}
-	for a := g; a != nil; a = a.parent.Load() {
-		a.Traffic().Detach(r.meter)
-		delete(a.members, r.key)
+	if g != nil {
+		g.node().sum.detach(r.meter, tot)
 	}
 	for i := range r.meter.leases {
-		r.meter.leases[i].set(nil, nil)
+		r.meter.leases[i].close()
 	}
-	configMu.Unlock()
 	if g != nil {
 		g.Release()
 	}
@@ -601,7 +663,7 @@ func (s *rateConn) Read(b []byte) (int, error) {
 		return 0, ErrNilConn
 	}
 	d := &s.read
-	if st := d.state.Load(); st == 0 || len(b) == 0 ||
+	if st := d.load(); st == 0 || len(b) == 0 ||
 		st == dirLeased && d.side.end.Load()-d.side.total.Load() >= int64(len(b)) {
 		n, err := s.r.Read(b)
 		d.count(int64(n))
@@ -649,7 +711,7 @@ func (s *rateConn) Write(b []byte) (int, error) {
 		return 0, ErrNilConn
 	}
 	d := &s.write
-	st := d.state.Load()
+	st := d.load()
 	if st == 0 || len(b) == 0 {
 		n, err := s.w.Write(b)
 		d.count(int64(n))
@@ -947,7 +1009,10 @@ func (s *rateConn) Close() error {
 	s.read.cancel.close()
 	s.write.cancel.close()
 	if !s.reg.done.Load() {
-		s.cleanup.Stop()
+		s.mu.Lock()
+		cleanup := s.cleanup
+		s.mu.Unlock()
+		cleanup.Stop()
 		s.reg.finish()
 	}
 	if s.c == nil {
@@ -1076,30 +1141,27 @@ func (s *rateConn) init(r io.Reader, w io.Writer, c io.Closer, o options, g *Gro
 	s.datagram = o.datagram
 	m := newMeter()
 	s.meter = m
-	s.read.init(&m.read, &m.leases[0])
-	s.write.init(&m.written, &m.leases[1])
 	if !s.datagram {
 		s.write.writing = make(chan struct{}, 1)
 	}
-	reg := &connReg{meter: m, counters: o.counters, group: g, key: weak.Make(s)}
+	reg := &connReg{meter: m, counters: o.counters, group: g}
 	s.reg = reg
-	configMu.Lock()
-	defer configMu.Unlock()
+	s.read.init(s, &m.read, &m.leases[0])
+	s.write.init(s, &m.written, &m.leases[1])
+	// Not yet shared: no lock. The Meter counts nothing yet.
 	s.own = [2]Limiter{o.read, o.write}
 	for _, c := range reg.counters {
-		c.Attach(m)
+		c.attach(m, [2]int64{})
 	}
-	for a := g; a != nil; a = a.parent.Load() {
-		a.Traffic().Attach(m)
-		if a.members == nil {
-			a.members = make(map[weak.Pointer[rateConn]]*Meter)
-		}
-		a.members[reg.key] = m
+	if g != nil {
+		g.node().sum.attach(m, [2]int64{})
+		s.seen.Store(groupGen.Load())
+		s.levels = g.levels()
+	}
+	if g != nil || len(reg.counters) > 0 {
+		s.settleWhenDroppedLocked()
 	}
 	s.applyLocked()
-	// A wrapper dropped without Close is settled once collected, so that
-	// its Counters, Budgets and Group do not keep it, nor its leases.
-	s.cleanup = runtime.AddCleanup(s, (*connReg).finish, reg)
 }
 
 // isDatagramConn reports whether c is a socket whose every Read and Write
@@ -1216,7 +1278,7 @@ func (c *PacketConn) ReadFrom(b []byte) (int, net.Addr, error) {
 		return 0, nil, ErrNilConn
 	}
 	d := &c.s.read
-	if d.state.Load() == 0 || len(b) == 0 {
+	if d.load() == 0 || len(b) == 0 {
 		n, addr, err := c.pc.ReadFrom(b)
 		d.count(int64(n))
 		return n, addr, err
@@ -1279,7 +1341,7 @@ func (c *PacketConn) WriteTo(b []byte, addr net.Addr) (int, error) {
 		return 0, ErrNilConn
 	}
 	d := &c.s.write
-	if d.state.Load() == 0 || len(b) == 0 {
+	if d.load() == 0 || len(b) == 0 {
 		n, err := c.pc.WriteTo(b, addr)
 		d.count(int64(n))
 		return n, err

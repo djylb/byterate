@@ -79,9 +79,9 @@ func (lv *level) isView() bool { return lv.kind == kindCountReads || lv.kind == 
 // count adds n bytes to the Counter of the view lv.
 func (lv *level) count(n int64) {
 	if lv.kind == kindCountReads {
-		(*Counter)(lv.l.(*counterReads)).Add(n, 0)
+		(*tally)(lv.l.(*counterReads)).add(n, 0)
 	} else {
-		(*Counter)(lv.l.(*counterWrites)).Add(0, n)
+		(*tally)(lv.l.(*counterWrites)).add(0, n)
 	}
 }
 
@@ -648,17 +648,38 @@ func (w *waitSet) sleep(ctx context.Context, t *waitTimer, switchCh <-chan struc
 	return nil
 }
 
-// configMu serializes the changes that reaches checks, SetParent, the
-// Group's limiter setters, Switch.Set and Budget.SetSteps, so that two of
-// them cannot together make a Limiter charge itself when neither does
-// alone. With it held, no tree of Groups changes its root.
-var configMu sync.Mutex
+// cycleMu serializes the changes that reaches checks: SetParent, and those
+// of Group.SetLimiters, Switch.Set and Budget.SetSteps that set a Limiter
+// that may pass charges on, so that two of them cannot together make a
+// Limiter charge itself when neither does alone. A change to Limiters that
+// pass charges on to none, such as Rates, cannot close such a loop and
+// takes no lock. With it held, no tree of Groups changes its root.
+var cycleMu sync.Mutex
+
+// mayReach reports whether charging l may charge another Limiter of this
+// package, as reaches would look for: whether a change to l needs the check.
+func mayReach(l Limiter) bool {
+	lv := classify(l)
+	switch lv.kind {
+	case kindHierarchy:
+		for _, x := range lv.l.(*hierarchy).lv {
+			if mayReach(x.l) {
+				return true
+			}
+		}
+		return false
+	case kindSwitch, kindBudget, kindGroupReads, kindGroupWrites:
+		return true
+	case kindNone, kindOther, kindRate, kindCountReads, kindCountWrites:
+	}
+	return false
+}
 
 // reaches reports whether charging l charges a Limiter for which f reports
 // true: l itself, or one that l passes charges on to, through hierarchies,
 // the current Limiters of Switches, the step Limits of Budgets and the
 // levels of Groups. It runs when a Limiter is configured, to keep one from
-// charging itself. configMu must be held.
+// charging itself. cycleMu must be held.
 func reaches(l Limiter, f func(Limiter) bool) bool {
 	seen := map[Limiter]bool{}
 	var visit func(Limiter) bool
@@ -692,7 +713,7 @@ func reaches(l Limiter, f func(Limiter) bool) bool {
 			}
 		case kindGroupReads, kindGroupWrites:
 			// The Limiters of the Group's levels as they are now, read
-			// without building them, as configMu keeps them.
+			// without building them, as cycleMu keeps them.
 			g := groupOf(lv.l)
 			for a := g; a != nil; a = a.parent.Load() {
 				own := a.readLimiter()

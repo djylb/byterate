@@ -215,7 +215,7 @@ func TestReserverOfEveryLimiter(t *testing.T) {
 	var g Group
 	for _, l := range []Limiter{
 		NewHierarchy(otherLimiter{NewRate(0)}), NewHierarchy(NewRate(0)),
-		g.Reads(), g.Writes(), NewSwitch(NewRate(0)), NewSharedCounter().reads(),
+		g.Reads(), g.Writes(), NewSwitch(NewRate(0)), new(Counter).reads(),
 	} {
 		r, ok := l.(Reserver)
 		if !ok {

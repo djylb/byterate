@@ -69,7 +69,7 @@ func TestThroughputIgnoresReaders(t *testing.T) {
 	run := func(readers int) []int64 {
 		var got []int64
 		synctest.Test(t, func(*testing.T) {
-			c := NewSharedCounter()
+			c := new(Counter)
 			nextWindow()
 			c.Sample()
 			for i := range 50 {
@@ -178,7 +178,7 @@ func TestCounterClock(t *testing.T) {
 // together: the windows report the bytes added and nothing of what Set
 // replaced.
 func TestCounterSetRacesThroughput(t *testing.T) {
-	c := NewSharedCounter()
+	c := new(Counter)
 	at := nowNs() + int64(time.Hour)
 	const adds = 1 << 15
 	var stop atomic.Bool

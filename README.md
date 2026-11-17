@@ -370,11 +370,13 @@ that sit idle and so never meet the refusal. `Reset` drops the usage of the peri
 each ancestor at that moment, and counted in each one's `Traffic`. After
 `SetParent`, a moved group's connections count in the new ancestors, their
 slots too, even past a cap, which then refuses new connections until enough
-close; the bytes counted before stay with the old ancestors, and a wait in
-progress starts over on the new ones. `SetLimiters` applies to the open
-connections at once. `SetMaxConns` limits the connections of a level and
-everything below it. `Acquire` takes a slot at every level or none. A
-limiter given to several levels is charged once.
+close; the bytes counted before stay with the old ancestors. `SetParent` and
+`SetLimiters` apply to the open connections from their next grant, which is
+at most one chunk of traffic away; a wait in progress ends on the limits it
+began with. `SetMaxConns` limits the connections of a level and everything
+below it. `Acquire` takes a slot at every level or none. A limiter given to
+several levels is charged once; a `Counter` given to several, as `Traffic`
+or by `WithCounter`, counts at each of them.
 
 **Switching.** After `Switch.Set`, new charges go to the new limiter, and a
 wait in progress on a `Rate` of the old one ends, is refunded there, and
@@ -437,7 +439,9 @@ A read or write on the fast path costs an atomic load and an uncontended
 atomic add on the connection's own cache line; it reads no clock and writes
 nothing that other connections share, so it does not slow down with the
 number of processors. A Counter or Group adds up its Meters when read, at a
-cost per attached connection.
+cost per attached connection, and a Group those of its children; opening and
+closing a connection registers it with its own Group alone, so connections
+of different Groups open and close without contending.
 
 Charges are lock-free; a refund takes the `Rate`'s lock briefly. A throttled
 connection reuses one timer per direction and does not allocate per `Read` or
@@ -446,8 +450,10 @@ limiter of its step counting as two. `Wait` and `Ready` called directly make
 a timer for each wait that needs one. Waits of up to 200 µs are accumulated
 as debt rather than slept. Callers waiting on a shared `Rate` are spread over
 several channels, so that many throttled connections do not contend on one.
-`Counter.Add` is an atomic add per direction; a shared `Counter` spreads the
-adds of many goroutines over counters per processor.
+`Counter.Add` is an atomic add per direction; a `Counter` that many
+goroutines add to at once spreads their adds over more counters as it finds
+them contending, up to one per processor, so one that few add to stays
+small.
 
 `io.Copy` to and from a wrapper keeps its zero-copy paths: the wrapper hands
 the connection, or the one at the other end, a chunk of at most 256 KiB at a

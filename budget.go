@@ -131,14 +131,16 @@ func (b *Budget) SetSteps(steps ...Step) {
 	if b == nil {
 		return
 	}
-	configMu.Lock()
-	defer configMu.Unlock()
 	sorted := slices.Clone(steps)
 	slices.SortStableFunc(sorted, func(x, y Step) int { return cmp.Compare(x.After, y.After) })
+	if slices.ContainsFunc(sorted, func(s Step) bool { return mayReach(s.Limit) }) {
+		cycleMu.Lock()
+		defer cycleMu.Unlock()
+	}
 	set := &budgetSteps{steps: make([]budgetStep, len(sorted)), stopAt: maxI64}
 	for i, s := range sorted {
 		s.Limit = classify(s.Limit).l
-		if reaches(s.Limit, func(x Limiter) bool { return x == Limiter(b) }) {
+		if mayReach(s.Limit) && reaches(s.Limit, func(x Limiter) bool { return x == Limiter(b) }) {
 			panic("byterate: Budget step limited by a Limiter that charges the Budget")
 		}
 		set.steps[i].Step = s
