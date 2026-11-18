@@ -27,7 +27,22 @@ type generation struct {
 
 // generationRead are the fields of a generation that every charge reads.
 type generationRead struct {
+	stopper
+}
+
+// stopper is a set of channels that close once, waking every waiter at
+// once: a Rate generation's, which Disable closes, and a paused Budget's,
+// which the change that may end the pause closes.
+type stopper struct {
 	stop atomic.Pointer[stopSet] // made by the first waiter
+}
+
+// stops returns g's stopper, nil for no generation.
+func (g *generation) stops() *stopper {
+	if g == nil {
+		return nil
+	}
+	return &g.stopper
 }
 
 // stopSet holds the channels of a generation that Disable closes. Waiters
@@ -75,9 +90,9 @@ func newGeneration(now, burstNs int64) *generation {
 	return g
 }
 
-// waitCh returns the channel of g that Disable closes for the waiter keyed by
-// key, or nil for no generation.
-func (g *generation) waitCh(key uint32) <-chan struct{} {
+// waitCh returns the channel of g that closes for the waiter keyed by key,
+// or nil for no stopper.
+func (g *stopper) waitCh(key uint32) <-chan struct{} {
 	if g == nil {
 		return nil
 	}
@@ -108,15 +123,16 @@ func (g *generation) waitCh(key uint32) <-chan struct{} {
 // grow replaces g's full stop set with a larger one, unless Disable or another
 // waiter replaced it first. Waiters keep the channels they took from the
 // full set, which Disable closes through the new set's prev.
-func (g *generation) grow(full *stopSet) {
+func (g *stopper) grow(full *stopSet) {
 	if n := sharedStopShards(); n > len(full.shards) {
 		g.stop.CompareAndSwap(full, newStopSet(n, full))
 	}
 }
 
 // closeStop closes g's channels, waking its waiters, and leaves stoppedSet
-// and closedStop for waiters to come. It runs once, for Disable.
-func (g *generation) closeStop() {
+// and closedStop for waiters to come. It runs once, for Disable or for the
+// change that opens a pauseGate.
+func (g *stopper) closeStop() {
 	for set := g.stop.Swap(stoppedSet); set != nil; set = set.prev {
 		for i := range set.shards {
 			if c := set.shards[i].Swap(closedStop); c != nil {

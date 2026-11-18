@@ -82,7 +82,7 @@ func (b *Budget) leaseLocked(n int64, self *budgetLease) (Lease, error) {
 		var err error
 		if used >= set.stopAt {
 			err = ErrBudgetExhausted
-		} else if _, s := set.at(used); s != nil && s.Limit != nil {
+		} else if _, s := set.at(used); s != nil && (s.Limit != nil || s.Pause) {
 			err = ErrWouldWait
 		}
 		if err != nil {

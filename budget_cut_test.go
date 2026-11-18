@@ -30,7 +30,7 @@ func (l *lowerOnReady) Ready(_ context.Context, n int64) (int64, error) {
 		if l.steps == nil {
 			l.steps = []Step{{After: l.stop, Stop: true}}
 		}
-		l.b.SetSteps(l.steps...)
+		l.b.SetSteps(l.steps...) //nolint:contextcheck // SetSteps takes no context
 	}
 	return n, nil
 }

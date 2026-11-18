@@ -69,6 +69,12 @@ type waitTimer struct {
 // it, and it ends within 2 ms anyway. A wait with done always watches it,
 // however short, since a deadline or Close must end it.
 func (w *waitTimer) sleep(waitNs int64, g *generation, done, switchCh <-chan struct{}) sleepResult {
+	return w.sleepOn(waitNs, g.stops(), done, switchCh)
+}
+
+// sleepOn is sleep with the channels of g, nil for none, which stopped
+// says closed.
+func (w *waitTimer) sleepOn(waitNs int64, g *stopper, done, switchCh <-chan struct{}) sleepResult {
 	if waitNs <= 0 {
 		return slept
 	}

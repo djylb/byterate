@@ -122,6 +122,17 @@ daily.Used()         // the bytes used in the period
 daily.Remaining()    // the bytes left before the stop, 0 once stopped
 ```
 
+A step with `Pause` holds the traffic without refusing it, such as until a
+quota is confirmed: reads and writes wait, and `TryWait` returns
+`ErrWouldWait`, until `SetSteps`, `Reset`, `SetUsed`, `SetExpiry` or the
+expiry lets the bytes through or stops them. A paused reader's `NotifyReadable` holds no
+goroutine while it waits:
+
+```go
+held := byterate.NewBudget(byterate.Step{Pause: true}) // nothing passes yet
+held.SetSteps()                                         // everything waiting passes
+```
+
 None of these changes ends a connection. Periods are up to the caller, such
 as each hour, day or week:
 
@@ -305,8 +316,10 @@ first and refuses them for the whole hierarchy: the other levels neither
 take them nor make the caller wait. `Charge`, which records bytes already
 transferred, keeps them on every level and returns the refusal.
 
-**Budgets.** A `Budget` never blocks by itself; the `Limit` of its step does.
-Once the usage reaches a `Stop` step, it refuses everything until the next
+**Budgets.** A `Budget` blocks by itself only at a `Pause` step; otherwise
+the `Limit` of its step does. A wait at a pause ends with the change that
+ends the pause, the end of its context, or a wrapper's `Close`, deadline or
+`SetLimiters`, and charges nothing until it passes. Once the usage reaches a `Stop` step, it refuses everything until the next
 period. Writes never take the usage past it, even concurrent ones: a
 `Write` sends what fits and fails. A `Read` reads no more than is left: the
 `Read` that reaches the stop returns its bytes and a nil error, and the next

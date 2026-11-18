@@ -112,3 +112,8 @@
     2.5s  read 512 ok
   3.524s  read 512 ok
   3.624s  deadline write 0 i/o timeout
+== budget pause
+      0s  write to pause 1000 ok used=1000
+      0s  trywait byterate: limit would wait
+      1s  write resumed 500 ok used=1500
+      2s  write to stop 1500 byterate: budget exhausted used=3000

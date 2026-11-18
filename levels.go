@@ -328,7 +328,7 @@ func (v *levels) readyOthers(ctx context.Context, t *waitTimer, size int64, whol
 		case kindNone, kindRate, kindCountReads, kindCountWrites:
 			continue
 		case kindBudget:
-			n, err = lv.l.(*Budget).ready(ctx, t, size)
+			n, err = lv.l.(*Budget).ready(ctx, t, size, v.switchCh)
 		case kindOther:
 			n, err = lv.l.Ready(ctx, size)
 		default:
@@ -489,7 +489,7 @@ func (v *levels) waitOthers(ctx context.Context, t *waitTimer, size int64, c cut
 			lv.count(size)
 			rc.add(entry{l: lv.l})
 		case kindBudget:
-			n, err = lv.l.(*Budget).wait(ctx, t, size, c, rc)
+			n, err = lv.l.(*Budget).wait(ctx, t, size, c, rc, v.switchCh)
 		case kindOther:
 			err = lv.l.Wait(ctx, size)
 			if err == nil || isCanceled(ctx, err) {

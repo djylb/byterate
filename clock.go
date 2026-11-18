@@ -26,8 +26,9 @@ func (b *Budget) SetClock(c Clock) {
 		box = &clockBox{c: c}
 	}
 	b.lessees.mu.Lock()
-	defer b.lessees.mu.Unlock()
 	b.clock.Store(box)
 	b.scheduleLocked()
 	b.revokeLocked()
+	b.lessees.mu.Unlock()
+	b.wakePaused()
 }

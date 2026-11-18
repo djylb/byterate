@@ -369,6 +369,27 @@ var differentialScenarios = []struct {
 		r.logf("deadline write %d %s", n, errStr(err))
 		_ = c.Close()
 	}},
+	{"budget pause", func(r *diffRecorder) {
+		slow := NewRate(1000)
+		bud := NewBudget(Step{After: 1000, Pause: true})
+		c := NewConn(&nopNetConn{}, WithLimiter(bud))
+		n, err := c.Write(make([]byte, 1000))
+		r.logf("write to pause %d %s used=%d", n, errStr(err), bud.Used())
+		r.logf("trywait %s", errStr(bud.TryWait(1)))
+		go func() {
+			time.Sleep(time.Second)
+			bud.SetSteps(Step{After: 1000, Limit: slow}, Step{After: 3000, Pause: true})
+		}()
+		n, err = c.Write(make([]byte, 500))
+		r.logf("write resumed %d %s used=%d", n, errStr(err), bud.Used())
+		go func() {
+			time.Sleep(time.Second)
+			bud.SetSteps(Step{After: 2000, Stop: true})
+		}()
+		n, err = c.Write(make([]byte, 2000))
+		r.logf("write to stop %d %s used=%d", n, errStr(err), bud.Used())
+		_ = c.Close()
+	}},
 }
 
 func fmt2(a, b int64) string { return fmt.Sprintf("%d/%d", a, b) }

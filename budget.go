@@ -10,6 +10,9 @@ import (
 	"weak"
 )
 
+// errPaused is take's refusal while a step with Pause applies.
+var errPaused = errors.New("byterate: budget paused")
+
 // ErrBudgetExhausted is returned for bytes that a Budget stops: once its
 // usage reaches a step with Stop, or once its expiry has passed.
 var ErrBudgetExhausted = errors.New("byterate: budget exhausted")
@@ -22,20 +25,35 @@ type Step struct {
 	After int64
 	// Limit, if set, is charged for the bytes of the step on top of the
 	// other limits, so that it sets their pace, such as a slower Rate. A
-	// step with Stop needs none.
+	// step with Stop or Pause needs none, and charges none given.
 	Limit Limiter
 	// Stop ends the period's traffic: from After on, the Budget refuses all
 	// bytes with ErrBudgetExhausted, which ends the connection reads and
-	// writes charged to it, and steps after it never apply.
+	// writes charged to it, and steps after it never apply. A step with
+	// Stop stops, whether it has Pause or not.
 	Stop bool
+	// Pause holds the traffic from After on without refusing it: Wait and
+	// Ready block, and the connection reads and writes charged to the
+	// Budget with them, and TryWait returns ErrWouldWait, until a change
+	// of the Budget lets the bytes through or refuses them. SetSteps,
+	// Reset, SetUsed, SetExpiry, SetClock and the expiry itself wake the
+	// waits, which, with a Clock set, find the expiry at the next change;
+	// so do the end of their ctx and a wrapper's Close, deadline and
+	// SetLimiters, and, for a blocking wait, a Switch it waits through.
+	// Bytes given back meanwhile by Refund or a Lease pass the next charge
+	// but wake no wait, and the levels of a Group apply to a wait from the
+	// next read or write. The NotifyReadable of a wrapper paused so holds
+	// no goroutine; the change that ends the pause has its calls made on
+	// a goroutine of their own.
+	Pause bool
 }
 
 // Budget is a Limiter that counts the bytes used in a period and applies a
 // Step once they reach its After: from there on, its Limit sets their pace,
-// or Stop refuses them. Steps can slow traffic down in stages and stop it,
-// such as to 1 MiB/s past 10 GiB, to 64 KiB/s past 20 GiB and not at all
-// past 30 GiB. Before the first step a Budget limits nothing, and without
-// steps it only counts.
+// Pause holds them, or Stop refuses them. Steps can slow traffic down in
+// stages and stop it, such as to 1 MiB/s past 10 GiB, to 64 KiB/s past 20
+// GiB and not at all past 30 GiB. Before the first step a Budget limits
+// nothing, and without steps it only counts.
 //
 // Reset starts a new period, and SetSteps and SetUsed change the steps and
 // the bytes used, at any time and without ending the connections charged to
@@ -60,6 +78,7 @@ type Budget struct {
 	cur    atomic.Pointer[budgetPeriod]
 	expiry atomic.Pointer[budgetExpiry]
 	steps  atomic.Pointer[budgetSteps]
+	pause  atomic.Pointer[pauseGate] // made by the first paused charge
 	onStep atomic.Pointer[func(step int, used int64)]
 	clock  atomic.Pointer[clockBox] // SetClock's, nil for the monotonic clock
 	// The wrappers' leases, whose unused bytes Used leaves out, and,
@@ -97,11 +116,13 @@ type budgetExpiry struct {
 	at int64
 }
 
-// budgetSteps is one set of steps of a Budget, sorted by After, and the After
-// of its first step with Stop, or maxI64 for none.
+// budgetSteps is one set of steps of a Budget, sorted by After, the After of
+// its first step with Stop, or maxI64 for none, and whether a step has
+// Pause.
 type budgetSteps struct {
 	steps  []budgetStep
 	stopAt int64
+	pause  bool
 }
 
 // budgetStep is a Step, its Limit as a level, and the bytes charged to its
@@ -125,7 +146,8 @@ func NewBudget(steps ...Step) *Budget {
 // SetSteps replaces the steps of b, given in any order, from the next
 // charge; Steps returns them sorted. Of steps with the same After, the last
 // one given applies, except that a step with Stop always does: from its After
-// on, b refuses everything. It panics if a step's Limit passes charges on to
+// on, b refuses everything. The waits on a step with Pause wake to look at
+// the new steps. It panics if a step's Limit passes charges on to
 // b, which would charge b without end.
 func (b *Budget) SetSteps(steps ...Step) {
 	if b == nil {
@@ -148,11 +170,13 @@ func (b *Budget) SetSteps(steps ...Step) {
 		if s.Stop && set.stopAt == maxI64 {
 			set.stopAt = s.After
 		}
+		set.pause = set.pause || s.Pause
 	}
 	b.lessees.mu.Lock()
-	defer b.lessees.mu.Unlock()
 	b.steps.Store(set)
 	b.revokeLocked()
+	b.lessees.mu.Unlock()
+	b.wakePaused()
 }
 
 // Steps returns b's steps, sorted by After.
@@ -190,9 +214,10 @@ func (b *Budget) SetUsed(n int64) {
 	p.used.Store(max(n, 0))
 	p.reached.Store(max(n, 0))
 	b.lessees.mu.Lock()
-	defer b.lessees.mu.Unlock()
 	b.cur.Store(p)
 	b.revokeLocked()
+	b.lessees.mu.Unlock()
+	b.wakePaused()
 }
 
 // Step returns the index of the step that applies to Used, in the order of
@@ -220,10 +245,11 @@ func (b *Budget) SetExpiry(t time.Time) {
 		e = &budgetExpiry{t: t, at: addSat(nowNs(), int64(time.Until(t)))}
 	}
 	b.lessees.mu.Lock()
-	defer b.lessees.mu.Unlock()
 	b.expiry.Store(e)
 	b.scheduleLocked()
 	b.revokeLocked()
+	b.lessees.mu.Unlock()
+	b.wakePaused()
 }
 
 // scheduleLocked sets the timer that takes the leases back at b's expiry,
@@ -242,6 +268,7 @@ func (b *Budget) scheduleLocked() {
 	b.timer = time.AfterFunc(time.Duration(e.at-nowNs()), func() {
 		if b := w.Value(); b != nil {
 			b.revoke()
+			b.wakePaused()
 			b.runAfterExpiry()
 		}
 	})
@@ -303,7 +330,7 @@ func (b *Budget) OnStep(f func(step int, used int64)) {
 // the expiry.
 func (b *Budget) Wait(ctx context.Context, n int64) error {
 	var rc receipt
-	_, err := b.wait(ctx, nil, n, cutNone, &rc)
+	_, err := b.wait(ctx, nil, n, cutNone, &rc, nil)
 	return err
 }
 
@@ -311,13 +338,24 @@ func (b *Budget) Wait(ctx context.Context, n int64) error {
 // b's own, then those of the step's Limit. Unless cutNone, it charges fewer
 // bytes when fewer are left below the next step or a Stop, as take does,
 // and the Limit may cut them further. It returns the bytes charged. A
-// refusal leaves rc as it was.
-func (b *Budget) wait(ctx context.Context, t *waitTimer, n int64, c cut, rc *receipt) (int64, error) {
+// refusal leaves rc as it was. While a step with Pause applies, it charges
+// nothing and waits for the pause to end, or for ctx or switchCh, whose
+// end returns ctx's error or errSwitched with nothing charged.
+func (b *Budget) wait(ctx context.Context, t *waitTimer, n int64, c cut, rc *receipt, switchCh <-chan struct{}) (int64, error) {
 	if b == nil || n <= 0 {
 		return n, nil
 	}
 	m := rc.mark()
-	n, s, err := b.take(n, c != cutNone, rc)
+	got, s, err := b.take(n, c != cutNone, rc)
+	for errors.Is(err, errPaused) {
+		if g := b.paused(); g != nil {
+			if werr := awaitResume(ctx, t, g, switchCh); werr != nil {
+				return 0, werr
+			}
+		}
+		got, s, err = b.take(n, c != cutNone, rc)
+	}
+	n = got
 	if err != nil {
 		return 0, err
 	}
@@ -325,7 +363,7 @@ func (b *Budget) wait(ctx context.Context, t *waitTimer, n int64, c cut, rc *rec
 		return n, nil
 	}
 	own := rc.mark()
-	got, err := s.t.wait(ctx, t, n, c, rc)
+	got, err = s.t.wait(ctx, t, n, c, rc)
 	if got < n && (err == nil || isCanceled(ctx, err)) {
 		rc.shrink(m, own, n-got)
 		n = got
@@ -358,6 +396,9 @@ func (b *Budget) tryWait(n, now int64, rc *receipt) error {
 	}
 	m := rc.mark()
 	_, s, err := b.take(n, false, rc)
+	if errors.Is(err, errPaused) {
+		return ErrWouldWait
+	}
 	if err != nil || s == nil {
 		return err
 	}
@@ -387,7 +428,9 @@ func (b *Budget) check(n, now int64) error {
 			return ErrBudgetExhausted
 		}
 	}
-	if _, s := set.at(used); s != nil && s.Limit != nil {
+	if _, s := set.at(used); s != nil && s.Pause {
+		return ErrWouldWait
+	} else if s != nil && s.Limit != nil {
 		return s.t.check(n, now)
 	}
 	return nil
@@ -399,7 +442,8 @@ func (b *Budget) check(n, now int64) error {
 // same atomic update that reads the usage, as a Lease does, and refuses only
 // at the Stop. It returns the bytes added and the step whose Limit must take
 // them as well, owed them, or nil, when it reports the step the bytes reach
-// itself.
+// itself. While a step with Pause applies, it adds nothing and returns
+// errPaused.
 func (b *Budget) take(n int64, cut bool, rc *receipt) (int64, *budgetStep, error) {
 	set := b.stepSet()
 	p := b.per()
@@ -412,6 +456,11 @@ func (b *Budget) take(n int64, cut bool, rc *receipt) (int64, *budgetStep, error
 			return 0, nil, ErrBudgetExhausted
 		}
 		used = p.used.Load()
+		if set.pause && used < set.stopAt {
+			if _, s := set.at(used); s != nil && s.Pause {
+				return 0, nil, errPaused
+			}
+		}
 		take = n
 		if cut && used < set.stopAt {
 			take = min(n, set.stopAt-used, set.nextAfter(used)-used)
@@ -449,13 +498,24 @@ func (b *Budget) take(n int64, cut bool, rc *receipt) (int64, *budgetStep, error
 // ErrBudgetExhausted once the usage reaches a step with Stop, or after the
 // expiry, and charges nothing.
 func (b *Budget) Ready(ctx context.Context, n int64) (int64, error) {
-	return b.ready(ctx, nil, n)
+	return b.ready(ctx, nil, n, nil)
 }
 
-// ready is Ready in timer t, nil for one per wait.
-func (b *Budget) ready(ctx context.Context, t *waitTimer, n int64) (int64, error) {
+// ready is Ready in timer t, nil for one per wait. While a step with Pause
+// applies, it waits for the pause to end, or for ctx or switchCh, whose
+// end returns ctx's error, as awaitResume does, or errSwitched.
+func (b *Budget) ready(ctx context.Context, t *waitTimer, n int64, switchCh <-chan struct{}) (int64, error) {
 	if b == nil || n <= 0 {
 		return n, nil
+	}
+	for {
+		g := b.paused()
+		if g == nil {
+			break
+		}
+		if err := awaitResume(ctx, t, g, switchCh); err != nil {
+			return 0, err
+		}
 	}
 	if b.expired() {
 		return 0, ErrBudgetExhausted
@@ -475,7 +535,7 @@ func (b *Budget) ready(ctx context.Context, t *waitTimer, n int64) (int64, error
 	if i+1 < len(set.steps) {
 		n = min(n, max(set.steps[i+1].After-used, 1))
 	}
-	if s == nil || s.Limit == nil {
+	if s == nil || s.Limit == nil || s.Pause {
 		return n, nil
 	}
 	return s.t.ready(ctx, t, n, false)
@@ -493,7 +553,7 @@ func (b *Budget) Charge(n int64) error {
 	used := b.per().add(n)
 	_, s := set.at(used)
 	var err error
-	if s != nil && s.Limit != nil {
+	if s != nil && s.Limit != nil && !s.Pause {
 		s.owed.Add(n)
 		err = s.t.charge(n)
 	}

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net"
 	"os"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -22,8 +23,67 @@ const (
 // most waits need none, and never changes; Err is non-nil once it is closed, as
 // context.Context requires.
 type waitGen struct {
-	done  atomic.Value // chan struct{}, set by Done or end
+	done  atomic.Value             // chan struct{}, set by Done or end
+	notes atomic.Pointer[genNotes] // made by the first parked NotifyReadable
 	state atomic.Uint32
+}
+
+// genNotes are the NotifyReadable calls of a wrapper parked on a paused
+// Budget, which the end of the generation advances, for TryRead to return
+// the error of Close or the deadline.
+type genNotes struct {
+	mu    sync.Mutex
+	list  []*pendingNotify
+	ended bool
+}
+
+// park registers n to be advanced when g ends, and reports whether it did:
+// false once g has ended. n.mu must be held.
+func (g *waitGen) park(n *pendingNotify) bool {
+	gn := g.notes.Load()
+	if gn == nil {
+		g.notes.CompareAndSwap(nil, &genNotes{})
+		gn = g.notes.Load()
+	}
+	gn.mu.Lock()
+	defer gn.mu.Unlock()
+	// end sets the state before it looks at the notes.
+	if gn.ended || g.ended() {
+		return false
+	}
+	gn.list = append(gn.list, n)
+	return true
+}
+
+// unpark takes n off g's notes. n.mu must be held.
+func (g *waitGen) unpark(n *pendingNotify) {
+	gn := g.notes.Load()
+	if gn == nil {
+		return
+	}
+	gn.mu.Lock()
+	defer gn.mu.Unlock()
+	if i := slices.Index(gn.list, n); i >= 0 {
+		gn.list = slices.Delete(gn.list, i, i+1)
+	}
+}
+
+// advanceNotes advances the calls parked on g, which look at the limiter
+// again, and with end takes them off for good.
+func (g *waitGen) advanceNotes(end bool) {
+	gn := g.notes.Load()
+	if gn == nil {
+		return
+	}
+	gn.mu.Lock()
+	list := slices.Clone(gn.list)
+	if end {
+		gn.ended, gn.list = true, nil
+	}
+	gn.mu.Unlock()
+	for _, n := range list {
+		n.advance()
+	}
 }
 
 var _ context.Context = (*waitGen)(nil)
@@ -77,6 +137,15 @@ func (g *waitGen) end(state uint32) {
 	}
 	if !g.done.CompareAndSwap(nil, closedChan) {
 		close(g.done.Load().(chan struct{}))
+	}
+}
+
+// endNotes takes the calls parked on g off once g ended and advances them,
+// for TryRead to return g's error. The callers of end call it without their
+// locks held, as the calls may run the reader's code.
+func (g *waitGen) endNotes() {
+	if g.ended() {
+		g.advanceNotes(true)
 	}
 }
 
@@ -141,16 +210,20 @@ func (dt *deadlineTimer) stop() {
 
 func (dt *deadlineTimer) fire() {
 	dt.mu.Lock()
-	defer dt.mu.Unlock()
 	dt.firesAt = time.Time{}
 	if dt.at.IsZero() {
+		dt.mu.Unlock()
 		return
 	}
 	if d := time.Until(dt.at); d > 0 {
 		dt.schedule(d) // the deadline was moved later
+		dt.mu.Unlock()
 		return
 	}
-	dt.gen.end(genExpired)
+	g := dt.gen
+	g.end(genExpired)
+	dt.mu.Unlock()
+	g.endNotes()
 }
 
 // set makes dt end g at at, which is d from now. dt.mu must be held.
@@ -175,10 +248,18 @@ func (w *waitCancel) current() *waitGen { return w.gen.Load() }
 // setDeadline sets the time at which the current generation ends; a zero t
 // means never.
 func (w *waitCancel) setDeadline(t time.Time) {
+	if g := w.setDeadlineLocked(t); g != nil {
+		g.endNotes()
+	}
+}
+
+// setDeadlineLocked is setDeadline under w's locks, returning the
+// generation it ended, if any.
+func (w *waitCancel) setDeadlineLocked(t time.Time) *waitGen {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.closed {
-		return
+		return nil
 	}
 	dt := w.timer
 	if dt != nil {
@@ -193,7 +274,7 @@ func (w *waitCancel) setDeadline(t time.Time) {
 		now := time.Now()
 		if d = t.Sub(now); d <= 0 {
 			g.end(genExpired)
-			return
+			return g
 		}
 		// On the monotonic clock, as the wrapped connection keeps it: a
 		// deadline without a monotonic reading would otherwise move with
@@ -215,15 +296,24 @@ func (w *waitCancel) setDeadline(t time.Time) {
 	default:
 		dt.set(g, t, d)
 	}
+	return nil
 }
 
 // close ends the wait signal for good, ending any wait.
 func (w *waitCancel) close() {
+	if g := w.closeLocked(); g != nil {
+		g.endNotes()
+	}
+}
+
+// closeLocked is close under w.mu, returning the generation it ended, if
+// any.
+func (w *waitCancel) closeLocked() *waitGen {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	g := w.gen.Load()
 	if w.closed || g == nil {
-		return
+		return nil
 	}
 	w.closed = true
 	if dt := w.timer; dt != nil {
@@ -232,7 +322,8 @@ func (w *waitCancel) close() {
 	if g.ended() {
 		// Waits on g keep their deadline error; later ones see the close.
 		w.gen.Store(closedGen)
-		return
+		return g
 	}
 	g.end(genClosed)
+	return g
 }

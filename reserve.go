@@ -70,13 +70,13 @@ func (o *reserveOn) wait(ctx context.Context, size int64, whole bool, rc *receip
 	case o.budget != nil:
 		c := cutNone
 		if !whole {
-			n, err := o.budget.ready(ctx, nil, size)
+			n, err := o.budget.ready(ctx, nil, size, nil)
 			if err != nil {
 				return 0, err
 			}
 			size, c = n, cutBudget
 		}
-		return o.budget.wait(ctx, nil, size, c, rc)
+		return o.budget.wait(ctx, nil, size, c, rc, nil)
 	case o.one != nil:
 		return waitOn(ctx, o.one, nil, size, cutOf(whole), rc)
 	default:

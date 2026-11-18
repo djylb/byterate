@@ -234,9 +234,10 @@ func (d *direction) init(s *rateConn, side *meterSide, leases *leaseSet) {
 // unlimited. A Group's levels still apply on top.
 func (s *rateConn) SetLimiters(read, write Limiter) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.own = [2]Limiter{read, write}
 	s.applyLocked()
+	s.mu.Unlock()
+	s.read.kickNotes()
 }
 
 // load returns d's state, with dirStale added while the levels of the
