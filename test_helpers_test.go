@@ -61,8 +61,10 @@ func setWrite(g *Group, l Limiter) {
 // processor, as contention makes them.
 func spreadCounter() *Counter {
 	c := &Counter{}
-	for set := c.added.grow(nil); ; {
-		next := c.added.grow(set)
+	c.added.grow(nil)
+	for set := c.added.cells.Load(); ; {
+		c.added.grow(set)
+		next := c.added.cells.Load()
 		if next == set {
 			return c
 		}

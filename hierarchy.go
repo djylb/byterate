@@ -120,7 +120,7 @@ func (h *hierarchy) Wait(ctx context.Context, n int64) error {
 		return v.waitRates(ctx, nil, n)
 	}
 	var rc receipt
-	_, err := v.wait(ctx, nil, n, true, &rc)
+	_, err := v.wait(ctx, nil, n, cutNone, &rc)
 	return err
 }
 

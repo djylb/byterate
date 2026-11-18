@@ -68,18 +68,19 @@ func (o *reserveOn) wait(ctx context.Context, size int64, whole bool, rc *receip
 	case o.rate != nil:
 		return o.rate.grant(ctx, nil, size, whole, rc, nil)
 	case o.budget != nil:
+		c := cutNone
 		if !whole {
 			n, err := o.budget.ready(ctx, nil, size)
 			if err != nil {
 				return 0, err
 			}
-			size = n
+			size, c = n, cutBudget
 		}
-		return size, o.budget.wait(ctx, nil, size, rc)
+		return o.budget.wait(ctx, nil, size, c, rc)
 	case o.one != nil:
-		return waitOn(ctx, o.one, nil, size, whole, rc)
+		return waitOn(ctx, o.one, nil, size, cutOf(whole), rc)
 	default:
-		return o.v.wait(ctx, nil, size, whole, rc)
+		return o.v.wait(ctx, nil, size, cutOf(whole), rc)
 	}
 }
 

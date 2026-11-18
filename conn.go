@@ -477,7 +477,7 @@ func (d *direction) grantWrite(size int64, whole bool, rc *receipt) (int64, erro
 		st := d.sw.state()
 		r := st.t.one[0].rate
 		if r == nil {
-			n, err := d.lim.wait(g, &d.timer, size, whole, rc)
+			n, err := d.lim.wait(g, &d.timer, size, cutOf(whole), rc)
 			return n, g.causeOf(err)
 		}
 		n, err := r.grant(g, &d.timer, size, whole, rc, st.changed)

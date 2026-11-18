@@ -105,9 +105,11 @@ func TestCounterSpreadsOnlyOnContention(t *testing.T) {
 	if c.added.cells.Load() != nil {
 		t.Fatal("a Counter without contention spread its Adds")
 	}
-	set := c.added.grow(nil)
+	c.added.grow(nil)
+	set := c.added.cells.Load()
 	for {
-		next := c.added.grow(set)
+		c.added.grow(set)
+		next := c.added.cells.Load()
 		if next == set {
 			break
 		}

@@ -128,6 +128,22 @@ func (rc *receipt) refundFrom(m mark, size int64) {
 	}
 }
 
+// shrink gives back by bytes of each charge made between from and to, which
+// stay in rc for the fewer bytes, as a charge that a later level cut.
+func (rc *receipt) shrink(from, to mark, by int64) {
+	if rc == nil || by <= 0 {
+		return
+	}
+	for i := from.n; i < to.n; i++ {
+		rc.at(i).refund(by)
+	}
+	if !from.views && to.views {
+		for i := range rc.views {
+			rc.views[i].l.Refund(by)
+		}
+	}
+}
+
 // refund gives back size bytes of the charge e records.
 func (e *entry) refund(size int64) {
 	switch l := e.l.(type) {

@@ -154,11 +154,11 @@ func (t *target) init(l Limiter) {
 func (t *target) limiter() Limiter { return t.one[0].l }
 
 // wait charges size bytes and waits, as levels.wait does.
-func (t *target) wait(ctx context.Context, tm *waitTimer, size int64, whole bool, rc *receipt) (int64, error) {
+func (t *target) wait(ctx context.Context, tm *waitTimer, size int64, c cut, rc *receipt) (int64, error) {
 	if t.fixed.lv != nil {
-		return t.fixed.wait(ctx, tm, size, whole, rc)
+		return t.fixed.wait(ctx, tm, size, c, rc)
 	}
-	return waitOn(ctx, t.one[:], tm, size, whole, rc)
+	return waitOn(ctx, t.one[:], tm, size, c, rc)
 }
 
 // ready waits until the Limiter is ready, as levels.ready does.
@@ -198,11 +198,11 @@ func (t *target) charge(n int64) error {
 
 // waitOn charges size bytes to the level one[0] and waits, as levels.wait
 // does, starting over on the new Limiter when a Switch changes it.
-func waitOn(ctx context.Context, one []level, t *waitTimer, size int64, whole bool, rc *receipt) (int64, error) {
+func waitOn(ctx context.Context, one []level, t *waitTimer, size int64, c cut, rc *receipt) (int64, error) {
 	for {
 		v := expand(one)
 		m := rc.mark()
-		n, err := v.wait(ctx, t, size, whole, rc)
+		n, err := v.wait(ctx, t, size, c, rc)
 		if !errors.Is(err, errSwitched) {
 			return n, err
 		}
@@ -386,30 +386,58 @@ func (v *levels) refund(n int64) {
 	}
 }
 
+// cut says how much of a charge levels.wait may take.
+type cut uint8
+
+const (
+	// cutNone charges all of the size or nothing, as a datagram needs.
+	cutNone cut = iota
+	// cutAll first cuts the size to the grant of every level, as ready
+	// computes it.
+	cutAll
+	// cutBudget charges a size that ready already granted: only a
+	// Budget cuts it further, to the bytes left below its next step or
+	// Stop when it charges them, as another charger or a change of its
+	// steps may have taken the room ready saw.
+	cutBudget
+)
+
+// cutOf returns the cut of a charge that is whole or cut to every level's
+// grant.
+func cutOf(whole bool) cut {
+	if whole {
+		return cutNone
+	}
+	return cutAll
+}
+
 // wait charges a transfer of size bytes to every level before it happens and
-// waits until each allows it. Unless whole, size is first cut to the grant
-// of every level, as ready computes it, and a Rate whose credit went to other
-// chargers meanwhile is charged a quantum instead. It returns the bytes
-// charged and records each charge in rc for a refund. A level that refuses
-// the charge, with an error other than ctx's, takes back what v charged and
-// leaves rc as it was. When ctx or v's switchCh ends the wait, the charges
-// stay in rc. rc may be nil for a whole charge of Rates alone, which no
-// level refuses and nobody refunds.
-func (v *levels) wait(ctx context.Context, t *waitTimer, size int64, whole bool, rc *receipt) (int64, error) {
+// waits until each allows it. With cutAll, size is first cut to the grant
+// of every level, as ready computes it, and a Rate whose credit went to
+// other chargers meanwhile is charged a quantum instead. Unless cutNone, a
+// Budget charged then cuts the size to the bytes it has left in that same
+// atomic charge, and the levels charged before it give back the rest, so
+// that the bytes below a Stop pass and only a charge at the Stop is refused.
+// It returns the bytes charged and records each charge in rc for a refund.
+// A level that refuses the charge, with an error other than ctx's, takes
+// back what v charged and leaves rc as it was. When ctx or v's switchCh ends
+// the wait, the charges stay in rc. rc may be nil for a whole charge of
+// Rates alone, which no level refuses and nobody refunds.
+func (v *levels) wait(ctx context.Context, t *waitTimer, size int64, c cut, rc *receipt) (int64, error) {
 	// The other levels first, also for a whole charge, so that one refusing
 	// does so before the others take the bytes and have to give them back.
-	size, err := v.readyOthers(ctx, t, size, whole)
+	size, err := v.readyOthers(ctx, t, size, c != cutAll)
 	if err != nil {
 		return 0, err
 	}
 	m := rc.mark()
 	now := nowNs()
-	if !whole {
+	if c == cutAll {
 		size = v.allowance(size, now)
 	}
 	var waits waitSet
 	v.reserve(size, now, rc, &waits)
-	if !whole && waits.n > 0 {
+	if c == cutAll && waits.n > 0 {
 		if q, ok := requeue(size, v.quantum()); ok {
 			rc.refundFrom(m, size)
 			waits = waitSet{}
@@ -418,7 +446,13 @@ func (v *levels) wait(ctx context.Context, t *waitTimer, size int64, whole bool,
 		}
 	}
 	if v.others {
-		if err := v.waitOthers(ctx, t, size, rc); err != nil {
+		inner := cutNone
+		if c != cutNone {
+			inner = cutBudget
+		}
+		n, err := v.waitOthers(ctx, t, size, inner, m, rc)
+		size = n
+		if err != nil {
 			if isCanceled(ctx, err) {
 				// It kept the charge, so the views count it, for a refund
 				// to take off.
@@ -430,15 +464,23 @@ func (v *levels) wait(ctx context.Context, t *waitTimer, size int64, whole bool,
 		}
 	}
 	rc.count(v.views, size)
+	// A Budget's cut leaves the Rates' waits as they were for the larger
+	// size, which the refund shortened for the next charger: this one
+	// waits at most the cut bytes' time too long.
 	return size, waits.sleep(ctx, t, v.switchCh)
 }
 
 // waitOthers charges size bytes to the levels of v other than Rates, which
-// wait already charged, and waits for each in turn, recording the
-// charges in rc. It returns the first error, ctx's for a charge kept.
-func (v *levels) waitOthers(ctx context.Context, t *waitTimer, size int64, rc *receipt) error {
+// wait already charged since m, and waits for each in turn, recording the
+// charges in rc. Unless cutNone, a level may charge fewer bytes, as a
+// Budget does at its next step or Stop; the charges since m then give back
+// the rest, and the levels after it are charged the fewer bytes. It returns
+// the bytes charged and the first error, ctx's for a charge kept.
+func (v *levels) waitOthers(ctx context.Context, t *waitTimer, size int64, c cut, m mark, rc *receipt) (int64, error) {
 	for i := range v.lv {
 		lv := &v.lv[i]
+		before := rc.mark()
+		n := size
 		var err error
 		switch lv.kind {
 		case kindNone, kindRate:
@@ -447,20 +489,28 @@ func (v *levels) waitOthers(ctx context.Context, t *waitTimer, size int64, rc *r
 			lv.count(size)
 			rc.add(entry{l: lv.l})
 		case kindBudget:
-			err = lv.l.(*Budget).wait(ctx, t, size, rc)
+			n, err = lv.l.(*Budget).wait(ctx, t, size, c, rc)
 		case kindOther:
 			err = lv.l.Wait(ctx, size)
 			if err == nil || isCanceled(ctx, err) {
 				rc.add(entry{l: lv.l})
 			}
 		default:
-			_, err = waitOn(ctx, v.lv[i:i+1], t, size, true, rc)
+			n, err = waitOn(ctx, v.lv[i:i+1], t, size, c, rc)
 		}
 		if err != nil {
-			return err
+			if isCanceled(ctx, err) && n < size {
+				rc.shrink(m, before, size-n)
+				size = n
+			}
+			return size, err
+		}
+		if n < size {
+			rc.shrink(m, before, size-n)
+			size = n
 		}
 	}
-	return nil
+	return size, nil
 }
 
 // tryWait charges size bytes to every level at now if none of them makes

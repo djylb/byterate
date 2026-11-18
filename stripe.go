@@ -61,20 +61,16 @@ func (s *stripes) addSpread(i int, n int64) *atomic.Int64 {
 }
 
 // grow replaces set, the current cells or nil for none, by twice as many,
-// and returns the current set: set itself once it has a cell per processor.
-func (s *stripes) grow(set *stripeSet) *stripeSet {
+// unless set already has a cell per processor or another grow replaced it.
+func (s *stripes) grow(set *stripeSet) {
 	n := 2
 	if set != nil {
 		n = 2 * len(set.cells)
 		if n > pow2AtLeast(runtime.GOMAXPROCS(0)) {
-			return set
+			return
 		}
 	}
-	next := &stripeSet{cells: make([]stripeCell, n), prev: set}
-	if s.cells.CompareAndSwap(set, next) {
-		return next
-	}
-	return s.cells.Load()
+	s.cells.CompareAndSwap(set, &stripeSet{cells: make([]stripeCell, n), prev: set})
 }
 
 // sum returns sum i.

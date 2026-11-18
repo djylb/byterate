@@ -97,7 +97,7 @@ func (s *Switch) Wait(ctx context.Context, n int64) error {
 		return nil // no Limiter, so nothing to wait for
 	}
 	var rc receipt
-	_, err := waitOn(ctx, st.self[:], nil, n, true, &rc)
+	_, err := waitOn(ctx, st.self[:], nil, n, cutNone, &rc)
 	return err
 }
 

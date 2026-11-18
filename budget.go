@@ -303,28 +303,42 @@ func (b *Budget) OnStep(f func(step int, used int64)) {
 // the expiry.
 func (b *Budget) Wait(ctx context.Context, n int64) error {
 	var rc receipt
-	return b.wait(ctx, nil, n, &rc)
+	_, err := b.wait(ctx, nil, n, cutNone, &rc)
+	return err
 }
 
 // wait is Wait in timer t, nil for one per wait, recording the charges in rc:
-// b's own, then those of the step's Limit. A refusal leaves rc as it was.
-func (b *Budget) wait(ctx context.Context, t *waitTimer, n int64, rc *receipt) error {
+// b's own, then those of the step's Limit. Unless cutNone, it charges fewer
+// bytes when fewer are left below the next step or a Stop, as take does,
+// and the Limit may cut them further. It returns the bytes charged. A
+// refusal leaves rc as it was.
+func (b *Budget) wait(ctx context.Context, t *waitTimer, n int64, c cut, rc *receipt) (int64, error) {
 	if b == nil || n <= 0 {
-		return nil
+		return n, nil
 	}
 	m := rc.mark()
-	s, err := b.take(n, rc)
-	if err != nil || s == nil {
-		return err
+	n, s, err := b.take(n, c != cutNone, rc)
+	if err != nil {
+		return 0, err
 	}
-	if _, err := s.t.wait(ctx, t, n, true, rc); err != nil {
+	if s == nil {
+		return n, nil
+	}
+	own := rc.mark()
+	got, err := s.t.wait(ctx, t, n, c, rc)
+	if got < n && (err == nil || isCanceled(ctx, err)) {
+		rc.shrink(m, own, n-got)
+		n = got
+	}
+	if err != nil {
 		if !isCanceled(ctx, err) {
 			rc.refundFrom(m, n) // refused, so b keeps no charge either
+			return 0, err
 		}
-		return err
+		return n, err
 	}
 	b.report()
-	return nil
+	return n, nil
 }
 
 // TryWait charges n bytes to b and to the Limit of the step that applies if
@@ -343,7 +357,7 @@ func (b *Budget) tryWait(n, now int64, rc *receipt) error {
 		return nil
 	}
 	m := rc.mark()
-	s, err := b.take(n, rc)
+	_, s, err := b.take(n, false, rc)
 	if err != nil || s == nil {
 		return err
 	}
@@ -380,22 +394,29 @@ func (b *Budget) check(n, now int64) error {
 }
 
 // take adds n bytes to the usage, unless they would take it past a Stop or
-// the expiry has passed, and records the charge in rc. It returns the step
-// whose Limit must take the bytes as well, owed them, or nil, when it
-// reports the step the bytes reach itself.
-func (b *Budget) take(n int64, rc *receipt) (*budgetStep, error) {
+// the expiry has passed, and records the charge in rc. With cut, it adds
+// fewer bytes when fewer are left below the next step or the Stop, in the
+// same atomic update that reads the usage, as a Lease does, and refuses only
+// at the Stop. It returns the bytes added and the step whose Limit must take
+// them as well, owed them, or nil, when it reports the step the bytes reach
+// itself.
+func (b *Budget) take(n int64, cut bool, rc *receipt) (int64, *budgetStep, error) {
 	set := b.stepSet()
 	p := b.per()
 	// Take the bytes before waiting, so that concurrent charges cannot pass
 	// a Stop together.
 	reclaimed := false
-	var used int64
+	var used, take int64
 	for {
 		if b.expired() {
-			return nil, ErrBudgetExhausted
+			return 0, nil, ErrBudgetExhausted
 		}
 		used = p.used.Load()
-		if addSat(used, n) > set.stopAt {
+		take = n
+		if cut && used < set.stopAt {
+			take = min(n, set.stopAt-used, set.nextAfter(used)-used)
+		}
+		if addSat(used, take) > set.stopAt || take <= 0 {
 			if !reclaimed {
 				// The wrappers' unused leases may hold the bytes.
 				reclaimed = true
@@ -404,9 +425,9 @@ func (b *Budget) take(n int64, rc *receipt) (*budgetStep, error) {
 					continue
 				}
 			}
-			return nil, ErrBudgetExhausted
+			return 0, nil, ErrBudgetExhausted
 		}
-		if p.used.CompareAndSwap(used, addSat(used, n)) {
+		if p.used.CompareAndSwap(used, addSat(used, take)) {
 			break
 		}
 	}
@@ -416,11 +437,11 @@ func (b *Budget) take(n int64, rc *receipt) (*budgetStep, error) {
 	}
 	rc.add(budgetEntry(b, s, p))
 	if s != nil {
-		s.owed.Add(n)
+		s.owed.Add(take)
 	} else {
 		b.report()
 	}
-	return s, nil
+	return take, s, nil
 }
 
 // Ready returns how many of n bytes may pass at once: up to the next step,
