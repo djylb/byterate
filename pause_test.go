@@ -74,11 +74,11 @@ func TestPauseEndsWithCtxAndStop(t *testing.T) {
 	b := NewBudget(Step{Pause: true})
 	ctx, cancel := context.WithTimeout(bg, 20*time.Millisecond)
 	defer cancel()
-	if err := b.Wait(ctx, 1); err != context.DeadlineExceeded { //nolint:errorlint // returned as it is
+	if err := b.Wait(ctx, 1); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("Wait = %v, want ctx's error", err)
 	}
 	h := NewHierarchy(NewRate(1<<20), b)
-	if _, err := h.Ready(ctx, 1); err != context.DeadlineExceeded { //nolint:errorlint // returned as it is
+	if _, err := h.Ready(ctx, 1); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("hierarchy Ready = %v, want ctx's error", err)
 	}
 	if got := b.Used(); got != 0 {
