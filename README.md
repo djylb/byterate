@@ -466,6 +466,17 @@ time as an `io.LimitedReader`, within the limit and the leases, so
 data; a change of limit applies from the next chunk. Other copies go through
 `Read` and `Write`.
 
+A connection or stream that reads without blocking and tells when it becomes
+readable, with methods `TryRead(p []byte) (int, error)` and
+`NotifyReadable(f func()) (stop func() bool)`, such as a stream of a
+multiplexed connection, keeps them through `Notifying`, so that a relay need
+not hold a goroutine while it is idle. `TryRead` is charged and counted as
+`Read` is; while the read limit has debt it returns `ErrWouldBlock`, whose
+`WouldBlock` method reports true, and `NotifyReadable` calls back once the
+debt is repaid and the source is readable. Only a goroutine waiting out that
+debt is held, never one for an idle source. `Notifying` of a wrapper over any
+other connection returns the wrapper unchanged, without those methods.
+
 ## Testing
 
 `Rate`, `Budget` and `Counter` work inside `testing/synctest` bubbles, on the

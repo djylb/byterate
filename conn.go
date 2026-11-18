@@ -195,12 +195,15 @@ const (
 
 // direction holds the limiting of one direction of a rateConn.
 type direction struct {
-	state  atomic.Uint32
-	side   *meterSide // the Meter's count of the direction, and leases' end
-	sw     Switch     // the limiter, replaced by apply
-	lim    target     // sw, prepared for charging
-	cancel waitCancel // ended by Close and the deadlines
-	timer  waitTimer  // reused by the waits of every Rate it charges
+	state atomic.Uint32
+	// granted is set by the wait of NotifyReadable that found the limiter
+	// ready, for the TryRead it announces; see probeRead.
+	granted atomic.Bool
+	side    *meterSide // the Meter's count of the direction, and leases' end
+	sw      Switch     // the limiter, replaced by apply
+	lim     target     // sw, prepared for charging
+	cancel  waitCancel // ended by Close and the deadlines
+	timer   waitTimer  // reused by the waits of every Rate it charges
 	// writing holds a token while a limited Write sends its grants, so
 	// that the grants of concurrent Writes do not interleave, as the
 	// writes of a *net.TCPConn do not. Made for the writes of a stream.
@@ -693,11 +696,13 @@ func (s *rateConn) Read(b []byte) (int, error) {
 		d.count(int64(n))
 		return n, err
 	}
-	return s.readSlow(b)
+	return s.readSlow(b, nil)
 }
 
-// readSlow is Read through d's leases and limiter.
-func (s *rateConn) readSlow(b []byte) (int, error) {
+// readSlow is Read through d's leases and limiter, or, with u, TryRead: it
+// reads from u without waiting, neither for data nor for the limiter, and
+// returns ErrWouldBlock where Read would wait for the limiter.
+func (s *rateConn) readSlow(b []byte, u readNotifier) (int, error) {
 	d := &s.read
 	for {
 		d.recheck()
@@ -717,11 +722,22 @@ func (s *rateConn) readSlow(b []byte) (int, error) {
 		}
 		if st&dirLimited != 0 {
 			var err error
-			if size, err = d.awaitRead(size, s.datagram); err != nil {
+			if u != nil {
+				size, err = d.probeRead(size, s.datagram)
+			} else {
+				size, err = d.awaitRead(size, s.datagram)
+			}
+			if err != nil {
 				return 0, err
 			}
 		}
-		n, err := s.r.Read(b[:size])
+		var n int
+		var err error
+		if u != nil {
+			n, err = u.TryRead(b[:size])
+		} else {
+			n, err = s.r.Read(b[:size])
+		}
 		d.count(int64(n))
 		if st&dirLimited != 0 {
 			err = d.received(int64(n), err)
