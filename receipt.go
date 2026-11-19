@@ -26,6 +26,9 @@ type receipt struct {
 	extra []entry
 	n     int
 	views []level
+	// held marks a write's grant, charged before the bytes pass: its
+	// Budgets leave OnStep until settle tells them what passed.
+	held bool
 }
 
 // mark is a point in a receipt to take back charges to.
@@ -119,12 +122,35 @@ func (rc *receipt) refundFrom(m mark, size int64) {
 			}
 		}
 	}
+	if rc.held {
+		rc.reportFrom(m)
+	}
 	rc.n = m.n
 	if len(rc.extra) > 0 {
 		rc.extra = rc.extra[:max(m.n-len(rc.fixed), 0)]
 	}
 	if !m.views {
 		rc.views = nil
+	}
+}
+
+// settle settles a held grant of size bytes of which m passed: it refunds
+// the rest and reports to OnStep the steps that the passed bytes reached.
+func (rc *receipt) settle(size, m int64) {
+	if m < size {
+		rc.refund(size - m)
+		return
+	}
+	rc.reportFrom(mark{})
+}
+
+// reportFrom reports the steps that the usage of the Budgets charged since
+// m reached, for a held grant.
+func (rc *receipt) reportFrom(m mark) {
+	for i := m.n; i < rc.n; i++ {
+		if b, ok := rc.at(i).l.(*Budget); ok {
+			b.report()
+		}
 	}
 }
 

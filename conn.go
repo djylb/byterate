@@ -475,6 +475,8 @@ func (d *direction) grantWrite(size int64, whole bool, rc *receipt) (int64, erro
 	// Capture the deadline generation before charging, just as reads do.
 	g := d.cancel.current()
 	rc.reset()
+	// The bytes have not passed yet: settle reports the steps they reach.
+	rc.held = true
 	for {
 		// A single Rate is charged in place; a Set of the Switch ends its
 		// wait, which starts over on the new limiter.
@@ -504,10 +506,10 @@ func (d *direction) grantWrite(size int64, whole bool, rc *receipt) (int64, erro
 // have sent none, or the grant. A nil rc refunds nothing.
 func (rc *receipt) sent(size int64, m int, err error) (int, error) {
 	m = min(max(m, 0), int(size))
+	if rc != nil {
+		rc.settle(size, int64(m))
+	}
 	if int64(m) < size {
-		if rc != nil {
-			rc.refund(size - int64(m))
-		}
 		if err == nil {
 			err = io.ErrShortWrite
 		}
@@ -899,8 +901,8 @@ func (s *rateConn) ReadFrom(r io.Reader) (int64, error) {
 		chunk.N = size
 		m, err := rf.ReadFrom(chunk)
 		m = min(max(m, 0), size)
-		if limited && m < size {
-			rc.refund(size - m)
+		if limited {
+			rc.settle(size, m)
 		}
 		d.sentReserved(reserved, m)
 		n += m

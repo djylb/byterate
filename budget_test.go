@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
+	"path/filepath"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -537,4 +539,66 @@ func TestBudgetOnStepSharedOnce(t *testing.T) {
 			}
 		})
 	}
+}
+
+// shortSink is a writer whose ReadFrom takes at most max bytes per call, as
+// a zero-copy path that the peer cuts short.
+type shortSink struct {
+	max int64
+	got int64
+}
+
+func (w *shortSink) Write(p []byte) (int, error) { w.got += int64(len(p)); return len(p), nil }
+
+func (w *shortSink) ReadFrom(r io.Reader) (int64, error) {
+	n, err := io.Copy(io.Discard, io.LimitReader(r, w.max))
+	w.got += n
+	return n, err
+}
+
+// A zero-copy chunk is charged to the Budget before it passes; OnStep
+// reports the steps that the bytes which passed reach, not the charge.
+func TestBudgetOnStepZeroCopyChunk(t *testing.T) {
+	f, err := os.Create(filepath.Join(t.TempDir(), "src"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = f.Close() }()
+	if _, err = f.Write(make([]byte, 2*copyChunk)); err != nil {
+		t.Fatal(err)
+	}
+	const stop = 1 << 20
+	b := NewBudget(Step{After: 0, Limit: NewRate(1 << 40)}, Step{After: stop, Stop: true})
+	var got []string
+	b.OnStep(func(s int, u int64) { got = append(got, fmt.Sprintf("%d@%d", s, u)) })
+	// Another holder has the usage up to where the chunk crosses the stop.
+	if err = b.Charge(stop - copyChunk/2); err != nil {
+		t.Fatal(err)
+	}
+	got = nil
+	sink := &shortSink{max: 2}
+	w := NewWriter(sink, WithLimiters(nil, b))
+	if _, err = f.Seek(0, io.SeekStart); err != nil {
+		t.Fatal(err)
+	}
+	n, err := w.ReadFrom(f)
+	if err != nil || n != 2 {
+		t.Fatalf("ReadFrom = %d, %v; want 2, nil", n, err)
+	}
+	if len(got) != 0 || b.Used() != stop-copyChunk/2+2 {
+		t.Fatalf("after 2 bytes: OnStep reported %v, Used %d; want none, %d", got, b.Used(), stop-copyChunk/2+2)
+	}
+	// Bytes that pass up to the stop report it once, at the stop.
+	sink.max = copyChunk
+	if _, err = f.Seek(0, io.SeekStart); err != nil {
+		t.Fatal(err)
+	}
+	n, err = w.ReadFrom(f)
+	if want := int64(copyChunk/2 - 2); n != want {
+		t.Fatalf("ReadFrom = %d, %v; want %d", n, err, want)
+	}
+	if s := fmt.Sprint(got); s != fmt.Sprintf("[1@%d]", stop) || b.Used() != stop {
+		t.Fatalf("OnStep reported %s, Used %d; want [1@%d], %d", s, b.Used(), stop, stop)
+	}
+	_ = w.Close()
 }

@@ -375,7 +375,9 @@ func (b *Budget) wait(ctx context.Context, t *waitTimer, n int64, c cut, rc *rec
 		}
 		return n, err
 	}
-	b.report()
+	if !rc.held {
+		b.report()
+	}
 	return n, nil
 }
 
@@ -406,7 +408,9 @@ func (b *Budget) tryWait(n, now int64, rc *receipt) error {
 		rc.refundFrom(m, n)
 		return err
 	}
-	b.report()
+	if !rc.held {
+		b.report()
+	}
 	return nil
 }
 
@@ -487,7 +491,7 @@ func (b *Budget) take(n int64, cut bool, rc *receipt) (int64, *budgetStep, error
 	rc.add(budgetEntry(b, s, p))
 	if s != nil {
 		s.owed.Add(take)
-	} else {
+	} else if !rc.held {
 		b.report()
 	}
 	return take, s, nil
