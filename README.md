@@ -304,6 +304,13 @@ sent and refunds the rest; a `Read` ended in its wait returns no bytes.
 return an error matching `errors.ErrUnsupported` when the wrapped connection
 lacks them, so check the error rather than the method.
 
+**Abort.** `Abort(cause)` ends a connection so that its peer sees a cut, not an
+end of data, and then closes the wrapper as `Close` does: a wrapped
+connection with an `Abort(cause error)` method is aborted, and a TCP
+connection, also beneath wrappers with a `NetConn() net.Conn` method, is closed
+with RST (`SO_LINGER 0`). Relays that abort their ends on an error find it by
+that method.
+
 **Nested limits.** `NewHierarchy` charges every level and waits for the
 strictest. `Disable` on one level ends the wait it imposes; the others still
 apply. Every level is charged when the bytes are, so a looser level counts
