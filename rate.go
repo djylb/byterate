@@ -37,6 +37,11 @@ type rateFields struct {
 	debtRate int64                      // protected by mu: the limit tat's debt is reckoned at, the last one above 0
 	mu       sync.Mutex                 // serializes Enable, Disable, SetLimit, Clone and refunds; charges take no lock
 	disabled atomic.Bool                // written under mu
+	fair     atomic.Bool                // SetFair
+	// sparse is the theoretical arrival time of the sparse lane (SetFair):
+	// the charges of sparse flows at the limit, with a burst of one
+	// quantum, which bounds what they pass ahead of the others.
+	sparse atomic.Int64
 }
 
 // NewRate returns a Rate limited to limitBps bytes per second with a full
@@ -88,6 +93,7 @@ func (r *Rate) Clone() *Rate {
 		c.gen.Store(cg)
 	}
 	c.disabled.Store(r.disabled.Load())
+	c.fair.Store(r.fair.Load())
 	return c
 }
 
@@ -322,13 +328,17 @@ func (r *Rate) grant(ctx context.Context, t *waitTimer, size int64, whole bool, 
 	if !whole {
 		size = r.allowance(size, now)
 	}
-	wait, g := r.take(size, now, rc)
+	wait, g := r.take(size, now, rc, t)
 	if !whole && wait > coalesceWaitNs {
 		if q, ok := requeue(size, r.quantum()); ok {
 			rc.refund(size)
 			size = q
-			wait, g = r.take(size, nowNs(), rc)
+			now = nowNs()
+			wait, g = r.take(size, now, rc, t)
 		}
+	}
+	if r.fair.Load() {
+		t.noteFlow(now, wait, size, false)
 	}
 	if wait > coalesceWaitNs {
 		switch t.sleep(wait, g, ctx.Done(), switchCh) {
@@ -349,7 +359,11 @@ func (r *Rate) grant(ctx context.Context, t *waitTimer, size int64, whole bool, 
 // A closed switchCh ends the wait with errSwitched.
 func (r *Rate) ready(ctx context.Context, t *waitTimer, size int64, whole bool, switchCh <-chan struct{}) (int64, error) {
 	now := nowNs()
-	if end, g := r.debtEnd(now); end != 0 {
+	end, g, lane := r.debtEndFor(now, t)
+	if r.fair.Load() {
+		t.noteFlow(now, subSat(end, now), 0, lane)
+	}
+	if end != 0 {
 		switch t.sleep(subSat(end, now), g, ctx.Done(), switchCh) {
 		case canceled:
 			return 0, ctx.Err()
@@ -367,14 +381,97 @@ func (r *Rate) ready(ctx context.Context, t *waitTimer, size int64, whole bool, 
 
 // take charges size to r at now, records the charge in rc unless rc is nil,
 // and returns how long the caller must wait and the generation charged,
-// whose Disable ends the wait. It takes no lock.
-func (r *Rate) take(size, now int64, rc *receipt) (int64, *generation) {
+// whose Disable ends the wait. A sparse flow f of a fair r waits on the
+// sparse lane instead, when that is shorter (SetFair). It takes no lock.
+func (r *Rate) take(size, now int64, rc *receipt, f *waitTimer) (int64, *generation) {
 	wait, g, metered, debt := r.reserveCore(size, now)
 	if metered && rc != nil {
 		rc.addRate(r, g, debt)
 	}
+	if wait > coalesceWaitNs && r.sparseFor(f, size, now) {
+		wait = min(wait, r.takeSparse(size, now))
+	}
 	r.notifyReserved(wait)
 	return wait, g
+}
+
+// SetFair turns fair scheduling of r's flows on or off. A flow is a
+// direction of a connection wrapper; plain Wait, Ready and Charge calls are
+// not flows. Without it, every charge queues behind the debt of all
+// charges before it, so a flow that sends little, such as an interactive
+// one, waits behind the grants of the flows that keep r busy. With it, a
+// sparse flow — one whose last charge did not wait, or that paused since
+// — takes up to a quantum of traffic (about 20 ms at the limit) through a
+// sparse lane, without waiting for that debt, while the flows that stay
+// busy share the limit in turns of a quantum, as before. The bytes of the
+// sparse lane are charged to r all the same, so the other flows pay for
+// them and the limit holds over time; the lane itself runs at the limit
+// with a burst of one quantum, which bounds what sparse flows pass ahead
+// of the others, and a flow that fills it waits and counts as busy. TryWait
+// does not use the lane. The zero value is off.
+func (r *Rate) SetFair(on bool) {
+	if r != nil {
+		r.fair.Store(on)
+	}
+}
+
+// Fair reports whether SetFair turned fair scheduling on.
+func (r *Rate) Fair() bool { return r != nil && r.fair.Load() }
+
+// sparseFor reports whether a charge of size bytes at now from flow f
+// takes r's sparse lane: r is fair and limits, f is sparse and the charge
+// fits in a quantum.
+func (r *Rate) sparseFor(f *waitTimer, size, now int64) bool {
+	return f != nil && r.fair.Load() && !r.disabled.Load() && r.rate.Load() > 0 && f.sparse(now, size, r.quantum())
+}
+
+// takeSparse charges size bytes to r's sparse lane at now and returns how
+// long the lane makes the caller wait.
+func (r *Rate) takeSparse(size, now int64) int64 {
+	limit := r.rate.Load()
+	if limit <= 0 {
+		return 0
+	}
+	cost := bytesToNsCeil(size, limit)
+	for {
+		prev := r.sparse.Load()
+		next := addSat(max(laneTat(prev), subSat(now, quantumNs)), cost)
+		if r.sparse.CompareAndSwap(prev, next) {
+			return max(subSat(next, now), 0)
+		}
+	}
+}
+
+// laneTat reads a sparse lane's arrival time: 0, the zero value's, is
+// none, as nowNs may be negative in a testing/synctest bubble.
+func laneTat(v int64) int64 {
+	if v == 0 {
+		return minI64
+	}
+	return v
+}
+
+// chargeSparse charges n bytes that a sparse flow received after a ready
+// on the sparse lane to that lane too, as its debt.
+func (r *Rate) chargeSparse(n, now int64) {
+	if r.fair.Load() && n > 0 {
+		r.takeSparse(n, now)
+	}
+}
+
+// debtEndFor is debtEnd for flow f: for a sparse flow of a fair r, the end
+// of the sparse lane's debt instead, and true. Ready then lets f's next
+// transfer through ahead of r's debt, and the charge of what it received
+// goes to the lane too.
+func (r *Rate) debtEndFor(now int64, f *waitTimer) (int64, *generation, bool) {
+	end, g := r.debtEnd(now)
+	if end == 0 || f == nil || !r.sparseFor(f, 1, now) {
+		return end, g, false
+	}
+	if lane := laneTat(r.sparse.Load()); subSat(lane, now) > coalesceWaitNs {
+		return min(end, lane), g, true
+	}
+	return 0, nil, true
 }
 
 // wouldWait reports whether a charge of size bytes at now would wait, as

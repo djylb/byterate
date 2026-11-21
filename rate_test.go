@@ -407,7 +407,7 @@ func TestRateCloneDuringEnableDisable(t *testing.T) {
 func TestRateChargeRefundDropsChargesBeforeReset(t *testing.T) {
 	r := NewRate(1000)
 	var charge receipt
-	r.take(1<<20, nowNs(), &charge)
+	r.take(1<<20, nowNs(), &charge, nil)
 	r.Reset(1000)
 	r.reserve(2000)  // spend the new burst
 	r.reserve(10000) // 10s of debt since the reset
@@ -420,7 +420,7 @@ func TestRateChargeRefundDropsChargesBeforeReset(t *testing.T) {
 	}
 
 	// A refund of a charge made since the last Enable is applied.
-	r.take(1000, nowNs(), &charge)
+	r.take(1000, nowNs(), &charge, nil)
 	charge.refund(1000)
 	if got := metered(r); got != 12001 {
 		t.Fatalf("metered after a current refund = %d, want 12001", got)

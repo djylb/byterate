@@ -189,11 +189,15 @@ func (t *target) tryWait(size, now int64, rc *receipt) error {
 }
 
 // charge records n transferred bytes, as levels.charge does.
-func (t *target) charge(n int64) error {
+func (t *target) charge(n int64) error { return t.chargeFlow(n, nil) }
+
+// chargeFlow is charge for the flow f, nil for none: after a ready of f
+// through the sparse lanes, its bytes go to those lanes too.
+func (t *target) chargeFlow(n int64, f *waitTimer) error {
 	if t.fixed.lv != nil {
-		return t.fixed.charge(n)
+		return t.fixed.chargeFlow(n, f)
 	}
-	return chargeOn(t.one[:], n)
+	return chargeOn(t.one[:], n, f)
 }
 
 // waitOn charges size bytes to the level one[0] and waits, as levels.wait
@@ -224,9 +228,9 @@ func readyOn(ctx context.Context, one []level, t *waitTimer, size int64, whole b
 
 // chargeOn records n transferred bytes on the level one[0], as levels.charge
 // does.
-func chargeOn(one []level, n int64) error {
+func chargeOn(one []level, n int64, f *waitTimer) error {
 	v := expand(one)
-	return v.charge(n)
+	return v.chargeFlow(n, f)
 }
 
 // allowance returns how much of size the Rate levels let through at now in
@@ -287,10 +291,27 @@ func (v *levels) ready(ctx context.Context, t *waitTimer, size int64, whole bool
 	}
 	now := nowNs()
 	var waits waitSet
+	lane, fair := false, false
 	for i := range v.lv {
-		if end, g := v.lv[i].rate.debtEnd(now); end != 0 {
+		r := v.lv[i].rate
+		if r == nil {
+			continue
+		}
+		var end int64
+		var g *generation
+		if r.fair.Load() {
+			var l bool
+			end, g, l = r.debtEndFor(now, t)
+			lane, fair = lane || l, true
+		} else {
+			end, g = r.debtEnd(now)
+		}
+		if end != 0 {
 			waits.add(subSat(end, now), now, g)
 		}
+	}
+	if fair && t != nil {
+		t.noteFlow(now, waits.longest(now), 0, lane)
 	}
 	if waits.n > 0 {
 		if err := waits.sleep(ctx, t, v.switchCh); err != nil {
@@ -312,7 +333,10 @@ func (v *levels) ready(ctx context.Context, t *waitTimer, size int64, whole bool
 // is recorded to give back.
 func (v *levels) waitRates(ctx context.Context, t *waitTimer, size int64) error {
 	var waits waitSet
-	v.reserve(size, nowNs(), nil, &waits)
+	now := nowNs()
+	if v.reserve(size, now, nil, &waits, t) && t != nil {
+		t.noteFlow(now, waits.longest(now), size, false)
+	}
 	return waits.sleep(ctx, t, v.switchCh)
 }
 
@@ -347,8 +371,12 @@ func (v *levels) readyOthers(ctx context.Context, t *waitTimer, size int64, whol
 // charge takes n transferred bytes on every level: as debt on the Rates,
 // which the next ready waits for, and through Charge on the others. Every
 // level keeps the charge; it returns the first error of the others.
-func (v *levels) charge(n int64) error {
+func (v *levels) charge(n int64) error { return v.chargeFlow(n, nil) }
+
+// chargeFlow is charge for the flow f, as target.chargeFlow.
+func (v *levels) chargeFlow(n int64, f *waitTimer) error {
 	now := nowNs()
+	lane, noted := false, f == nil
 	var first error
 	for i := range v.lv {
 		lv := &v.lv[i]
@@ -357,12 +385,19 @@ func (v *levels) charge(n int64) error {
 		case kindNone:
 		case kindRate:
 			lv.rate.reserveAt(n, now)
+			if !noted && lv.rate.fair.Load() {
+				noted, lane = true, f.laneCharge()
+				f.received(n)
+			}
+			if lane {
+				lv.rate.chargeSparse(n, now)
+			}
 		case kindBudget, kindOther:
 			err = lv.l.Charge(n)
 		case kindCountReads, kindCountWrites:
 			lv.count(n)
 		default:
-			err = chargeOn(v.lv[i:i+1], n)
+			err = chargeOn(v.lv[i:i+1], n, f)
 		}
 		if err != nil && first == nil {
 			first = err
@@ -436,14 +471,18 @@ func (v *levels) wait(ctx context.Context, t *waitTimer, size int64, c cut, rc *
 		size = v.allowance(size, now)
 	}
 	var waits waitSet
-	v.reserve(size, now, rc, &waits)
+	fair := v.reserve(size, now, rc, &waits, t)
 	if c == cutAll && waits.n > 0 {
 		if q, ok := requeue(size, v.quantum()); ok {
 			rc.refundFrom(m, size)
 			waits = waitSet{}
 			size = q
-			v.reserve(size, nowNs(), rc, &waits)
+			now = nowNs()
+			v.reserve(size, now, rc, &waits, t)
 		}
+	}
+	if fair && t != nil {
+		t.noteFlow(now, waits.longest(now), size, false)
 	}
 	if v.others {
 		inner := cutNone
@@ -612,15 +651,19 @@ func isCanceled(ctx context.Context, err error) bool {
 	return ctxErr != nil && errors.Is(err, ctxErr)
 }
 
-// reserve charges size to the Rate levels at now, recording each charge in
-// rc and its wait in waits.
-func (v *levels) reserve(size, now int64, rc *receipt, waits *waitSet) {
+// reserve charges size to the Rate levels at now for flow f, nil for
+// none, recording each charge in rc and its wait in waits.
+// It reports whether a Rate charged is fair, so that the caller records
+// the charge for flow f.
+func (v *levels) reserve(size, now int64, rc *receipt, waits *waitSet, f *waitTimer) (fair bool) {
 	for i := range v.lv {
 		if r := v.lv[i].rate; r != nil {
-			wait, g := r.take(size, now, rc)
+			wait, g := r.take(size, now, rc, f)
 			waits.add(wait, now, g)
+			fair = fair || r.fair.Load()
 		}
 	}
+	return fair
 }
 
 // levelWait is the wait one level of a hierarchical charge imposes: when it
@@ -652,6 +695,18 @@ func (w *waitSet) add(wait, now int64, g *generation) {
 		w.extra = append(w.extra, lw)
 	}
 	w.n++
+}
+
+// longest returns the longest wait in w from now, 0 for none.
+func (w *waitSet) longest(now int64) int64 {
+	var end int64
+	for i := range w.n {
+		end = max(end, w.at(i).end)
+	}
+	if w.n == 0 {
+		return 0
+	}
+	return max(subSat(end, now), 0)
 }
 
 func (w *waitSet) at(i int) *levelWait {

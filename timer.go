@@ -59,7 +59,60 @@ const (
 // another or from outside one. A nil *waitTimer makes a timer for each wait.
 type waitTimer struct {
 	t atomic.Pointer[time.Timer] // idle timer, nil while a wait holds it
+	// The direction as a flow of fair Rates (Rate.SetFair): when its last
+	// charge was allowed, as nowNs, the bytes it charged since it last
+	// paused, and whether its last ready went through a sparse lane.
+	flowEnd   atomic.Int64
+	flowBytes atomic.Int64
+	flowLane  atomic.Bool
 }
+
+// sparseGapNs is how long a flow must pause after its last charge was
+// allowed to count as sparse again: longer than a busy flow takes to come
+// back for its next grant.
+const sparseGapNs = shortWaitNs
+
+// sparse reports whether w's flow is sparse at now for a charge of size
+// bytes on a Rate of quantum q: since it last paused, its charges with
+// this one stay within a quantum. A nil w is no flow.
+func (w *waitTimer) sparse(now, size, q int64) bool {
+	if w == nil {
+		return false
+	}
+	b := w.flowBytes.Load()
+	if subSat(now, w.flowEnd.Load()) >= sparseGapNs {
+		b = 0 // paused
+	}
+	return addSat(b, size) <= q
+}
+
+// noteFlow records a charge of n bytes of w's flow at now that waits
+// waitNs, and whether it went through a sparse lane, for a read to charge
+// what it receives there too.
+func (w *waitTimer) noteFlow(now, waitNs, n int64, lane bool) {
+	if w == nil {
+		return
+	}
+	if subSat(now, w.flowEnd.Load()) >= sparseGapNs {
+		w.flowBytes.Store(n)
+	} else {
+		w.flowBytes.Add(n)
+	}
+	w.flowEnd.Store(addSat(now, max(waitNs, 0)))
+	w.flowLane.Store(lane)
+}
+
+// received records n bytes that w's flow received after a ready, which
+// noteFlow recorded with none.
+func (w *waitTimer) received(n int64) {
+	if w != nil && n > 0 {
+		w.flowBytes.Add(n)
+	}
+}
+
+// laneCharge reports whether the charge of what w's flow received goes to
+// the sparse lanes of its fair Rates too.
+func (w *waitTimer) laneCharge() bool { return w != nil && w.flowLane.Load() }
 
 // sleep waits waitNs in w's timer, returning early when Disable on g, done
 // or switched ends the wait. A nil g has no Disable.

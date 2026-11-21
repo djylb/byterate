@@ -553,9 +553,16 @@ func (d *direction) received(n int64, err error) error {
 	}
 	var cerr error
 	if r := d.sw.state().t.one[0].rate; r != nil {
-		r.reserveAt(n, nowNs())
+		now := nowNs()
+		r.reserveAt(n, now)
+		if r.fair.Load() {
+			d.timer.received(n)
+			if d.timer.laneCharge() {
+				r.chargeSparse(n, now)
+			}
+		}
 	} else {
-		cerr = d.lim.charge(n)
+		cerr = d.lim.chargeFlow(n, &d.timer)
 	}
 	if err == nil {
 		return cerr

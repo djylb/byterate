@@ -294,6 +294,19 @@ once: its credit, or without credit about 20 ms of traffic.
   together when its debt is repaid, a grant each.
 - Datagrams are never split: each one is charged and sent whole.
 
+**Fair sharing.** Connections that keep a shared limit busy take turns of a
+grant each, but a connection that sends little, such as an interactive one,
+still queues behind the grants already charged. `Rate.SetFair(true)` lets
+such a sparse connection through first: a direction of a wrapper counts as
+sparse while it has charged at most a grant since it last paused, and its
+transfers then pass through a sparse lane without waiting for the busy
+connections' debt. The bytes are still charged to the Rate, so the busy
+connections pay for them and the limit holds over time; the lane runs at the
+limit with a burst of one grant, which bounds what passes ahead of the
+others, and a connection that keeps sending becomes busy and takes turns
+again. Plain `Wait`, `Ready` and `Charge` calls and `TryWait` are not
+connections and queue as before.
+
 **Ending waits.** `Close` ends a wait with `net.ErrClosed`, and `CloseRead` or
 `CloseWrite` do the same for their side. Deadlines set through the wrapper end
 waits with `os.ErrDeadlineExceeded`; a deadline set on the connection before
